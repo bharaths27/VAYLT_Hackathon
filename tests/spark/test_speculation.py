@@ -783,3 +783,46 @@ def test_reject_of_an_utterance_the_gate_has_not_heard_yet_is_taken(fake, spawn,
     r = gate.reject(2)                                         # 2 overflowed before any of its partials arrived
     assert (r.action, r.cause) == ("clarify", "misheard")
     assert gate.on_final(2, 0, "Open the claw").action == "ignored"   # and it is still set aside
+
+
+# ---- a late final names why it was ignored ------------------------------------------------------------------
+
+
+def _late_final(gate, case):
+    if case == "stopped":
+        gate.on_partial(1, 0, "Open the claw, stop")
+        return gate.on_final(1, 1, "Open the claw")
+    if case == "rejected":
+        gate.on_partial(1, 0, "Open the claw")
+        gate.reject(1)
+        return gate.on_final(1, 1, "Open the claw")
+    if case == "superseded":
+        gate.on_partial(1, 0, "Open the claw")
+        gate.on_partial(2, 0, "Close the claw")
+        return gate.on_final(1, 1, "Open the claw")
+    if case == "already_final":
+        gate.on_final(1, 0, "Open the claw")
+        return gate.on_final(1, 1, "Open the claw")
+    gate.on_partial(1, 5, "Open the claw")                    # out_of_order: revision 3 arrives after 5
+    return gate.on_final(1, 3, "Close the claw")
+
+
+@pytest.mark.parametrize("case", ["stopped", "rejected", "superseded", "already_final", "out_of_order"])
+def test_a_late_final_names_why_it_was_ignored(fake, spawn, clock, case):
+    r = _late_final(make_gate(fake, spawn, clock), case)
+    assert (r.action, r.cause) == ("ignored", case)
+
+
+def test_a_final_whose_utterance_was_stopped_while_it_waited_names_the_stop():
+    fake = FakeIntent()
+    fake.hold()
+    gate = SpeculationGate(fake)
+    gate.on_partial(1, 0, "Open the")
+    assert fake.entered.acquire(timeout=5)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 1, "Open the claw")))
+    t.start()
+    assert gate.on_partial(1, 2, "stop").action == "stop"
+    t.join(5)
+    fake.release.set()
+    assert (out["r"].action, out["r"].cause) == ("ignored", "stopped")

@@ -136,7 +136,8 @@ class GateResult:
     # audio that overflowed). ambiguous: what was meant is not clear (a correction, "later" with no event to
     # wait for, no usable answer from the intent model). memory_changed / expired: understood, but memory moved
     # on, or it took too long, while it was worked out: said again, nothing stopped. negated, not_a_preset:
-    # understood and declined. superseded, stopped, rejected: set aside for a newer utterance or by a stop.
+    # understood and declined. Ignored, and every one names why: superseded (a newer utterance), stopped,
+    # rejected (by reject()), already_final (a second final), out_of_order (an older revision).
     cause: str = ""
 
 
@@ -261,7 +262,7 @@ class SpeculationGate:
             self._ctx_now = ctx
             why = self._observe(utterance, revision, text)
             if why:
-                return GateResult("ignored", utterance, revision, text, reason=why)
+                return GateResult("ignored", utterance, revision, text, reason=why[0], cause=why[1])
             if not text or (self._pred and self._valid(self._pred.key)) or \
                     (self._in_flight and self._current(self._in_flight)):
                 action = "unchanged"
@@ -288,7 +289,7 @@ class SpeculationGate:
         with self._cv:
             why = self._observe(utterance, revision, text)
             if why:
-                return GateResult("ignored", utterance, revision, text, reason=why)
+                return GateResult("ignored", utterance, revision, text, reason=why[0], cause=why[1])
             self._final, self._pending = True, None
             # Single flight: wait for the request already out. If it is about this same text, reuse its answer.
             while self._in_flight is not None and self._utt == utterance and not self._is_stopped(utterance):
@@ -300,8 +301,11 @@ class SpeculationGate:
         ctx = self._context()   # on the caller's thread, with the lock released
         with self._cv:
             self._ctx_now = ctx
-            if self._utt != utterance or self._is_stopped(utterance):
-                return GateResult("ignored", utterance, revision, text, reason="stopped or superseded")
+            if self._utt != utterance:
+                return GateResult("ignored", utterance, revision, text, reason="superseded", cause="superseded")
+            if self._is_stopped(utterance):
+                return GateResult("ignored", utterance, revision, text, reason=self._void_why(utterance),
+                                  cause=self._void_why(utterance))
             if not text:
                 return GateResult("clarify", utterance, revision, text, reason="I didn't catch anything.",
                                   cause="misheard")
@@ -420,19 +424,19 @@ class SpeculationGate:
     def _void_why(self, utterance: int) -> str:
         return "rejected" if utterance in self._rejected else "stopped"
 
-    def _observe(self, utterance: int, revision: int, text: str) -> str | None:
-        """Record a transcript revision. Returns why it was ignored, or None."""
+    def _observe(self, utterance: int, revision: int, text: str) -> tuple[str, str] | None:
+        """Record a transcript revision. Returns (why it was ignored, its cause), or None."""
         if self._utt is not None and utterance < self._utt:
-            return "older utterance"
+            return "older utterance", "superseded"
         if self._is_stopped(utterance):
-            return self._void_why(utterance)
+            return self._void_why(utterance), self._void_why(utterance)
         if utterance != self._utt:
             self._utt, self._rev, self._text, self._text_since, self._final = utterance, -1, "", -1, False
             self._pending, self._pred = None, None
         if self._final:
-            return "utterance already final"
+            return "utterance already final", "already_final"
         if revision < self._rev or (revision == self._rev and text != self._text):
-            return "older revision"
+            return "older revision", "out_of_order"
         if text != self._text:
             self._text, self._text_since = text, revision
         self._rev = revision
