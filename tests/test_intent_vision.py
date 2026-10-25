@@ -226,3 +226,16 @@ def test_the_default_transport_returns_a_normal_reply():
         assert iv._default_transport(url, b"{}", {}, 3.0) == (200, b'{"answers": {}}')
     finally:
         srv.shutdown()
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan"), True, "0.5", None])
+def test_find_object_refuses_a_nonsense_threshold_before_asking(bad):
+    t = FakeTransport({"answers": {}})
+    with pytest.raises(ValueError):
+        iv.find_object(png(640, 480), "cup", client(t), min_present=bad)
+    assert t.calls == []
+
+
+def test_a_very_narrow_image_meets_the_minimum_without_passing_the_api_limit():
+    out = Image.open(io.BytesIO(iv.prepare_jpeg(png(1600, 300))))
+    assert min(out.size) >= iv.MIN_SIDE and max(out.size) <= iv.MAX_SIDE

@@ -106,7 +106,8 @@ def _default_transport(url: str, body: bytes, headers: dict[str, str], timeout_s
 
 
 def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
-    """Any JPEG/PNG -> an RGB JPEG whose sides fit the API's limits (longest side at most max_side)."""
+    """Any JPEG/PNG -> an RGB JPEG the API accepts: longest side at most max_side, except that a very narrow
+    image is enlarged until its short side reaches the API's 280 px minimum (never past its 1568 px limit)."""
     if not MIN_SIDE <= max_side <= MAX_SIDE:
         raise ValueError(f"max_side must be in [{MIN_SIDE}, {MAX_SIDE}]")
     try:
@@ -276,6 +277,8 @@ def find_object(image: bytes, what: str, client: VisionClient | None = None,
 
     A Box question always draws a box, even around nothing, so the box is returned only when the separate
     presence question says the object is there (present >= min_present)."""
+    if isinstance(min_present, bool) or not isinstance(min_present, (int, float)) or not 0.0 <= min_present <= 1.0:
+        raise ValueError("min_present must be a number in [0, 1]")
     what = " ".join(what.split())
     if not what or len(what) > 80:
         raise ValueError("describe the object in 1 to 80 characters")

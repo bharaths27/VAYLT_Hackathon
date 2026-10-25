@@ -8,8 +8,9 @@
 | Is someone there, on the floor, asking for help? What is their posture? | `scene_check(jpeg)` | three yes-probabilities and a posture (`standing`, `sitting`, `lying_in_bed`, `lying_on_floor`, `no_person`) |
 | Is an object in view, and where? | `find_object(jpeg, "pill bottle")` | a presence probability and, only when present, a box as fractions of the image (`top`, `bottom`, `left`, `right`) |
 
-The answers are **advice about one still frame**. They never move the robot, approve a plan or count as a
-sensor reading; code decides what to do with them, through the brain's normal stop / propose / approve paths.
+The answers are **advice about one still frame**: this module and `scripts/vision_ask.py` only return and print
+them. They never move the robot, approve a plan or count as a sensor reading. Anything that acts on them (the
+hand-signal loop, for example) must go through the brain's normal stop / propose / approve paths.
 Images are a preview feature on TypeSafe's side (fine for prototypes; format and accuracy can change), so
 check it on your own camera before you rely on a threshold.
 
