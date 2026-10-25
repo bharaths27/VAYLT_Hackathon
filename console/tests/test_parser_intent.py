@@ -8,8 +8,10 @@
 Expected kinds were written down before the fix; every table had failing rows on the old parser.
 """
 import asyncio
+import threading
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -97,6 +99,33 @@ FAIL_CLOSED = [
     "Open the claw in place soonish.", "Open the claw in front of the deadline.",
 ]
 
+# Review round 6: a primitive planned whatever else was said ("Open the claw following calibration." planned an
+# immediate open). A command plans only when the whole utterance is that command, give or take filler such as
+# "please" or "can you"; anything left over asks and never goes to the model fallback. The rows after the first
+# block use words that no list knows, so only the whole-utterance rule can catch them.
+LEFTOVER = [
+    "Open the claw following calibration.", "Open the claw once calibration ends.",
+    "Open the claw as soon as calibration ends.", "Open the claw when calibration ends.",
+    "Open the claw whenever calibration ends.", "Open the claw upon calibration.",
+    "Open the claw pending calibration.", "Open the claw provided calibration passed.",
+    "Open the claw if calibration passed.", "Open the claw unless calibration failed.",
+    "Open the claw until calibration ends.", "Open the claw before calibration.",
+    "Open the claw by the time calibration ends.", "Open the claw the moment calibration ends.",
+    "Drive forward 10 cm following calibration.", "Turn left following calibration.",
+    "Find the vial following calibration.", "Bring the red cup to zone B following calibration.",
+    "Prep the bench for calibration following the meeting.", "Juggle following calibration.",
+    # No grammar and no rule trigger here, so only the deferral words keep these from the model fallback.
+    "Juggle following the meeting.", "Dance pending approval.", "Wave provided it is safe.",
+    # words no list knows
+    "Open the claw subsequent to calibration.", "Open the claw contingent on calibration.", "Open the claw halfway.",
+    "Close the gripper gently.", "Turn left 90 degrees twice.", "Drive forward 10 cm three times.",
+    "Bring the red cup to zone B as needed.", "What do you see behind the bench?",
+]
+
+# Review round 6: only "In N seconds/minutes, ..." is scheduled; "After N seconds, ..." asks to be said that way.
+AFTER = ["After 5 seconds, close the claw.", "After 2 minutes, bring the red cup to zone B.",
+         "After five minutes, open the claw."]
+
 # Review round 4: the grammar plans one primitive, or one fetch of one object to one zone. A second action or
 # a second object was silently dropped ("close the claw and open the gripper" staged only the open).
 MULTIPLE = [
@@ -133,10 +162,20 @@ STILL_WORKS = [
     ("Bring the red cup to zone B.", "plan", "search_tag"),
     ("What do you see?", "plan", "observe"),
     ("In 5 seconds, open the claw.", "prospective", "gripper_open"),
-    ("After 5 seconds, close the claw.", "prospective", "gripper_close"),
     ("In 2 minutes, bring the red cup to zone B.", "prospective", "search_tag"),
     ("In five minutes, open the claw.", "prospective", "gripper_open"),
-    ("Bring the cup next to the vial to zone B.", "plan", "search_tag"),
+    # Round 6: this used to plan a fetch of the VIAL ("the cup" is not in memory, "vial" is); now it asks.
+    ("Bring the cup next to the vial to zone B.", "clarify", None),
+    # Filler around a command is fine.
+    ("Can you open the claw?", "plan", "gripper_open"),
+    ("Please close the gripper now.", "plan", "gripper_close"),
+    ("Hey robot, turn left 90 degrees.", "plan", "turn_bounded"),
+    ("Could you drive forward 10 cm for me?", "plan", "drive_bounded"),
+    ("Where is the vial?", "plan", "detect_tag"),
+    ("Look for the vial.", "plan", "detect_tag"),  # used to plan "observe"
+    ("Prep the bench for calibration.", "plan", "search_tag"),
+    ("Bring the vial to the bench for calibration.", "plan", "search_tag"),
+    ("Bring the red cup to the sample shelf.", "plan", "search_tag"),
     # Places after in/at/on/next are consumed by the grammar, not mistaken for time.
     ("Put the red cup in zone A.", "plan", "search_tag"),  # "the cup" alone is not a known object here
     ("Put the vial on the calibration bench.", "plan", "search_tag"),
@@ -189,6 +228,36 @@ def test_negated_command_is_refused_not_planned(text):
 def test_future_condition_is_not_run_now(text):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
+
+
+@pytest.mark.parametrize("text", LEFTOVER)
+def test_a_leftover_qualifier_asks_instead_of_planning(text):
+    r = parse(text, BUNDLE)
+    assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
+    assert not r.data.get("llm_eligible"), "a leftover qualifier must not go to the model fallback"
+
+
+@pytest.mark.parametrize("text", LEFTOVER)
+def test_a_leftover_qualifier_never_reaches_the_model(monkeypatch, text):
+    calls = []
+
+    async def propose(t, bundle):
+        calls.append(t)
+        return None, "model declined (test)"
+
+    monkeypatch.setattr(main.config, "LLM_URL", "http://model.test")
+    monkeypatch.setattr(main.llm, "propose", propose)
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        out = c.post("/commands", json={"text": text, "source": "voice"}).json()
+    assert out["kind"] == "clarify" and "operation" not in out and calls == [], (text, out.get("kind"), calls)
+
+
+@pytest.mark.parametrize("text", AFTER)
+def test_after_a_delay_asks_to_rephrase(text):
+    r = parse(text, BUNDLE)
+    assert (r.kind, r.plan) == ("clarify", None) and "'In " in r.reason, (text, r.kind, r.reason)
+    assert not r.data.get("llm_eligible")
 
 
 @pytest.mark.parametrize("text", MULTIPLE)
@@ -305,9 +374,207 @@ def test_a_failing_robot_stop_still_stops_the_brain(monkeypatch):
             m.setattr(main.brain, "clear_stop", brain_clear)
             m.setattr(main.engine.robot, "stop", robot_stop)
             r = c.post("/stop")
-            assert r.status_code == 200 and main.engine.stopped and told == ["stop"], (r.status_code, told)
+            # 502, not 200: the HUD then shows "STOP request failed: use the robot's physical button!"
+            assert r.status_code == 502 and main.engine.stopped and told == ["stop"], (r.status_code, told)
             assert r.json()["status"] == "stop_request_failed" and "ValueError" in r.json()["error"], r.json()
             c.post("/stop/clear")
+
+
+ROBOT_OK = {"stopped": True, "latched": True}  # the robot server's reply to /robot/stop
+# Review round 7: a reply confirms a stop only when it says so explicitly, in its target's own shape. Anything
+# else (missing, malformed, unknown, or a string where a boolean belongs) does not.
+STOP_REPLIES = [  # (robot reply, brain reply or None when the brain bridge is off, confirmed)
+    (ROBOT_OK, None, True),
+    ({"stopped": True}, None, True),
+    ({"status": "stopped", "simulated": True}, None, True),  # the console's mock robot
+    (ROBOT_OK, {"adapter": "mock", "stopped": True}, True),  # the brain answers /stop with its robot's state
+    (ROBOT_OK, {"adapter": "brian8200", "connected": True, "stopped": True}, True),
+    (None, None, False), ({}, None, False), ([], None, False), ("stopped", None, False), (True, None, False),
+    ({"status": "error"}, None, False), ({"status": "ok"}, None, False), ({"status": "STOPPED"}, None, False),
+    ({"stopped": "yes"}, None, False), ({"stopped": "true"}, None, False), ({"stopped": 1}, None, False),
+    ({"stopped": None}, None, False), ({"latched": True}, None, False),
+    ({"stopped": True, "latched": False}, None, False), ({"stopped": True, "latched": "yes"}, None, False),
+    ({"stopped": True, "error": "driver fault"}, None, False), ({"status": "stopped", "stopped": False}, None, False),
+    ([], {"adapter": "mock", "stopped": True}, False),
+    (ROBOT_OK, {}, False), (ROBOT_OK, {"stopped": False}, False), (ROBOT_OK, {"adapter": "masterpi", "stopped": "yes"}, False),
+    # When the brain cannot reach its robot, its state says "stopped" anyway, next to the failure.
+    (ROBOT_OK, {"adapter": "brian8200", "connected": False, "error": "timed out", "stopped": True}, False),
+    (ROBOT_OK, {"adapter": "masterpi", "connected": False, "stopped": True}, False),
+    (ROBOT_OK, {"error": "brain unreachable"}, False),
+]
+
+
+@pytest.mark.parametrize("robot_reply,brain_reply,confirmed", STOP_REPLIES)
+def test_only_an_explicit_reply_confirms_a_stop(monkeypatch, robot_reply, brain_reply, confirmed):
+    async def robot_stop():
+        return robot_reply
+
+    async def brain_stop():
+        return brain_reply
+
+    async def brain_clear():
+        return {}
+
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.engine.robot, "stop", robot_stop)
+            if brain_reply is not None:
+                m.setattr(main.brain, "enabled", lambda: True)
+                m.setattr(main.brain, "stop", brain_stop)
+                m.setattr(main.brain, "clear_stop", brain_clear)
+            voice = c.post("/commands", json={"text": "Stop.", "source": "voice"})
+            button = c.post("/stop")
+            latched = main.engine.stopped
+            c.post("/stop/clear")
+    assert voice.status_code == 200 and voice.json()["stop_confirmed"] is confirmed and latched, voice.json()
+    assert button.status_code == (200 if confirmed else 502), button.status_code
+
+
+@pytest.mark.parametrize("failure", ["robot stop raises", "robot stop request failed", "robot says not stopped",
+                                     "brain stop failed"])
+def test_an_unconfirmed_stop_says_so_and_stays_latched(monkeypatch, failure):
+    # Review round 5: the voice route answered "Stopping." even when the robot never confirmed the stop.
+    async def robot_stop():
+        if failure == "robot stop raises":
+            raise ValueError("robot reply was not JSON")
+        if failure == "robot stop request failed":
+            return {"status": "stop_request_failed", "error": "connect timeout"}
+        if failure == "robot says not stopped":
+            return {"stopped": False, "latched": False}
+        return {"stopped": True, "latched": True}
+
+    async def brain_stop():
+        return {"error": "brain unreachable"}
+
+    async def brain_clear():
+        return {}
+
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.engine.robot, "stop", robot_stop)
+            if failure == "brain stop failed":
+                m.setattr(main.brain, "enabled", lambda: True)
+                m.setattr(main.brain, "stop", brain_stop)
+                m.setattr(main.brain, "clear_stop", brain_clear)
+            out = c.post("/commands", json={"text": "Stop.", "source": "voice"}).json()
+            latched = main.engine.stopped
+            said = [e["text"] for e in main.bus.log if e["type"] == "say"][-1]
+            button = c.post("/stop")
+            c.post("/stop/clear")
+    assert out["kind"] == "stop" and out["stop_confirmed"] is False and latched, out
+    assert "could not confirm" in out["reason"] and "Cut the motor power" in out["quip"], out
+    assert said == out["quip"] and out["robot"], (said, out)
+    assert button.status_code == 502, button.status_code
+
+
+@pytest.mark.parametrize("status,body,confirmed", [(200, {"stopped": True, "latched": True}, True),
+                                                   (500, {"detail": "driver crashed"}, False),
+                                                   (200, {"stopped": False, "latched": False}, False)])
+def test_the_http_robot_never_passes_an_error_reply_off_as_a_stop(status, body, confirmed):
+    from server.adapters.robot import HttpRobot
+    from server.core import stop_unconfirmed
+
+    robot = HttpRobot("http://robot.test")
+    robot.fast = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status, json=body)))
+    res = asyncio.run(robot.stop())
+    assert (not stop_unconfirmed(res)) is confirmed, res
+
+
+def test_a_confirmed_stop_says_stopping():
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        out = c.post("/commands", json={"text": "Stop.", "source": "voice"}).json()
+        assert out["stop_confirmed"] is True and out["reason"] == "" and out["quip"] == "Stopping.", out
+        assert out["robot"]["status"] == "stopped" and c.post("/stop").status_code == 200
+        c.post("/stop/clear")
+
+
+class StalledDisk:
+    """A ledger file whose every open hangs, like a stalled SD card, until released. With reads_stall, looking
+    the file up (exists()) hangs too, and `reading` is set once a read is stuck."""
+
+    def __init__(self, release: threading.Event, reads_stall: bool = False):
+        self.release, self.reads_stall, self.reading = release, reads_stall, threading.Event()
+
+    def open(self, *args, **kwargs):
+        self.release.wait(3)
+        raise OSError("the disk stalled")
+
+    def exists(self):
+        if self.reads_stall:
+            self.reading.set()
+            self.release.wait(5)
+        return False
+
+
+def test_a_stalled_ledger_read_never_delays_a_stop(monkeypatch):
+    # Review round 7: Ledger.find() read the file on the event loop, so an evidence lookup during a disk stall
+    # blocked a concurrent stop. The read now happens on the ledger's reader thread, within a time budget.
+    release = threading.Event()
+    disk = StalledDisk(release, reads_stall=True)
+    lookup = {}
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.ledger, "path", disk)
+            m.setattr(main.ledger, "read_timeout_s", 1.0, raising=False)
+
+            def look():
+                t0 = time.monotonic()
+                lookup["status"] = c.get("/evidence/ev_not_there").status_code
+                lookup["s"] = time.monotonic() - t0
+
+            reader = threading.Thread(target=look)
+            reader.start()
+            assert disk.reading.wait(5), "the lookup never reached the disk"
+            t0 = time.monotonic()
+            r = c.post("/commands", json={"text": "Stop.", "source": "voice"})
+            stop_s = time.monotonic() - t0
+            latched = main.engine.stopped
+            reader.join(10)
+        release.set()
+        assert main.ledger.flush(10)
+        c.post("/stop/clear")
+    assert r.status_code == 200 and r.json()["kind"] == "stop" and latched and stop_s < 1.0, stop_s
+    assert lookup["status"] == 404 and lookup["s"] < 3.0, lookup  # the lookup gave up after its time budget
+
+
+def test_a_stalled_ledger_disk_never_delays_a_stop(monkeypatch):
+    # Review round 5: ledger writes ran on the event loop, so a stalled disk blocked the stop response (the time
+    # budget cannot interrupt a blocked loop) and every other request. Writes now happen on the ledger's thread.
+    release = threading.Event()
+    calls = []
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        real_stop = main.engine.robot.stop
+
+        async def robot_stop():
+            calls.append("robot.stop")
+            return await real_stop()
+
+        try:
+            with monkeypatch.context() as m:
+                m.setattr(main.ledger, "path", StalledDisk(release))
+                m.setattr(main.engine.robot, "stop", robot_stop)
+                t0 = time.monotonic()
+                r = c.post("/commands", json={"text": "Stop.", "source": "voice"})
+                stop_s = time.monotonic() - t0
+                t1 = time.monotonic()
+                other = c.post("/commands", json={"text": "What do you see?", "source": "typed"})
+                other_s = time.monotonic() - t1
+                eid = main.ledger.append("probe")
+                found = asyncio.run(main.ledger.find(eid))
+                latched = main.engine.stopped
+        finally:
+            release.set()
+        assert r.status_code == 200 and r.json()["kind"] == "stop" and stop_s < 2.0, stop_s
+        assert calls == ["robot.stop"] and latched
+        assert other.status_code == 200 and other_s < 2.0, other_s  # the event loop was never blocked
+        assert found and found["kind"] == "probe"  # a record that is not on disk yet can still be found
+        assert main.ledger.flush(10)
+        c.post("/stop/clear")
 
 
 def test_spoken_stop_does_not_wait_on_the_brain(monkeypatch):

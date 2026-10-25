@@ -352,6 +352,7 @@ class HttpRobot:
     async def stop(self):
         try:
             r = await self.fast.post(f"{self.base}/robot/stop", json={"latch": True, "reason": "operator e-stop (iPad console)"})
+            r.raise_for_status()  # an error reply did not confirm the stop: report it, never pass it off as one
             return r.json()
         except httpx.HTTPError as e:
             return {"status": "stop_request_failed", "error": str(e)}

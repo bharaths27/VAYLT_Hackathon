@@ -36,7 +36,8 @@ APPROVAL_TTL_S = 120.0
 # "Stop. Bring ..."). whisper.cpp writes "Stop."; without this it reached the planner and was refused as an
 # unknown object. Deliberately broad ("don't stop the timer" stops too, and so does "Remember to wait for the
 # student", which must be taught with POST /memory/sources instead): a needless stop costs one clear_stop, a
-# missed stop can hurt someone. "hold on", "hold it" and "hang on" are phrases, so "hold the beaker" is not a
+# missed stop can hurt someone. Decided and kept on purpose (warden, under Carter's rule): "Wait, don't open
+# the gripper" latches a stop, even though it only meant "don't". "hold on", "hold it" and "hang on" are phrases, so "hold the beaker" is not a
 # stop. The same pattern as STOP_WORDS in console/server/parser.py (tests/test_spoken_stop.py checks it).
 STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b",
                         re.IGNORECASE)
