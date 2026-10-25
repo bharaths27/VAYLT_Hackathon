@@ -344,7 +344,7 @@ def test_closing_the_pool_stops_its_thread_and_a_later_clip_starts_afresh(stt, w
 def test_whisper_cli_gets_the_audio_context_and_the_vocabulary_prompt(stt, monkeypatch):
     assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "pick up the beaker"
     ((_, cmd),) = stt.calls
-    assert cmd[cmd.index("-ac") + 1] == "512"
+    assert cmd[cmd.index("-ac") + 1] == "768"
     assert cmd[cmd.index("--prompt") + 1] == config.WHISPER_PROMPT and "claw" in config.WHISPER_PROMPT
     stt.calls.clear()
     monkeypatch.setattr(config, "WHISPER_AUDIO_CTX", 0)  # whisper's own defaults
@@ -362,7 +362,7 @@ def test_the_whisper_server_gets_them_with_every_request(stt, whisper_server, mo
     monkeypatch.setattr(config, "WHISPER_PROMPT", "")
     assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "hello from the server"
     (_, _, first), (_, _, second) = whisper_server["requests"]
-    assert b'name="audio_ctx"\r\n\r\n512\r\n' in first
+    assert b'name="audio_ctx"\r\n\r\n768\r\n' in first
     assert b'name="prompt"\r\n\r\n' + prompt.encode() + b"\r\n" in first
     assert b'name="audio_ctx"' not in second and b'name="prompt"' not in second  # the server's own defaults
 
@@ -1365,10 +1365,20 @@ def test_queue_limits_are_validated(monkeypatch, raw, expected):
 
 
 @pytest.mark.parametrize("raw,expected", [("0", 0), ("384", 384), ("512", 512), ("768", 768), ("1500", 1500),
-                                          ("256", 512), ("383", 512), ("1501", 512), ("-1", 512), ("lots", 512)])
+                                          ("256", 768), ("383", 768), ("1501", 768), ("-1", 768), ("lots", 768)])
 def test_the_audio_context_is_validated(monkeypatch, raw, expected):
     monkeypatch.setenv("ENGRAM_WHISPER_AUDIO_CTX", raw)
-    assert config._audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 512) == expected
+    assert config._audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 768) == expected
+
+
+def test_the_shipped_whisper_defaults():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ENGRAM_")}
+    code = "from console.server import config as c; print(c.WHISPER_AUDIO_CTX); print(c.WHISPER_PROMPT)"
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    ctx, prompt = out.stdout.splitlines()
+    assert ctx == "768"  # not 512: at 512 whisper-cli repeated whole commands on 3 of 32 clips
+    assert "claw" in prompt and "gripper" in prompt
 
 
 @pytest.mark.parametrize("raw,expected", [("x" * 900, "x" * 500), ("  ", ""), ("Open the claw.", "Open the claw.")],
@@ -1393,7 +1403,7 @@ def test_bad_settings_fall_back_to_defaults_at_startup(bad):
             "c.STT_MAX_SECONDS, c.STT_UPLOAD_TIMEOUT_S, c.WHISPER_AUDIO_CTX)")
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0", "20.0", "512"]
+    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0", "20.0", "768"]
 
 
 def test_a_server_that_never_finishes_answering_hits_the_overall_deadline(stt, whisper_server, monkeypatch):

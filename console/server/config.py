@@ -32,7 +32,8 @@ def _count(name: str, default: int, cap: int) -> int:
 
 def _audio_ctx(name: str, default: int) -> int:
     """0 (whisper's own default, all 1500) or 384..1500; anything else gives the default. Below
-    ~384 whisper starts repeating words (256 measured unsafe: multi-second hallucinations)."""
+    ~384 whisper starts repeating words (256 measured unsafe: multi-second hallucinations), and
+    even 512 repeated whole phrases on some clips, hence the 768 default."""
     try:
         n = int(_env(name, str(default)))
     except ValueError:
@@ -72,7 +73,10 @@ WHISPER_SERVER_TIMEOUT_S = _seconds("ENGRAM_WHISPER_SERVER_TIMEOUT_S", 30.0, 120
 # context is much faster: 0 = whisper's default, else 384..1500. Passed to whisper-cli as -ac N,
 # and to the whisper server with every request as its audio_ctx form field (whisper.cpp's
 # /inference reads it per request; the server's own -ac start flag is only its default).
-WHISPER_AUDIO_CTX = _audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 512)
+# Default 768, not 512: on our command clips, 512 made whisper-cli (tiny.en) repeat the whole
+# phrase on 3 of 32 clips ("Don't open the claw. Don't open the claw."), and a duplicated
+# command must not reach the planner. 768 repeated nothing, for ~20 ms more.
+WHISPER_AUDIO_CTX = _audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 768)
 # Initial prompt naming the robot's vocabulary, so whisper hears "claw" rather than "cloth" or
 # "clock". Passed to whisper-cli as --prompt and to the server as its prompt form field; empty =
 # none. A sentence of nouns, not a list of commands: measured, a bare word list did not help and a
