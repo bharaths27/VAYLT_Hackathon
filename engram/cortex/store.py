@@ -21,6 +21,11 @@ from .schema import migrate
 from .types import (Conflict, CortexError, Denied, Goal, Missing, Policy, Stale,
                     canonical, digest, finite, normalize, text, uid)
 
+# Commitment status implied by its proposal's outcome; a settled commitment is never rewritten.
+TASK_STATE = {'success':'done','failed':'failed','rejected':'failed','unknown':'unknown','aborted':'unknown',
+              'cancelled':'cancelled','expired':'expired','invalidated':'failed'}
+STARTED = ('running','unknown','needs_verification')
+
 RULE_RE = re.compile(
     r'(?P<pre>[A-Za-z0-9 _-]+?)\s+(?:must|should|needs? to)\s+be\s+'
     r'(?:at|on|in)\s+(?:the\s+)?(?P<zone>[A-Za-z0-9 _-]+?)\s+before\s+'
@@ -351,8 +356,34 @@ class Store:
                     definition=json.loads(k['definition_json'])
                     if 'source:'+sid in definition.get('refs',[]):
                         self.conn.execute("UPDATE skill_version SET definition_json='{\"redacted\":true}' WHERE id=?",(k['id'],))
-            # A removed instruction cannot wake a pending commitment later.
-            self.conn.execute("UPDATE prospective_task SET status='cancelled' WHERE source_id=? AND status IN ('waiting','fired')", (sid,))
+            # A removed instruction cannot wake a pending commitment later; one whose effect started keeps its real outcome.
+            for t in self.rows("SELECT id FROM prospective_task WHERE source_id=? AND status IN ('waiting','fired')", (sid,)):
+                self.withdraw_commitment(t['id'], 'source withdrawn')
+
+    def settle(self, ep: str, outcome: str, allowed: tuple, failure: str | None = None) -> bool:
+        """The one guarded episode transition; the linked commitment follows in the same transaction."""
+        with self.tx():
+            n = self.conn.execute(f"UPDATE episode SET outcome=?,failure=?,finished_at=? WHERE id=? AND outcome IN ({','.join('?'*len(allowed))}) "
+                                  "AND id IN (SELECT id FROM cx_episode)", (outcome, failure, self.clock(), ep, *allowed)).rowcount
+            if n: self.finish_task(ep, outcome)
+        return n == 1
+
+    def finish_task(self, ep: str, outcome: str) -> None:
+        if outcome in TASK_STATE:
+            with self.tx():
+                self.conn.execute("UPDATE prospective_task SET status=? WHERE proposal_id=? AND status NOT IN ('cancelled','done')", (TASK_STATE[outcome], ep))
+
+    def withdraw_commitment(self, tid: str, reason: str) -> bool:
+        """Cancel a commitment, its unstarted proposal and pending wakes; False if its effect may have started."""
+        with self.tx():
+            r = self.one('SELECT p.proposal_id,e.outcome FROM prospective_task p LEFT JOIN episode e ON e.id=p.proposal_id WHERE p.id=?', (tid,))
+            if not r: raise Missing('task not found')
+            if r['outcome'] in STARTED: return False
+            if r['proposal_id']: self.settle(r['proposal_id'], 'cancelled', ('preparing','proposed'), reason)
+            self.conn.execute("UPDATE prospective_task SET status='cancelled' WHERE id=?", (tid,))
+            self.conn.execute('UPDATE cx_commitment SET generation=generation+1 WHERE id=?', (tid,))
+            self.conn.execute("UPDATE cx_wake SET status='cancelled' WHERE task_id=? AND status IN ('pending','preparing')", (tid,))
+        return True
 
     def rules(self) -> list[dict]:
         return self.rows("SELECT a.*,r.rule_key,r.required_zone,r.status,c.revision FROM assertion a JOIN cx_rule r ON r.assertion_id=a.id "
