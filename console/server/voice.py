@@ -347,7 +347,7 @@ def _native_data(path: Path) -> tuple[int, int, bool] | None:
     per sample, so 12-bit audio in 2-byte samples would pass it. PCM means format tag 1, or
     WAVE_FORMAT_EXTENSIBLE with cbSize >= 22, 16 valid bits and the PCM subtype GUID; any
     other extensible layout (fewer valid bits, a float subtype, a short extension) is not
-    native. Judged from the bytes, not the name.
+    native, and so is a file with more than one fmt chunk. Judged from the bytes, not the name.
 
     size counts only whole samples actually in the file. exact is True only when the header
     says exactly that: the RIFF size is the file size - 8, the data chunk's declared size is
@@ -369,6 +369,8 @@ def _native_data(path: Path) -> tuple[int, int, bool] | None:
                     return None
                 cid, size = chunk[:4], int.from_bytes(chunk[4:], "little")
                 if cid == b"fmt ":
+                    if fmt is not None:  # a second fmt chunk: which one a reader believes is unclear
+                        return None
                     body = f.read(min(size, 40))
                     if size < 16 or len(body) < 16:
                         return None

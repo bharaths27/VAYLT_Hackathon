@@ -867,9 +867,10 @@ def multipart(audio: bytes, auto: str = "0") -> bytes:
             "Content-Type: audio/wav\r\n\r\n").encode() + audio + f"\r\n--{BOUNDARY}--\r\n".encode()
 
 
-def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False, root_path=""):
+def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False, root_path="", stall=False):
     """Drive the ASGI app directly, the way a server would. Returns (status, body, pulled):
-    pulled counts the receive() calls the app made and the body bytes it took."""
+    pulled counts the receive() calls the app made and the body bytes it took. hang_up: the
+    client disconnects after its chunks; stall: it goes quiet after them and never sends more."""
     pulled = {"calls": 0, "bytes": 0}
     chunks = iter(chunks)
     upcoming = [next(chunks, None)]
@@ -878,10 +879,12 @@ def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False, root_
         pulled["calls"] += 1
         chunk = upcoming[0]
         if chunk is None:
+            if stall:
+                await asyncio.sleep(3600)
             return {"type": "http.disconnect"}
         upcoming[0] = next(chunks, None)
         pulled["bytes"] += len(chunk)
-        return {"type": "http.request", "body": chunk, "more_body": upcoming[0] is not None or hang_up}
+        return {"type": "http.request", "body": chunk, "more_body": upcoming[0] is not None or hang_up or stall}
 
     sent = []
 
@@ -891,9 +894,23 @@ def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False, root_
     scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
              "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": root_path,
              "headers": list(headers), "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8000)}
-    asyncio.run(app(scope, receive, send))
+    asyncio.run(asyncio.wait_for(app(scope, receive, send), 10))  # fail, never hang
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")
     return status, b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body"), pulled
+
+
+def _record_spools(monkeypatch):
+    """Every spool file Starlette's multipart parser opens, kept so a test can see it closed."""
+    from starlette import formparsers
+
+    spools, real = [], formparsers.SpooledTemporaryFile
+
+    def recorded(*args, **kwargs):
+        spools.append(real(*args, **kwargs))
+        return spools[-1]
+
+    monkeypatch.setattr(formparsers, "SpooledTemporaryFile", recorded)
+    return spools
 
 
 def _queue_is_empty():
@@ -1023,6 +1040,41 @@ def test_reservations_are_released_after_failure_refusal_and_disconnect(stt, mon
 
 
 @needs_web
+@pytest.mark.parametrize("client", ["stalls", "hangs-up"])
+def test_an_unfinished_upload_frees_its_room_and_its_spool(stt, monkeypatch, client):
+    from console.server import main
+
+    monkeypatch.setattr(config, "STT_UPLOAD_TIMEOUT_S", 0.3)
+    spools = _record_spools(monkeypatch)
+    body = multipart(wav_bytes())
+    headers = [FORM_TYPE, (b"content-length", str(len(body)).encode())]
+    started = time.monotonic()
+    status, out, pulled = _asgi(main.app, headers, [body[: len(body) // 2]],
+                                stall=client == "stalls", hang_up=client == "hangs-up")
+    if client == "stalls":  # declared within the cap, then silence: 408 at the deadline
+        assert status == 408 and json.loads(out)["reason"] == "upload not received within 0.3 s"
+        assert time.monotonic() - started < 2.0
+    else:
+        assert status == 400
+    assert pulled["bytes"] == len(body) // 2
+    assert spools and all(spool.closed for spool in spools)  # the partial spool was closed, not left to GC
+    assert _queue_is_empty()  # and the room it reserved was given back
+    status, out, _ = _asgi(main.app, headers, [body])  # an upload that arrives in time is unaffected
+    assert status == 200 and json.loads(out)["text"] == "pick up the beaker"
+
+
+@needs_web
+def test_an_stt_request_that_is_not_a_multipart_upload_is_answered_422(monkeypatch):
+    from console.server import main
+
+    body = b'{"audio": "not a file"}'
+    status, out, pulled = _asgi(main.app, [(b"content-type", b"application/json"),
+                                           (b"content-length", str(len(body)).encode())], [body])
+    assert (status, json.loads(out)) == (422, {"ok": False, "reason": "no audio file in the upload"})
+    assert pulled["calls"] == 0 and _queue_is_empty()  # nothing read, the room given back
+
+
+@needs_web
 def test_an_upload_longer_than_its_content_length_is_not_read_past_its_reservation(stt, monkeypatch):
     from starlette.datastructures import UploadFile
 
@@ -1138,13 +1190,13 @@ def test_queue_limits_are_validated(monkeypatch, raw, expected):
 def test_bad_settings_fall_back_to_defaults_at_startup(bad):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ENGRAM_")}
     env.update(ENGRAM_WHISPER_SERVER_TIMEOUT_S=bad, ENGRAM_STT_MAX_PENDING=bad, ENGRAM_STT_MAX_SECONDS=bad,
-               ENGRAM_STT_MAX_PENDING_BYTES=bad, ENGRAM_TTS_MAX_PENDING=bad)
+               ENGRAM_STT_MAX_PENDING_BYTES=bad, ENGRAM_TTS_MAX_PENDING=bad, ENGRAM_STT_UPLOAD_TIMEOUT_S=bad)
     code = ("from console.server import config as c; "
             "print(c.WHISPER_SERVER_TIMEOUT_S, c.STT_MAX_PENDING, c.STT_MAX_PENDING_BYTES, c.TTS_MAX_PENDING, "
-            "c.STT_MAX_SECONDS)")
+            "c.STT_MAX_SECONDS, c.STT_UPLOAD_TIMEOUT_S)")
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0"]
+    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0", "20.0"]
 
 
 def test_a_server_that_never_finishes_answering_hits_the_overall_deadline(stt, whisper_server, monkeypatch):
@@ -1299,8 +1351,11 @@ def test_12_bit_audio_in_2_byte_samples_is_converted(stt, tmp_path):
     riff((b"fmt ", b"\x01\x00\x01\x00"), (b"data", PCM_1S)),  # fmt chunk too short
     riff(fmt()),  # no data chunk
     b"RIFX" + riff(fmt(), (b"data", PCM_1S))[4:],  # big-endian RIFF
+    riff(fmt(tag=3, align=4, bits=32), fmt(), (b"data", PCM_1S)),  # two fmt chunks: float, then PCM
+    riff(fmt(), fmt(tag=3, align=4, bits=32), (b"data", PCM_1S)),  # two fmt chunks: PCM, then float
 ], ids=["extensible-12-valid-bits", "extensible-float-subtype", "extensible-cbsize-0", "extensible-short-fmt",
-        "float", "block-align", "data-first", "short-fmt", "no-data", "rifx"])
+        "float", "block-align", "data-first", "short-fmt", "no-data", "rifx", "two-fmt-float-first",
+        "two-fmt-pcm-first"])
 def test_wavs_that_are_not_plain_16_bit_pcm_are_converted(stt, audio):
     assert run(voice.transcribe(audio, ".wav"))[0] == "pick up the beaker"
     assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw == CONVERTED

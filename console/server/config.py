@@ -61,6 +61,9 @@ WHISPER_SERVER_TIMEOUT_S = _seconds("ENGRAM_WHISPER_SERVER_TIMEOUT_S", 30.0, 120
 # Longest clip STT accepts, measured on the decoded audio (at most 120 s). ffmpeg stops decoding
 # just past it, and longer clips are refused before whisper sees them.
 STT_MAX_SECONDS = _seconds("ENGRAM_STT_MAX_SECONDS", 30.0, 120.0)
+# How long /stt waits for the whole upload to arrive (at most 120 s). A client that stalls
+# part way is answered 408 and the room it reserved in the STT queue is given back.
+STT_UPLOAD_TIMEOUT_S = _seconds("ENGRAM_STT_UPLOAD_TIMEOUT_S", 20.0, 120.0)
 # Speech queues: past these, requests are refused as busy instead of piling up in memory.
 # Counts include the job that is running. STT also caps the audio bytes its queued jobs hold.
 STT_MAX_PENDING = _count("ENGRAM_STT_MAX_PENDING", 4, 64)

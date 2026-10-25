@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as FormFile
+from starlette.formparsers import MultiPartParser
 from starlette.requests import ClientDisconnect
 
 from . import brain, config, llm, voice
@@ -99,6 +100,19 @@ def _declared_length(value: str | bytes | None) -> int | None:
 
 class _UploadTooLarge(Exception):
     pass
+
+
+async def _read_stt_form(request: Request, deadline: float):
+    """Parse the multipart /stt body within `deadline` seconds (asyncio.TimeoutError past it).
+    On any way out but success (timeout, client gone, malformed body, the guard's cut-off) the
+    partly written spool files are closed here rather than left for the garbage collector."""
+    parser = MultiPartParser(request.headers, request.stream(), max_files=1, max_fields=2)
+    try:
+        return await asyncio.wait_for(parser.parse(), deadline)
+    except BaseException:
+        for spool in getattr(parser, "_files_to_close_on_error", ()):  # the spool files it opened
+            spool.close()
+        raise
 
 
 def _route_path(scope) -> str:
@@ -510,8 +524,13 @@ async def stt(request: Request):
     except voice.VoiceBusy as e:
         return JSONResponse({"ok": False, "reason": str(e)}, status_code=503)
     with reservation:  # released on every way out unless the STT job has taken it over
+        if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            return JSONResponse({"ok": False, "reason": "no audio file in the upload"}, status_code=422)
+        deadline = config.STT_UPLOAD_TIMEOUT_S
         try:
-            form = await request.form(max_files=1, max_fields=2)
+            form = await _read_stt_form(request, deadline)
+        except asyncio.TimeoutError:
+            return JSONResponse({"ok": False, "reason": f"upload not received within {deadline:g} s"}, status_code=408)
         except ClientDisconnect:
             return Response(status_code=400)  # the client has gone; nobody reads this
         except Exception as e:  # noqa: BLE001 - a malformed (or, past the guard's cap, cut off) upload
