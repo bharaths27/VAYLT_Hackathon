@@ -9,7 +9,9 @@ import gc
 import io
 import json
 import os
+import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -848,6 +850,104 @@ def test_a_converter_that_writes_the_wrong_format_is_refused(stt):
     text, why = run(voice.transcribe(wav_bytes(rate=8000), ".wav"))
     assert (text, why) == (None, "audio is not 16 kHz mono 16-bit PCM after conversion")
     assert stt.tools() == ["ffmpeg"]
+
+
+# ------------------------------------------------------------------ native = the fmt chunk (review fix 6)
+PCM_1S = b"\x10\x20" * 16000  # 1 s of 16-bit mono samples at 16 kHz
+
+
+def riff(*chunks, data_size=None):
+    """A RIFF/WAVE file from (id, body) chunks, each padded to an even size."""
+    body = b"WAVE"
+    for cid, data in chunks:
+        size = data_size if cid == b"data" and data_size is not None else len(data)
+        body += cid + struct.pack("<I", size) + data + (b"\0" if len(data) % 2 else b"")
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def fmt(tag=1, channels=1, rate=16000, align=2, bits=16, extra=b""):
+    return b"fmt ", struct.pack("<HHIIHH", tag, channels, rate, rate * align, align, bits) + extra
+
+
+# WAVE_FORMAT_EXTENSIBLE: cbSize 22, 16 valid bits, front-centre, KSDATAFORMAT_SUBTYPE_PCM
+EXTENSIBLE = fmt(tag=0xFFFE, extra=struct.pack("<HHI", 22, 16, 4) + bytes.fromhex("0100000000001000800000aa00389b71"))
+
+
+def test_12_bit_audio_in_2_byte_samples_is_converted(stt, tmp_path):
+    twelve = riff(fmt(bits=12), (b"data", PCM_1S))
+    clip = tmp_path / "twelve.wav"
+    clip.write_bytes(twelve)
+    with wave.open(str(clip), "rb") as w:  # what fooled the old check: 2 bytes per sample
+        assert (w.getsampwidth(), w.getnchannels(), w.getframerate()) == (2, 1, 16000)
+    assert not voice.is_native_pcm(clip)
+    text, _ = run(voice.transcribe(twelve, ".wav"))
+    assert text == "pick up the beaker"
+    assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw == CONVERTED
+    assert voice_probe.probe_clip(clip)["native_pcm"] is False
+
+
+@pytest.mark.parametrize("audio", [
+    riff(EXTENSIBLE, (b"data", PCM_1S)),  # extensible, even with 16 valid bits of PCM: ffmpeg's job
+    riff(fmt(tag=3, align=4, bits=32), (b"data", PCM_1S)),  # 32-bit float
+    riff(fmt(align=4), (b"data", PCM_1S)),  # block size disagrees with 16-bit mono
+    riff((b"data", PCM_1S), fmt()),  # data before any fmt chunk
+    riff((b"fmt ", b"\x01\x00\x01\x00"), (b"data", PCM_1S)),  # fmt chunk too short
+    riff(fmt()),  # no data chunk
+    b"RIFX" + riff(fmt(), (b"data", PCM_1S))[4:],  # big-endian RIFF
+], ids=["extensible", "float", "block-align", "data-first", "short-fmt", "no-data", "rifx"])
+def test_wavs_that_are_not_plain_16_bit_pcm_are_converted(stt, audio):
+    assert run(voice.transcribe(audio, ".wav"))[0] == "pick up the beaker"
+    assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw == CONVERTED
+
+
+def test_plain_16_bit_pcm_still_skips_ffmpeg_around_other_chunks(stt):
+    native = riff((b"LIST", b"odd"), fmt(), (b"fact", b"\x00\x7d\x00\x00"), (b"data", PCM_1S))
+    assert run(voice.transcribe(native, ".wav"))[0] == "pick up the beaker"
+    assert stt.tools() == ["whisper-cli"] and stt.whisper_saw == native
+
+
+def test_length_counts_only_the_audio_really_in_the_file(stt, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    streamed = riff(fmt(), (b"data", PCM_1S), data_size=0xFFFFFFFF)  # a streaming writer's header
+    clip = tmp_path / "streamed.wav"
+    clip.write_bytes(streamed)
+    assert voice._native_seconds(clip) == 1.0
+    assert run(voice.transcribe(streamed, ".wav"))[0] == "pick up the beaker"
+    assert stt.tools() == ["whisper-cli"]
+
+
+def _real_ffmpeg():
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return shutil.which("ffmpeg")
+
+
+REAL_FFMPEG = _real_ffmpeg()
+
+
+@pytest.mark.skipif(not REAL_FFMPEG, reason="no real ffmpeg on this machine")
+@pytest.mark.parametrize("seconds,expected", [(1.5, ("pick up the beaker", "ok")),
+                                              (5.0, (None, "audio too long: 3.0 s (limit 2 s)"))])
+def test_real_ffmpeg_output_passes_the_native_check(stt, monkeypatch, seconds, expected):
+    monkeypatch.setattr(config, "FFMPEG_BIN", REAL_FFMPEG)
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    stt.installed.add(REAL_FFMPEG)
+    real_run = subprocess.run
+
+    def procs(cmd, **kwargs):  # the real ffmpeg; whisper-cli stays the fake
+        if cmd[0] == REAL_FFMPEG:
+            stt.calls.append(("ffmpeg", list(cmd)))
+            return real_run(cmd, **kwargs)
+        return stt(cmd, **kwargs)
+
+    monkeypatch.setattr(voice, "subprocess", types.SimpleNamespace(run=procs))
+    upload = wav_bytes(rate=44100, channels=2, frames=int(44100 * seconds))
+    assert run(voice.transcribe(upload, ".wav")) == expected
+    if expected[0]:
+        assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw[:4] == b"RIFF"
 
 
 # ------------------------------------------------------------------ probe reference (review fix 5)

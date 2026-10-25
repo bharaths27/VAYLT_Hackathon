@@ -16,6 +16,7 @@ import concurrent.futures
 import hashlib
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
@@ -242,14 +243,44 @@ def whisper_server_endpoint() -> str | None:
     return f"{u.scheme}://{u.netloc}{u.path.rstrip('/')}/inference"
 
 
+# fmt chunk of the one format whisper.cpp reads as-is: (format tag 1 = PCM, 1 channel, 16000 Hz,
+# 2-byte blocks, 16 bits per sample).
+_NATIVE_FMT = (1, 1, 16000, 2, 16)
+
+
 def _native_seconds(path: Path) -> float | None:
-    """Length in seconds, from the WAV header, if the file is exactly what whisper.cpp reads
-    (16 kHz, mono, 16-bit PCM WAV; judged from the header, not the file name). Else None."""
+    """Length in seconds if the file is exactly what whisper.cpp reads: a RIFF/WAVE file whose
+    fmt chunk says PCM (tag 1), 16 bits per sample, 1 channel, 16000 Hz. Else None, and the clip
+    goes through ffmpeg. The fmt chunk is read here directly, with small bounded reads: the wave
+    module only reports whole bytes per sample, so 12-bit audio in 2-byte samples would pass it.
+    WAVE_FORMAT_EXTENSIBLE (and anything else) is not native. The length comes from the data
+    chunk, counting only the bytes actually in the file. Judged from the bytes, not the name."""
     try:
-        with wave.open(str(path), "rb") as w:
-            if (w.getcomptype(), w.getframerate(), w.getnchannels(), w.getsampwidth()) == ("NONE", 16000, 1, 2):
-                return w.getnframes() / 16000
-    except (wave.Error, EOFError, OSError):
+        with open(path, "rb") as f:
+            file_size = os.fstat(f.fileno()).st_size
+            head = f.read(12)
+            if len(head) < 12 or head[:4] != b"RIFF" or head[8:] != b"WAVE":
+                return None
+            fmt = None
+            for _ in range(64):  # a bounded walk over the chunks
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    return None
+                cid, size = chunk[:4], int.from_bytes(chunk[4:], "little")
+                if cid == b"fmt ":
+                    body = f.read(16)
+                    if size < 16 or len(body) < 16:
+                        return None
+                    tag, channels, rate, _byte_rate, align, bits = struct.unpack("<HHIIHH", body)
+                    fmt = (tag, channels, rate, align, bits)
+                    f.seek(size - 16 + (size & 1), os.SEEK_CUR)
+                elif cid == b"data":
+                    if fmt != _NATIVE_FMT:  # also None: data before any fmt chunk
+                        return None
+                    return min(size, file_size - f.tell()) // 2 / 16000
+                else:
+                    f.seek(size + (size & 1), os.SEEK_CUR)  # chunks are padded to even sizes
+    except OSError:
         pass
     return None
 
