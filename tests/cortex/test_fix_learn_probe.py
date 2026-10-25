@@ -43,6 +43,6 @@ def test_probe_records_stop_type_timings_and_model_file_name_not_path(tmp_path,m
     gguf=tmp_path/'q.gguf'; gguf.write_bytes(b'not a real model')
     runs,doc=run_probe(tmp_path,monkeypatch,'ok',('--model-file',str(gguf)))
     r=runs[0]
-    assert r['status']=='response_received' and r['model']=='q.gguf' and r['model_sha256']==hashlib.sha256(b'not a real model').hexdigest()
+    assert r['status']=='response_received' and r['model']=='q.gguf' and r['candidate_model_file_sha256']==hashlib.sha256(b'not a real model').hexdigest() and r['model_identity_verified'] is False
     assert r['trace']['stop_type']=='eos' and r['trace']['timings']=={'predicted_n':40} and r['trace']['thinking_disabled'] is True
     assert str(tmp_path) not in json.dumps(doc['model_file'])
