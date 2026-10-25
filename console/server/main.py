@@ -289,12 +289,15 @@ async def _task_running() -> bool:
         return True
 
 
+def _sentence(text: str) -> str:
+    text = text.strip()
+    return text + "." if text and text[-1] not in ".?!" else text
+
+
 def clarify_reply(reason: str, stopped: bool) -> str:
     """Carter's rule, in words: "I stopped. <reason> Please clarify.", or "<reason> Please clarify." when nothing was
     running (the same wording as engram.engine.clarify_reply)."""
-    reason = reason.strip()
-    if reason and reason[-1] not in ".?!":
-        reason += "."
+    reason = _sentence(reason)
     return ("I stopped. " if stopped else "") + (reason + " " if reason else "") + "Please clarify."
 
 
@@ -354,9 +357,10 @@ async def handle_command(text: str, source: str) -> dict:
     metrics = {"memory_ms": memory_ms, "parse_ms": parse_ms, "planner_calls": planner_calls,
                "plan_ms": int((time.time() - t0) * 1000)}
     out = {"kind": r.kind, "reason": r.reason, "quip": r.quip, "trace": r.trace, "data": r.data, "metrics": metrics}
-    # Unclear: the parser asks ("clarify"), or nothing it knows matched and no model plan came of it (an unparsed
-    # request, often a misheard one). Clear refusals (unsafe, a limit, "don't") are understood and stay abstentions.
-    unclear = r.kind == "clarify" or (r.kind == "abstain" and r.data.get("llm_eligible") is True)
+    # Unclear: the parser asks ("clarify") about something it did not understand, or nothing it knows matched and no
+    # model plan came of it (an unparsed request, often a misheard one). Clear refusals (unsafe, a limit, "don't") are
+    # understood and stay abstentions; so is a request understood but impossible as said (r.understood).
+    unclear = (r.kind == "clarify" and not r.understood) or (r.kind == "abstain" and r.data.get("llm_eligible") is True)
 
     if unclear:
         await _clarify(out, r.short or r.reason, source)
@@ -382,6 +386,8 @@ async def handle_command(text: str, source: str) -> dict:
     await bus.emit("parsed", **{k: v for k, v in out.items() if k != "operation"})
     if unclear:
         await bus.emit("say", text=out["reply"])
+    elif r.kind == "clarify":  # understood, refused as said: its reason, and nothing is stopped
+        await bus.emit("say", text=_sentence(r.short or r.reason))
     elif r.quip:
         await bus.emit("say", text=r.quip if r.kind != "abstain" else f"{r.quip} {r.reason}.")
     return out

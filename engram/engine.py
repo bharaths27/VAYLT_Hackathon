@@ -158,10 +158,10 @@ class Engine:
             # Any question counts, not only memory-shaped ones: a question is never a request to move.
             return {"kind": "answer", **Recall(self.memory).recall(stripped)}
         rule = deferred_rule(stripped)  # "When X, remember that ...": a rule cannot wait for an event
-        if rule is not None:  # it must be said another way: as a rule now, or as a robot action to schedule
+        if rule is not None:  # understood, and refused as said: a rule now, or a robot action to schedule
             reason = (f"I can only schedule a robot action, and not '{rule}': it is a rule. Say the rule now, or "
                       "schedule a robot action, like 'When calibration ends, bring Sample B to the bench'.")
-            return self._refuse(stripped, reason, unclear=True)
+            return self._refuse(stripped, reason, unclear=False)
         when = parse_when(stripped)
         if when:
             trigger, request = when

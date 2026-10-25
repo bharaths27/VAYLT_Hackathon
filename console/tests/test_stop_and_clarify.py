@@ -275,8 +275,8 @@ def test_brain_path_misheard_voice_stops_the_brains_plan(c, on_brain):
     ("open the claw and close the gripper", "One thing at a time: which first? Please clarify."),
     ("open the claw after calibration", "'after' sounds like later, a condition or another step. Please clarify."),
     ("open the claw halfway", "I don't understand 'halfway'. Please clarify."),
-    ("in five minutes, look around", "I can only schedule a robot action. Please clarify."),
-], ids=["more than one thing", "a deferral", "a word it does not use", "not schedulable"])
+    ("In 5 seconds, juggle.", "I don't have a safe primitive for that yet. Please clarify."),
+], ids=["more than one thing", "a deferral", "a word it does not use", "an unparsed task in a delay"])
 def test_the_spoken_reason_is_short_and_the_screen_keeps_the_whole_one(c, text, reply):
     j = c.post("/commands", json={"text": text}).json()
     assert j["kind"] == "clarify" and j["reply"] == reply and len(j["reason"]) > len(reply) - len(" Please clarify.")
@@ -302,3 +302,47 @@ def test_a_parenthesized_refusal_while_a_task_runs_stays_a_refusal(c, held):
 ], ids=lambda v: str(v))
 def test_no_speech_drops_only_recognized_markers(text, noise):
     assert main.voice.no_speech(text) is noise
+
+
+# ---- understood but impossible as said ("I can only schedule a robot action"): a refusal, never a stop -----
+
+
+@pytest.fixture
+def said(monkeypatch):
+    out, real = [], main.bus.emit
+
+    async def emit(type_, **data):
+        if type_ == "say":
+            out.append(data.get("text"))
+        return await real(type_, **data)
+
+    monkeypatch.setattr(main.bus, "emit", emit)
+    return out
+
+
+@pytest.mark.parametrize("text", ["In 5 minutes, look around.", "In 5 minutes, remember that the bench is wet.",
+                                  "In 5 minutes, in 2 minutes, open the claw."],
+                         ids=["not a robot action", "a rule", "a delay of its own"])
+def test_an_understood_request_that_cannot_be_scheduled_is_refused_and_stops_nothing(c, held, said, text):
+    op = start_op(c, held)
+    j = c.post("/commands", json={"text": text}).json()
+    assert j["kind"] == "clarify" and "stopped" not in j and "reply" not in j
+    assert said[-1] == "I can only schedule a robot action." and not main.engine.stopped
+    held.finish.set()
+    assert wait(c, op["id"])["status"] != "STOPPED"
+
+
+@pytest.mark.parametrize("text", ["juggle", "In 5 seconds, juggle.", "In 5 seconds, bring it here."],
+                         ids=["unparsed", "an unparsed task in a delay", "an ambiguous task in a delay"])
+def test_an_unparsed_or_ambiguous_task_still_stops_and_asks(c, held, text):
+    op = start_op(c, held)
+    j = c.post("/commands", json={"text": text}).json()
+    assert j["kind"] == "clarify" and j["stopped"] is True and j["reply"].endswith("Please clarify.")
+    assert wait(c, op["id"])["status"] == "STOPPED"
+
+
+def test_the_parser_marks_what_it_understood():
+    from server.parser import parse
+    assert parse("In 5 minutes, look around.", {}).understood is True
+    assert parse("In 5 seconds, juggle.", {}).understood is False
+    assert parse("bring it here", {}).understood is False

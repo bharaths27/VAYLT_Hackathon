@@ -141,6 +141,9 @@ class ParseResult:
     data: dict[str, Any] = field(default_factory=dict)
     trace: list[str] = field(default_factory=list)  # why the parser decided what it did (shown on HUD)
     short: str = ""  # the reason in a few words, for the spoken "... Please clarify." (the HUD shows reason)
+    # A clarification for a request that was understood but cannot be done as said ("In 5 minutes, look around":
+    # only a robot action is scheduled). It is a refusal, not an ambiguous or misheard command: it stops nothing.
+    understood: bool = False
 
 
 def _num(s: str) -> float | None:
@@ -525,10 +528,14 @@ def _not_schedulable(text: str, inner: str, sub: ParseResult, trace: list[str]) 
     one with no grammar must not run later on a guess (or go to the model fallback, which would plan it now)."""
     why = {"rule": "it is a rule", "prospective": "it has a delay of its own"}.get(sub.kind) or (
         "it does not move the robot" if sub.kind == "plan" else (sub.reason or "I can't do it").rstrip(". "))
+    # Understood: a rule, a second delay, something that does not move, or a task refused for itself (unsafe, a
+    # limit, "don't"). Unclear: the task inside is itself unclear or unparsed, so the whole command is.
+    understood = sub.kind in ("rule", "prospective", "plan") or (sub.kind == "abstain" and not sub.data.get("llm_eligible"))
     return ParseResult("clarify", text, reason=f"I can only schedule a robot action, and not '{inner.strip(' .')}': "
                        f"{why}. Say the rule now, or schedule a robot action, like 'In 5 minutes, open the claw'.",
                        quip=quip("clarify"), trace=trace + [f"only a robot action is scheduled, not a {sub.kind}"] + sub.trace,
-                       short="I can only schedule a robot action")
+                       short="I can only schedule a robot action" if understood else (sub.short or sub.reason),
+                       understood=understood)
 
 
 def _ok(goal, steps, evidence, trace, physical=True) -> ParseResult:

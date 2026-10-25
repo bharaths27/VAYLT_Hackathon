@@ -116,7 +116,7 @@ def test_a_stop_word_is_unchanged(lab):
 @pytest.mark.parametrize("text,unclear", [
     (UNCLEAR, True),                                            # no object it knows
     ("Open the claw later", True),                              # a time that did not parse as a future task
-    ("When calibration ends, remember that the bench is wet", True),   # a rule cannot wait for an event
+    ("When calibration ends, remember that the bench is wet", False),  # understood: a rule cannot wait for an event
     ("", True),                                                 # nothing heard
     (UNDERSTOOD, False),                                        # an action the robot may not do
     ("Don't move Sample B", False),                             # "don't": understood
@@ -145,3 +145,13 @@ def test_the_brain_api_lists_running_plans_and_takes_an_empty_command(lab):
         t.join(10)
     assert r["needs_clarification"] is True and r["stopped"] is True
     assert r["reply"] == "I stopped. I didn't catch anything. Please clarify."
+
+
+def test_a_rule_that_cannot_wait_for_an_event_while_a_plan_runs_is_refused_and_stops_nothing(lab):
+    oid, t, out = start_plan(lab)
+    r = lab.command("When calibration ends, remember that the bench is wet", "test")
+    lab.robot.release.set()
+    t.join(10)
+    assert r["status"] == "refused" and r["needs_clarification"] is False and "stopped" not in r
+    assert r["reason"].startswith("I can only schedule a robot action")
+    assert out["run"]["outcome"] == "success" and lab.robot.state()["stopped"] is False
