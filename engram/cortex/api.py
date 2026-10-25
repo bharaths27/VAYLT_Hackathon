@@ -1,7 +1,8 @@
 """Authenticated additive API for Cortex. Defaults to a separate MOCK database.
 
 Run from the repository root with uvicorn engram.cortex.api:create_app --factory
---host 127.0.0.1 --port 8010. Bind/proxy through trusted TLS for iPad access.
+--host 127.0.0.1 --port 8010. On the Pi use scripts/cortex_sidecar.sh (loopback only, reached
+with ssh -L); no LAN exposure has been reviewed.
 No submitted branch, voice stack, or motor service is modified by importing this.
 """
 from __future__ import annotations
