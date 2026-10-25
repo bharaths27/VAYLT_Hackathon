@@ -47,6 +47,11 @@ ROBOT_URL = _env("ENGRAM_ROBOT_URL", "mock")
 MEMORY_URL = _env("ENGRAM_MEMORY_URL", "mock")
 # Bharath's ENGRAM brain API (plans + approvals + execution). "off" = console plans by itself.
 BRAIN_URL = _env("ENGRAM_BRAIN_URL", "off")
+# How long to wait for the brain. Planning can take 10-50 s when the model plans on the Pi, and approve returns only
+# after the whole plan has run on the robot (each step up to 60 s). One 20 s limit for both made the console say
+# "could not confirm what the robot did" while the robot was still moving.
+BRAIN_PLAN_TIMEOUT_S = _seconds("ENGRAM_BRAIN_PLAN_TIMEOUT_S", 90.0, 600.0)
+BRAIN_RUN_TIMEOUT_S = _seconds("ENGRAM_BRAIN_RUN_TIMEOUT_S", 600.0, 3600.0)
 # Where Deniz's metrics / dream compiler lives. "off" = skip.
 METRICS_URL = _env("ENGRAM_METRICS_URL", "off")
 

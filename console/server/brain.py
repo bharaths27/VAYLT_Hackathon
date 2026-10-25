@@ -37,8 +37,9 @@ def enabled() -> bool:
     return bool(URL)
 
 
-async def _post(path: str, body: dict | None = None) -> dict:
-    r = await _c.post(URL + path, json=body or {})
+async def _post(path: str, body: dict | None = None, timeout: float | None = None) -> dict:
+    extra = {"timeout": timeout} if timeout else {}  # quick calls (stop, health) keep the client's 20 s
+    r = await _c.post(URL + path, json=body or {}, **extra)
     if r.status_code >= 400:
         try:
             detail = r.json().get("detail")
@@ -62,7 +63,7 @@ async def health() -> dict:
 
 
 async def command(text: str) -> dict:
-    return await _post("/commands", {"text": text, "who": WHO})
+    return await _post("/commands", {"text": text, "who": WHO}, timeout=config.BRAIN_PLAN_TIMEOUT_S)
 
 
 async def pending() -> list[dict]:
@@ -73,7 +74,9 @@ async def pending() -> list[dict]:
 
 
 async def approve(oid: str, digest: str) -> dict:
-    return await _post(f"/operations/{oid}/approve", {"digest": digest, "approved_by": WHO})
+    # The brain answers only when the whole plan has run on the robot.
+    return await _post(f"/operations/{oid}/approve", {"digest": digest, "approved_by": WHO},
+                       timeout=config.BRAIN_RUN_TIMEOUT_S)
 
 
 async def stop() -> dict:
@@ -90,18 +93,24 @@ async def clear_stop() -> dict:
         return {"error": str(e)}
 
 
+def _items(mem: dict, key: str) -> list[dict]:
+    """The brain sends some memory items as plain strings (constraints always, after a failed step): a string is
+    that item's text. Calling .get on one crashed every plan that carried a constraint."""
+    return [x if isinstance(x, dict) else {"text": str(x)} for x in (mem.get(key) or [])]
+
+
 def to_bundle(mem: dict | None) -> dict:
     """Brain MemoryBundle -> the console's memory panel shape."""
     mem = mem or {}
     facts = [{"id": f.get("chunk_id") or f.get("id") or f"fact{i}", "text": f.get("statement") or f.get("text") or str(f),
-              "source_id": f.get("chunk_id") or f.get("source_id") or ""} for i, f in enumerate(mem.get("facts", []))]
-    for e in mem.get("evidence", []):
+              "source_id": f.get("chunk_id") or f.get("source_id") or ""} for i, f in enumerate(_items(mem, "facts"))]
+    for e in _items(mem, "evidence"):
         facts.append({"id": e.get("chunk_id") or e.get("id") or "", "text": e.get("text") or e.get("quote") or str(e),
                       "source_id": e.get("chunk_id") or e.get("source_id") or ""})
-    binds = [{"id": o.get("id"), "name": o.get("name"), "aliases": [], "tag_id": o.get("tag"),
-              "source_id": f"memory:{o.get('id')}", "last_seen": o.get("statement")} for o in mem.get("objects", [])]
+    binds = [{"id": o.get("id"), "name": o.get("name") or o.get("text"), "aliases": [], "tag_id": o.get("tag"),
+              "source_id": f"memory:{o.get('id')}", "last_seen": o.get("statement")} for o in _items(mem, "objects")]
     cons = [{"id": c.get("id", f"c{i}"), "text": c.get("statement") or c.get("text") or str(c),
-             "source_id": c.get("chunk_id") or c.get("source_id") or ""} for i, c in enumerate(mem.get("constraints", []))]
+             "source_id": c.get("chunk_id") or c.get("source_id") or ""} for i, c in enumerate(_items(mem, "constraints"))]
     return {"bundle_id": "brain", "goal": mem.get("goal"), "facts": facts[:6], "bindings": binds, "zones": [],
             "constraints": cons, "skills": mem.get("applicable_skills", []),
             "missing_evidence": mem.get("missing", []), "source_ids": [f["source_id"] for f in facts if f["source_id"]]}
