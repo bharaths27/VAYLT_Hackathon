@@ -139,11 +139,15 @@ def create_app(bot: RobotClient, transcribe, pin: str | None = None, brain: "Bra
 
     def clarify(text: str, intent: dict) -> dict:
         """Carter's rule: "ambiguous or misheard command: we stop the task and ask user to please clarify."
-        For what this console answers itself: in direct mode a request it cannot parse, in brain mode one with
-        no words in it (the brain answers everything else, under the same rule). If the robot is busy it is
+        For what this console answers itself: in direct mode whatever the parser does not say it understood
+        (its classification; a result that does not say counts as unclear), in brain mode only a request with no
+        words in it (the brain answers everything else, under the same rule). If the robot is busy it is
         stopped with the latching stop (a reset is needed to move again): "I stopped. <reason> Please
         clarify."; if not, nothing is stopped: "<reason> Please clarify."."""
-        if intent.get("op") is not None or (brain is not None and not no_speech(text)):
+        if brain is not None:
+            if not no_speech(text):
+                return intent
+        elif intent.get("classification") == "understood":   # a command, or a refusal of one: unchanged
             return intent
         stopped, lead = busy(), ""
         if stopped:

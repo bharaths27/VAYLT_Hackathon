@@ -257,3 +257,40 @@ def test_a_robot_that_does_not_say_it_is_idle_counts_as_busy(stack, monkeypatch,
     r = transcribe(c)
     assert r["stopped"] is True and svc.safety.estop_latched    # only "null" (or false) says idle
     svc.reset("test")
+
+
+# ---- every parse states its classification; only "understood" keeps a running task going -------------------
+
+
+@pytest.mark.parametrize("said, cls", [
+    ("Open the claw", "understood"), ("Stop!", "understood"), ("don't open the claw", "understood"),
+    ("[BLANK_AUDIO]", "misheard"), ("", "misheard"), ("make me a sandwich", "unclear"),
+])
+def test_every_parse_states_its_classification(said, cls):
+    assert parse(said)["classification"] == cls
+
+
+def test_a_negation_is_refused_not_turned_into_the_motion():
+    r = parse("Don't open the claw.")
+    assert r["op"] is None and r["say"] == "You said not to, so nothing will move." and r["classification"] == "understood"
+
+
+def test_a_refusal_while_the_robot_is_busy_stops_nothing(stack, monkeypatch):
+    c, d, whisper, svc = stack
+    whisper.text = "don't open the claw"
+    robot_busy(monkeypatch)
+    r = transcribe(c)
+    assert r["op"] is None and r["classification"] == "understood" and "stopped" not in r
+    assert r["say"] == "You said not to, so nothing will move." and not svc.safety.estop_latched
+
+
+def test_a_parse_that_does_not_say_it_understood_counts_as_unclear(stack, monkeypatch):
+    import voice.server as voice_server
+
+    c, d, whisper, svc = stack
+    whisper.text = "open the claw"
+    robot_busy(monkeypatch)
+    monkeypatch.setattr(voice_server, "parse", lambda text, poses=(): {"op": None, "say": "Hm."})   # says nothing
+    r = transcribe(c)
+    assert r["stopped"] is True and svc.safety.estop_latched
+    svc.reset("test")
