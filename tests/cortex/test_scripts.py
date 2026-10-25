@@ -30,3 +30,44 @@ def test_opt_in_console_patch_rejects_changed_anchors_and_preserves_voice(tmp_pa
     again=mod.transforms(root);assert all(old==new for _,old,new in again)
     (root/'console/server/brain.py').write_text('unknown upstream version')
     with pytest.raises(ValueError):mod.transforms(root)
+
+def test_a_destination_swapped_for_a_symlink_never_overwrites_another_database(tmp_path,monkeypatch):
+    # Round 12: the old backup reserved the destination with O_EXCL, closed it and reopened it by name, so a symlink swapped
+    # in between pointed SQLite at another database and the backup overwrote it.
+    import os
+    mod=load_script('cortex_backup');source,dest,victim=tmp_path/'source.db',tmp_path/'backup.db',tmp_path/'victim.db'
+    with sqlite3.connect(source) as c:c.execute('CREATE TABLE notes(n TEXT)');c.execute("INSERT INTO notes VALUES('persisted')")
+    with sqlite3.connect(victim) as c:c.execute('CREATE TABLE kept(v TEXT)');c.execute("INSERT INTO kept VALUES('untouched')")
+    try:os.symlink(victim,tmp_path/'probe')
+    except OSError:pytest.skip('this user cannot create symlinks here')
+    def swap():                                                       # the destination becomes a symlink to another database
+        if os.path.lexists(dest):os.unlink(dest)
+        os.symlink(victim,dest)
+    connect,link=sqlite3.connect,os.link
+    def connecting(path,*a,**k):
+        if str(path)==str(dest):swap()                                # reserved and closed, about to be reopened by name
+        return connect(path,*a,**k)
+    def linking(src,dst,*a,**k):
+        if str(dst)==str(dest):swap()                                 # staged, about to be published
+        return link(src,dst,*a,**k)
+    monkeypatch.setattr(mod.sqlite3,'connect',connecting);monkeypatch.setattr(mod.os,'link',linking)
+    with pytest.raises(FileExistsError):mod.backup(source,dest)       # was: no error, the other database overwritten
+    monkeypatch.undo()
+    with sqlite3.connect(victim) as c:assert c.execute('SELECT v FROM kept').fetchone()[0]=='untouched'
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith('.cortex-backup-')]    # the staging directory is gone
+
+def test_a_planted_staging_entry_is_never_written_through(tmp_path,monkeypatch):
+    # The staged copy is created exclusively and without following a link: an entry already in the staging directory (a
+    # symlink to another database, planted by whoever controls it) refuses the backup instead of being written through.
+    import os,tempfile
+    mod=load_script('cortex_backup');source,dest,victim=tmp_path/'source.db',tmp_path/'backup.db',tmp_path/'victim.db'
+    with sqlite3.connect(source) as c:c.execute('CREATE TABLE notes(n TEXT)')
+    with sqlite3.connect(victim) as c:c.execute('CREATE TABLE kept(v TEXT)');c.execute("INSERT INTO kept VALUES('untouched')")
+    stage=tmp_path/'planted';stage.mkdir()
+    try:os.symlink(victim,stage/'backup.db')
+    except OSError:pytest.skip('this user cannot create symlinks here')
+    monkeypatch.setattr(tempfile,'mkdtemp',lambda **k:str(stage))
+    with pytest.raises(FileExistsError):mod.backup(source,dest)
+    monkeypatch.undo()
+    with sqlite3.connect(victim) as c:assert c.execute('SELECT v FROM kept').fetchone()[0]=='untouched'
+    assert not dest.exists()
