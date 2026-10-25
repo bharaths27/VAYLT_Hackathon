@@ -2,6 +2,7 @@
 
 import re
 import threading
+import time
 
 import pytest
 
@@ -826,3 +827,19 @@ def test_a_final_whose_utterance_was_stopped_while_it_waited_names_the_stop():
     t.join(5)
     fake.release.set()
     assert (out["r"].action, out["r"].cause) == ("ignored", "stopped")
+
+
+def test_a_final_superseded_while_it_waited_names_the_newer_utterance():
+    fake = FakeIntent()
+    fake.hold()
+    gate = SpeculationGate(fake)
+    gate.on_partial(1, 0, "Open the")
+    assert fake.entered.acquire(timeout=5)               # utterance 1's partial is with the model
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 1, "Open the claw")))
+    t.start()
+    time.sleep(0.05)                                     # the final waits for that answer
+    gate.on_partial(2, 0, "Close the claw")              # utterance 2 begins meanwhile
+    fake.release.set()
+    t.join(5)
+    assert (out["r"].action, out["r"].cause) == ("ignored", "superseded")
