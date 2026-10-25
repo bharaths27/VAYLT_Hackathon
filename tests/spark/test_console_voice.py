@@ -1070,6 +1070,32 @@ def test_a_reserved_job_cancelled_while_it_waits_gives_its_room_back():
     assert (q.jobs, q.bytes) == (0, 0)
 
 
+@pytest.mark.skipif(not _console_web_deps(), reason="python-multipart (console/requirements.txt) not installed")
+def test_stt_handler_drops_the_clip_before_running_the_command(monkeypatch):
+    import inspect
+
+    from fastapi.testclient import TestClient
+
+    from console.server import main
+
+    seen = {}
+
+    async def fake_transcribe(data, suffix, **kw):
+        return "open the gripper", "ok"
+
+    async def slow_command(text, source):  # runs while /stt awaits it: look at the handler's frame
+        caller = inspect.currentframe().f_back
+        seen["handler"] = caller.f_code.co_name
+        seen["holds_clip"] = "data" in caller.f_locals
+        return {"ok": True}
+
+    monkeypatch.setattr(main.voice, "transcribe", fake_transcribe)
+    monkeypatch.setattr(main, "handle_command", slow_command)
+    r = TestClient(main.app).post("/stt", files={"audio": ("a.wav", wav_bytes(), "audio/wav")}, data={"auto": "1"})
+    assert r.status_code == 200 and r.json()["text"] == "open the gripper"
+    assert seen == {"handler": "stt", "holds_clip": False}
+
+
 # ------------------------------------------------------------------ server deadline (review fix 2)
 @pytest.mark.parametrize("raw,expected", [
     ("inf", 30.0), ("-inf", 30.0), ("nan", 30.0), ("-5", 30.0), ("0", 30.0), ("1e9", 30.0),

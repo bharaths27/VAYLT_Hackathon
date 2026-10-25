@@ -520,7 +520,10 @@ async def stt(request: Request):
             suffix = Path(audio.filename or "a.webm").suffix or ".webm"
         finally:
             await form.close()
-        text, why = await voice.transcribe(data, suffix, reservation=reservation)
+        try:
+            text, why = await voice.transcribe(data, suffix, reservation=reservation)
+        finally:
+            del data  # the queue released its byte reservation: the handler must not keep the clip either
     if not text:
         return JSONResponse({"ok": False, "reason": why}, status_code=503)
     res = {"ok": True, "text": text}
