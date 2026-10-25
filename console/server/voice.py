@@ -242,15 +242,41 @@ def whisper_server_endpoint() -> str | None:
     return f"{u.scheme}://{u.netloc}{u.path.rstrip('/')}/inference"
 
 
-def is_native_pcm(path: Path) -> bool:
-    """True for exactly what whisper.cpp reads: 16 kHz, mono, 16-bit PCM WAV. Judged from the
-    WAV header, not the file name."""
+def _native_seconds(path: Path) -> float | None:
+    """Length in seconds, from the WAV header, if the file is exactly what whisper.cpp reads
+    (16 kHz, mono, 16-bit PCM WAV; judged from the header, not the file name). Else None."""
     try:
         with wave.open(str(path), "rb") as w:
-            return (w.getcomptype() == "NONE" and w.getframerate() == 16000
-                    and w.getnchannels() == 1 and w.getsampwidth() == 2)
+            if (w.getcomptype(), w.getframerate(), w.getnchannels(), w.getsampwidth()) == ("NONE", 16000, 1, 2):
+                return w.getnframes() / 16000
     except (wave.Error, EOFError, OSError):
-        return False
+        pass
+    return None
+
+
+def is_native_pcm(path: Path) -> bool:
+    """True for exactly what whisper.cpp reads: 16 kHz, mono, 16-bit PCM WAV."""
+    return _native_seconds(path) is not None
+
+
+def wav_byte_limit() -> int:
+    """Largest WAV that STT will hand to whisper: STT_MAX_SECONDS of 16 kHz mono 16-bit PCM, plus
+    the extra second ffmpeg may write (see _transcribe_job) and a little slack for the header."""
+    return int((config.STT_MAX_SECONDS + 2) * 16000 * 2) + 4096
+
+
+def _wav_problem(wav: Path) -> str | None:
+    """Why this WAV must not reach whisper, or None. Looks at its size on disk first and then
+    only at its header, so an oversized file is refused before anything reads it into memory."""
+    limit = config.STT_MAX_SECONDS
+    if wav.stat().st_size > wav_byte_limit():
+        return f"audio too long: over {limit:g} s"
+    seconds = _native_seconds(wav)
+    if seconds is None:
+        return "audio is not 16 kHz mono 16-bit PCM after conversion"
+    if seconds > limit:
+        return f"audio too long: {seconds:.1f} s (limit {limit:g} s)"
+    return None
 
 
 def _server_transcribe(endpoint: str, wav: Path) -> tuple[str | None, str]:
@@ -297,10 +323,19 @@ def _transcribe_job(audio: bytes, suffix: str) -> tuple[str | None, str]:
             return None, f"STT not installed: {st}"
         else:
             wav = Path(d) / "converted-16k-mono.wav"
-            conv = subprocess.run([config.FFMPEG_BIN, "-y", "-loglevel", "error", "-i", str(src), "-ar", "16000", "-ac", "1", str(wav)],
+            # Bound the DECODED audio while ffmpeg writes it (-t length, -fs file size): a small,
+            # long compressed clip must not grow into a WAV that fills memory or /tmp. ffmpeg may
+            # write one second past the limit so the check below can tell "too long" from
+            # "exactly at the limit".
+            conv = subprocess.run([config.FFMPEG_BIN, "-y", "-loglevel", "error", "-i", str(src),
+                                   "-t", f"{config.STT_MAX_SECONDS + 1:g}", "-fs", str(wav_byte_limit()),
+                                   "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
                                   capture_output=True, timeout=20)
             if conv.returncode != 0:
                 return None, "ffmpeg failed: " + conv.stderr.decode()[-200:]
+        problem = _wav_problem(wav)  # before the server or whisper-cli reads a byte of it
+        if problem:
+            return None, problem
         server_why = ""
         if server:
             text, server_why = _server_transcribe(server, wav)

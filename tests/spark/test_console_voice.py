@@ -63,6 +63,10 @@ class FakeSpeechProcs:
         self.whisper_saw = None
         self.gate = None  # threading.Event: hold every process until it is set
         self.time_out_on = set()  # whisper-cli call numbers (1-based) that raise TimeoutExpired
+        self.decoded_seconds = None  # None: ffmpeg writes CONVERTED; else this much 16 kHz audio
+        self.obeys_t = True  # a real ffmpeg stops at -t; a broken converter might not
+        self.extra_bytes = 0  # bytes after the data chunk that the WAV header does not count
+        self.ffmpeg_wrote = None
 
     def __call__(self, cmd, **kwargs):
         with self.lock:
@@ -78,7 +82,8 @@ class FakeSpeechProcs:
                 raise subprocess.TimeoutExpired(cmd, 40)
             if tool == "ffmpeg":
                 src, dst = Path(cmd[cmd.index("-i") + 1]), Path(cmd[-1])
-                dst.write_bytes(CONVERTED)
+                dst.write_bytes(self.decode(cmd))
+                self.ffmpeg_wrote = dst.stat().st_size
                 self.upload_after_ffmpeg = src.read_bytes()
                 return subprocess.CompletedProcess(cmd, 0, b"", b"")
             if tool == "whisper-cli":
@@ -88,6 +93,14 @@ class FakeSpeechProcs:
         finally:
             with self.lock:
                 self.active -= 1
+
+    def decode(self, cmd):
+        if self.decoded_seconds is None:
+            return CONVERTED
+        seconds = self.decoded_seconds
+        if self.obeys_t:
+            seconds = min(seconds, float(cmd[cmd.index("-t") + 1]))
+        return wav_bytes(frames=int(seconds * 16000)) + b"\0" * self.extra_bytes
 
     def tools(self):
         return [tool for tool, _ in self.calls]
@@ -744,13 +757,14 @@ def test_queue_limits_are_validated(monkeypatch, raw, expected):
 @pytest.mark.parametrize("bad", ["inf", "nan", "-5", "1e9"])
 def test_bad_settings_fall_back_to_defaults_at_startup(bad):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ENGRAM_")}
-    env.update(ENGRAM_WHISPER_SERVER_TIMEOUT_S=bad, ENGRAM_STT_MAX_PENDING=bad,
+    env.update(ENGRAM_WHISPER_SERVER_TIMEOUT_S=bad, ENGRAM_STT_MAX_PENDING=bad, ENGRAM_STT_MAX_SECONDS=bad,
                ENGRAM_STT_MAX_PENDING_BYTES=bad, ENGRAM_TTS_MAX_PENDING=bad)
     code = ("from console.server import config as c; "
-            "print(c.WHISPER_SERVER_TIMEOUT_S, c.STT_MAX_PENDING, c.STT_MAX_PENDING_BYTES, c.TTS_MAX_PENDING)")
+            "print(c.WHISPER_SERVER_TIMEOUT_S, c.STT_MAX_PENDING, c.STT_MAX_PENDING_BYTES, c.TTS_MAX_PENDING, "
+            "c.STT_MAX_SECONDS)")
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8"]
+    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0"]
 
 
 def test_a_server_that_never_finishes_answering_hits_the_overall_deadline(stt, whisper_server, monkeypatch):
@@ -777,3 +791,75 @@ def test_probe_records_an_stt_timeout_and_keeps_going(stt, tmp_path, capsys):
     assert b["latency_s"] >= 0
     assert report["summary"]["transcribed"] == 2 and report["summary"]["failed"] == 1
     assert code == 1
+
+
+# ------------------------------------------------------------------ decoded length (review fix 4)
+def test_long_clip_is_cut_short_by_ffmpeg_and_refused(stt, monkeypatch):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    stt.decoded_seconds = 600  # a few bytes of compressed audio that decode to ten minutes
+    text, why = run(voice.transcribe(b"\x1aE\xdf\xa3 small but long webm", ".webm"))
+    assert (text, why) == (None, "audio too long: 3.0 s (limit 2 s)")
+    ((_, cmd),) = stt.calls
+    assert cmd[cmd.index("-t") + 1] == "3" and int(cmd[cmd.index("-fs") + 1]) == voice.wav_byte_limit()
+    assert stt.ffmpeg_wrote <= voice.wav_byte_limit()  # ffmpeg stopped at -t
+    assert stt.tools() == ["ffmpeg"]  # whisper never ran
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_a_clip_right_at_the_limit_is_transcribed(stt, monkeypatch, native):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    if native:
+        audio = wav_bytes(frames=32000)  # 2.0 s
+    else:
+        stt.decoded_seconds, audio = 2.0, wav_bytes(rate=44100)
+    assert run(voice.transcribe(audio, ".wav"))[0] == "pick up the beaker"
+
+
+def test_a_native_wav_over_the_limit_is_refused(stt, monkeypatch):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    text, why = run(voice.transcribe(wav_bytes(frames=40000), ".wav"))  # 2.5 s, needs no ffmpeg
+    assert (text, why) == (None, "audio too long: 2.5 s (limit 2 s)")
+    assert stt.calls == []
+
+
+@pytest.mark.parametrize("decoded_seconds,extra_bytes", [(60, 0), (1, 4 * 1024 * 1024)],
+                         ids=["converter-ignores-t", "header-undercounts-file"])
+def test_an_oversized_wav_is_refused_before_anything_reads_it(stt, whisper_server, monkeypatch,
+                                                              decoded_seconds, extra_bytes):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"])
+    stt.decoded_seconds, stt.obeys_t, stt.extra_bytes = decoded_seconds, False, extra_bytes
+    reads = []
+    real_read_bytes = Path.read_bytes
+
+    def spy(self):
+        reads.append(self.stat().st_size)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", spy)
+    text, why = run(voice.transcribe(wav_bytes(rate=44100), ".wav"))
+    assert (text, why) == (None, "audio too long: over 2 s")
+    assert stt.ffmpeg_wrote > voice.wav_byte_limit()  # the converter really did misbehave
+    assert reads and max(reads) <= voice.wav_byte_limit()  # and nothing read that file
+    assert whisper_server["requests"] == [] and stt.tools() == ["ffmpeg"]
+
+def test_a_converter_that_writes_the_wrong_format_is_refused(stt):
+    stt.decode = lambda cmd: wav_bytes(rate=44100, channels=2)  # not what whisper reads
+    text, why = run(voice.transcribe(wav_bytes(rate=8000), ".wav"))
+    assert (text, why) == (None, "audio is not 16 kHz mono 16-bit PCM after conversion")
+    assert stt.tools() == ["ffmpeg"]
+
+
+# ------------------------------------------------------------------ probe reference (review fix 5)
+def test_probe_records_a_bad_reference_and_keeps_going(stt, tmp_path, capsys):
+    folder = _clips(tmp_path, a=(wav_bytes(), None), b=(wav_bytes(), None), c=(wav_bytes(), "pick up the beaker"))
+    (folder / "a.txt").write_bytes(b"\xff\xfe pick up \xfa")  # not UTF-8
+    (folder / "b.txt").mkdir()  # there, but cannot be read as a file
+    code = voice_probe.main([str(folder)])
+    report = json.loads(capsys.readouterr().out)
+    a, b, c = report["clips"]
+    assert "UnicodeDecodeError" in a["reference_error"] and a["reference"] is None and a["wer"] is None
+    assert b["reference_error"] and b["reference"] is None and b["wer"] is None
+    assert [x["transcript"] for x in (a, b, c)] == ["pick up the beaker"] * 3  # all still transcribed
+    assert c["reference_error"] is None and c["wer"] == 0
+    assert report["summary"]["reference_errors"] == 2 and report["summary"]["failed"] == 0 and code == 0
