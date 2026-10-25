@@ -3,17 +3,48 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
+import logging
 import socket
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import WebSocket
 
 from . import config
 from .plan import PRIMITIVES, Plan
+
+log = logging.getLogger("console.core")
+TELEMETRY_TIMEOUT_S = 0.5
+
+
+async def best_effort(*calls: Callable[[], Any], timeout_s: float = TELEMETRY_TIMEOUT_S) -> None:
+    """Run telemetry calls (bus emits, ledger writes) in order, after a safety action, never before it.
+    Each failure is logged and skipped, and all of them together get at most timeout_s, so none can raise
+    into or stall the caller. (A write that blocks the event loop cannot be cut short: it comes last.)"""
+    async def run() -> None:
+        for call in calls:
+            try:
+                r = call()
+                if inspect.isawaitable(r):
+                    await r
+            except Exception as e:  # noqa: BLE001
+                log.warning("telemetry failed: %s: %s", type(e).__name__, e)
+
+    try:
+        await asyncio.wait_for(run(), timeout_s)
+    except asyncio.TimeoutError:
+        log.warning("telemetry took over %.1f s; the rest was skipped", timeout_s)
+
+
+def _stop_failed(r: Any) -> Any:
+    """A stop call that raised becomes the same failure record the HTTP robot adapter already returns."""
+    if isinstance(r, BaseException):
+        return {"status": "stop_request_failed", "error": f"{type(r).__name__}: {r}"}
+    return r
 
 
 # --------------------------------------------------------------------------- bus
@@ -267,19 +298,23 @@ class Engine:
             await self.bus.emit("log", level="warn", msg=f"episode not recorded: {e}")
 
     async def stop(self, by="operator") -> dict:
-        self.stopped = True
-        res = await self.robot.stop()
-        from . import brain
-        if brain.enabled():
-            res = {**(res or {}), "brain": await brain.stop()}
+        """E-STOP. The latch, the cancellations and the stop calls to the robot and the brain all happen before
+        any telemetry, which comes last and is best effort: a stalled HUD client or a failed ledger write can
+        neither delay nor skip a stop."""
+        self.stopped = True  # the executor checks this before every step, and approve() refuses while it is set
         for op in self.ops.values():
             if op.status == "PENDING_APPROVAL":
                 op.status = "CANCELLED"
-            if op.task and not op.task.done():
-                pass  # executor sees self.stopped and skips remaining steps
-            await self.bus.emit("operation", op=op.public())
-        self.ledger.append("estop", by=by, robot=res)
-        await self.bus.emit("stop", by=by, robot=res)
+        from . import brain
+        # Both at once, each failure on its own: a slow or failing robot call must not hold up the brain's stop.
+        robot_res, *brain_res = await asyncio.gather(self.robot.stop(), *([brain.stop()] if brain.enabled() else []),
+                                                     return_exceptions=True)
+        res = _stop_failed(robot_res)
+        if brain_res:
+            res = {**(res or {}), "brain": _stop_failed(brain_res[0])}
+        await best_effort(lambda: self.ledger.append("estop", by=by, robot=res),
+                          lambda: self.bus.emit("stop", by=by, robot=res),
+                          *[lambda op=op: self.bus.emit("operation", op=op.public()) for op in list(self.ops.values())])
         return res
 
     async def clear_stop(self) -> dict:

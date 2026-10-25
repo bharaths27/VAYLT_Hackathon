@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from . import brain, config, llm, voice
 from .adapters.memory import make_memory
 from .adapters.robot import make_camera, make_robot
-from .core import Bus, Engine, Ledger, Operation, hash_models, upstream_online
+from .core import Bus, Engine, Ledger, Operation, best_effort, hash_models, upstream_online
 from .parser import is_stop, parse, quip
 
 WEB = config.ROOT / "web"
@@ -170,10 +170,10 @@ class Command(BaseModel):
 
 async def handle_command(text: str, source: str) -> dict:
     t0 = time.time()
+    if is_stop(text):  # first: not even the "heard" telemetry may delay or skip a stop
+        return await _stop_command(text, source, t0)
     await bus.emit("heard", text=text, source=source)
     ledger.append("command", text=text, source=source)
-    if is_stop(text):
-        return await _stop_command(text, source, t0)
     if brain.enabled():
         return await _brain_command(text, source, t0)
     scene = STATUS.get("last_state") or {}
@@ -228,14 +228,18 @@ async def handle_command(text: str, source: str) -> dict:
 
 
 async def _stop_command(text: str, source: str, t0: float) -> dict:
-    """A spoken or typed stop acts before memory, the brain bridge or any planner is asked: none of them
-    may delay it or read it as something else. engine.stop() also stops the brain when the bridge is on."""
+    """A spoken or typed stop acts before telemetry, memory, the brain bridge or any planner: none of them may
+    delay it or read it as something else. engine.stop() latches and stops the robot (and the brain, when the
+    bridge is on) before its own telemetry; this command's telemetry comes after that, best effort."""
     await engine.stop(by=f"command:{source}")
     out = {"kind": "stop", "reason": "", "quip": quip("stop"), "trace": ["stop word"], "data": {},
            "metrics": {"plan_ms": int((time.time() - t0) * 1000), "planner_calls": 0}}
-    ledger.append("parse", text=text, result_kind="stop", reason="", trace=out["trace"], metrics=out["metrics"])
-    await bus.emit("parsed", **out)
-    await bus.emit("say", text=out["quip"])
+    await best_effort(lambda: ledger.append("command", text=text, source=source),
+                      lambda: ledger.append("parse", text=text, result_kind="stop", reason="", trace=out["trace"],
+                                            metrics=out["metrics"]),
+                      lambda: bus.emit("heard", text=text, source=source),
+                      lambda: bus.emit("parsed", **out),
+                      lambda: bus.emit("say", text=out["quip"]))
     return out
 
 
