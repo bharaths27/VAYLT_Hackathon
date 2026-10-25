@@ -45,8 +45,9 @@ def test_mutation_suite_known_wrong_plans_fail_verification(store,rule,name):
 
 @pytest.mark.parametrize('goal',[FETCH_B,Goal('fetch',('sample_a',),'home'),Goal('goto',zone='home'),CLAW,Goal('inspect',('goggles',))])
 def test_compiled_plans_still_verify(store,rule,goal):
-    c=Compiler(store); p=c.compile(goal)
-    assert verify(goal,p['steps'],c.fixture(),store.related_rules(goal),store.policy).ok
+    c=Compiler(store); f={**c.fixture(),'holding':None,'holding_known':True}   # the claw is reported empty
+    p=c.compile(goal,f)
+    assert verify(goal,p['steps'],f,store.related_rules(goal),store.policy).ok
 
 def _model_brain(arena,clock,steps,policy=None):
     calls=[]

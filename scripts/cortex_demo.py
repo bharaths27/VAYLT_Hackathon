@@ -40,8 +40,10 @@ def run():
         r=b.approve(p['operation_id'],p['digest'],principal='demo')
         assert r['status']=='success' and robot.positions['goggles']=='ppe_station' and robot.positions['sample_b']=='bench'
         check('new_task_uses_newly_stored_recipe',recipe_id=recipe['id'],source=src['source_id'],actual_mock_positions=dict(robot.positions),planning_ms=round(first_ms,3))
-        # Controlled new-task fixture: put only the target back, then record a simulated observation.
+        # Controlled new-task fixture: put the target and its prerequisite back (a state that needs the whole stored
+        # procedure; with the goggles already in place the skill would re-handle them and is not reused), then observe.
         robot.positions['sample_b']='home';s.observe('sample_b','home',origin='demo_fixture_reset',mode='SIMULATED',evidence='controlled repeat fixture')
+        robot.positions['goggles']='home';s.observe('goggles','home',origin='demo_fixture_reset',mode='SIMULATED',evidence='controlled repeat fixture')
         start=time.perf_counter();again=b.command('Bring Sample B to bench',principal='demo');repeat_ms=(time.perf_counter()-start)*1000
         assert again['source']=='skill' and again['planner_calls']==0
         check('verified_skill_reuse',skill=again['skill_id'],planning_ms=round(repeat_ms,3),planner_calls=again['planner_calls'],note='Host timing only; not Pi performance and not a controlled speedup claim')

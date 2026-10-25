@@ -267,10 +267,10 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         with b.activity.foreground():
             try:g=parse_goal(body.goal,b.store)
             except CortexError:g=None
-            return b.store.bundle(body.goal,g)
+            return b.store.bundle(body.goal,g,principal=principal)
     @app.post('/memory/recall')
     def recall(body:Recall,principal=Depends(operator)):
-        with b.activity.foreground():return b.store.recall(body.question,body.kinds)
+        with b.activity.foreground():return b.store.recall(body.question,body.kinds,principal=principal)
     @app.get('/memory/objects')
     def objects(principal=Depends(operator)):return b.store.objects()
     @app.get('/memory/facts')

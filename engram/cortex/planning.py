@@ -37,9 +37,9 @@ def goal_ops(goal: dict | Goal | None) -> tuple[str, ...]:
 # Grammar: refuse by default. Anything below means the utterance says more than "move X to Y".
 QUESTION = re.compile(r"\?\s*$|^\s*(?:should|shall|do|does|did|is|are|was|were|am|may|might|must|what|why|how|which|who|whose|whether|where|when|(?:can|could|would|will)\s+(?:i|we)\b)\b", re.I)
 # Routing, not refusal: a question Brain.command answers from memory. A question mark or a question opener counts,
-# except a polite request ("can/could/would/will you ...", "please ..."), the "what do you see" observation, a
-# "do not ..." instruction, and a bare "when <event> <action>" commitment ("when" counts only before an auxiliary).
-OBSERVE = {'look around','observe','what do you see'}
+# except a polite request ("can/could/would/will you ...", "please ..."), a "do not ..." instruction, and a bare
+# "when <event> <action>" commitment ("when" counts only before an auxiliary). "What do you see?" is a question too.
+OBSERVE = {'look around','observe'}
 POLITE = re.compile(r"^\s*(?:(?:can|could|would|will)\s+you|please)\b", re.I)
 ASKS = re.compile(r"\?\s*$|^\s*(?:what|where|which|who|whom|whose|whether|why|how|is|are|was|were|am|(?:do|does|did)\s+(?!not\b)|"
                   r"can|could|should|shall|would|will|may|might|must|when\s+(?:is|are|was|were|do|does|did|will|would|can|could|should|shall|has|have|had))\b", re.I)
@@ -48,7 +48,7 @@ ASKS = re.compile(r"\?\s*$|^\s*(?:what|where|which|who|whom|whose|whether|why|ho
 def asks_memory(request: str) -> bool:
     """A question for memory, not an instruction: parse_goal refuses every question shape, so routing loses nothing."""
     t=request.replace(chr(0x2019),"'")
-    return bool(RECALL.search(t)) or (bool(ASKS.search(t)) and not POLITE.search(t) and normalize(t) not in OBSERVE)
+    return bool(RECALL.search(t)) or (bool(ASKS.search(t)) and not POLITE.search(t))
 HEDGES = (
     (re.compile(r"\b(?:not|no|nor|except|excluding|apart from|other than|without|instead|rather|alone|leave|but)\b", re.I), 'an exclusion or correction ("not", "except", "without", "leave ... alone", "instead")'),
     (re.compile(r"\b(?:off|away|out|from)\b", re.I), 'a source location ("off", "away from", "out of", "from"); name only the destination'),
@@ -91,9 +91,9 @@ def _uncovered(low: str, store: Store) -> list[str]:
 def parse_goal(request: str, store: Store) -> Goal:
     if safety_reason(request): raise Missing(safety_reason(request))
     low=normalize(request)
+    if QUESTION.search(request): raise Missing(ambiguity_reason(request))   # before any phrase allowlist
     if low in OBSERVE:
         return Goal('primitive',primitive='observe')
-    if QUESTION.search(request): raise Missing(ambiguity_reason(request))
     primitive = {'open the claw':'gripper_open','open claw':'gripper_open','open the gripper':'gripper_open',
                  'close the claw':'gripper_close','close claw':'gripper_close','close the gripper':'gripper_close'}
     if low in primitive: return Goal('primitive',primitive=primitive[low])
@@ -172,7 +172,9 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
     allowed=set(goal_ops(goal))
     def picked_later(oid,i): return any(isinstance(s,dict) and s.get('op')=='pick_tagged_object' and isinstance(s.get('args'),dict) and s['args'].get('object_id')==oid for s in steps[i+1:])
     def required(oid,zone,i): return (oid in goal_ids and zone==goal.zone) or any(r['object']==oid and r['required_zone']==zone and picked_later(r['subject'],i) for r in rules)
-    placed={}
+    placed={}; picked_from={}
+    # Held-object state comes from the adapter's report (fixture 'holding_known'/'holding'); unknown is never "empty".
+    loaded=fixture.get('holding') if fixture.get('holding_known') else 'an unknown object'
     try:
         if goal.kind in {'primitive','goto'} and len(steps)!=1: raise Conflict('extra effect: this goal is exactly one step')
         for i,step in enumerate(steps):
@@ -197,19 +199,24 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
                 if op=='approach_tag':
                     at=positions[oid]; continue
                 if holding: raise Conflict('already holding an object')
+                if fixture.get('holding_known') and fixture.get('holding') is not None: raise Conflict(f"the claw already holds {fixture['holding']}")
                 if not objects[oid].get('graspable',True): raise DeniedPlan('object not graspable')
                 for r in rules:
                     if r['subject']==oid and positions.get(r['object'])!=r['required_zone']:
                         raise Conflict('prerequisite object is not at its required station')
-                at=positions.pop(oid); holding=oid; open_=False
+                at=positions.pop(oid); holding=oid; open_=False; picked_from[oid]=at
             elif op=='place_at_zone':
                 if holding is None: raise Conflict('placement without a held object')
                 if goal.kind=='fetch' and not required(holding,a['zone'],i):
                     raise Conflict(f"extra effect: {holding} to {a['zone']} is neither the destination nor a prerequisite station needed later")
                 if placed.get(holding)==a['zone']: raise Conflict('extra effect: repeated move to where this plan already put the object')
+                # No physical handling without state progress: an object already where it must be stays untouched.
+                if picked_from.get(holding)==a['zone']: raise Conflict(f"extra effect: {holding} is put back where it already was; handling it makes no progress")
                 positions[holding]=placed[holding]=a['zone']; at=a['zone']; holding=None; open_=True
             elif op=='go_to_zone': at=a['zone']
             elif op=='gripper_open':
+                if holding is None and loaded is not None:
+                    raise Conflict(f'the claw may be holding {loaded}; opening it would release that object without a placement check')
                 if holding: positions[holding]=at; holding=None
                 open_=True
             elif op=='gripper_close': open_=False
@@ -243,7 +250,9 @@ class Compiler:
         objs=self.store.objects()
         objects={o['id']:{'tag':o['tag'],'graspable':o['graspable']} for o in objs}
         pos={o['id']:o['last_zone'] if o['fresh'] and o['last_zone'] else None for o in objs}
-        return {'mode':mode,'positions':pos,'objects':objects,'zones':zones,'at_zone':None,'unknown_positions':sorted(k for k,v in pos.items() if v is None)}
+        # What the claw holds is the adapter's to report (Brain._fixture); the store alone never knows, so: unknown.
+        return {'mode':mode,'positions':pos,'objects':objects,'zones':zones,'at_zone':None,'unknown_positions':sorted(k for k,v in pos.items() if v is None),
+                'holding':None,'holding_known':False}
 
     def compile(self, goal: Goal, fixture: dict | None=None) -> dict:
         goal=Goal.from_dict(goal.to_dict())

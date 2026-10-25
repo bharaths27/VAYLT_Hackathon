@@ -17,7 +17,8 @@ def test_every_question_is_answered_from_memory_on_the_command_path(brain,q):
 def test_instructions_commitments_and_observation_keep_their_paths(brain):
     c=lambda u:brain.command(u,principal='carther')
     assert c('When the tray arrives, bring Sample A to the bench.')['kind']=='scheduled'     # a commitment, not a question
-    seen=c('What do you see?'); assert seen['kind']=='proposal' and seen['plan']['steps'][0]['op']=='observe'
+    seen=c('Look around'); assert seen['kind']=='proposal' and seen['plan']['steps'][0]['op']=='observe'
+    assert c('What do you see?')['kind']=='answer'                                            # a question, not an observe phrase
     assert c('Could you bring Sample A to the bench')['status']=='proposed'                   # a polite request is an instruction
     for u in ('Can you bring Sample A to the bench?','Please bring Sample A to the bench?'):
         assert c(u)['kind']=='proposal',u                                                      # still refused as an instruction, not answered

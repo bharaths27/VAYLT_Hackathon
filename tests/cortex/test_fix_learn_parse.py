@@ -29,6 +29,7 @@ TABLE=[
     ('Bring Sample A to the bench?',REFUSE),
     ('Can I move the tray to shelf B',REFUSE),
     ('Open the claw?',REFUSE),
+    ('What do you see?',REFUSE),          # a question first: never matched against the observe phrases
     # alternatives, conditions, relative places, sequences, unknown words
     ('Bring Sample A or Sample B to the bench',REFUSE),
     ('Bring Sample A to the bench if it is clean',REFUSE),
@@ -51,7 +52,7 @@ TABLE=[
     ('Return home',('goto',(),'home')),
     ('Find the goggles',('inspect',('goggles',),None)),
     ('Open the claw',('primitive',(),None)),
-    ('What do you see?',('primitive',(),None)),
+    ('Look around',('primitive',(),None)),
 ]
 
 @pytest.mark.parametrize('request_text,expected',TABLE)
@@ -76,7 +77,7 @@ def test_eval_table_is_large_enough_and_balanced():
 
 # On the command path a question is answered from memory (needle benchmark), still with nothing proposed; when only
 # the "?" made it a question, the answer keeps the hint to say it as an instruction.
-ANSWERED={'Should I bring Sample A to the bench?':False,'Can I move the tray to shelf B':False,'Bring Sample A to the bench?':True,'Open the claw?':True}
+ANSWERED={'What do you see?':False,'Should I bring Sample A to the bench?':False,'Can I move the tray to shelf B':False,'Bring Sample A to the bench?':True,'Open the claw?':True}
 
 @pytest.mark.parametrize('request_text',[r for r,e in TABLE if e is REFUSE])
 def test_refused_request_creates_no_proposal_and_explains(brain,request_text):
