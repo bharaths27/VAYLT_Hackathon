@@ -20,7 +20,8 @@ def test_closing_the_claw_on_a_constrained_held_object_is_refused(brain,note,err
 def test_a_constraint_taught_after_proposing_a_close_still_refuses_it_at_approval(brain):
     holding(brain,'sample_b');p=brain.command('Close the claw',principal='carther');assert p['status']=='proposed'
     brain.store.teach('Note','Leave Sample B alone.',owner='carther')
-    with pytest.raises(Denied,match='structured review'): approve(brain,p)                  # was: closed on it
+    # Since round 12 the held object's constraints are in the plan's basis: teaching one withdraws the proposal at once.
+    with pytest.raises((Denied,Conflict)): approve(brain,p)                                   # was: closed on it
     assert not [c for c in brain.robot.calls if c[0]=='gripper_close']
 
 def test_control_closing_an_empty_claw_is_not_held_to_another_objects_constraint(brain):

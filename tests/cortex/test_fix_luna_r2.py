@@ -67,7 +67,7 @@ def test_open_claw_is_refused_when_loaded_even_after_proposal(brain):
     brain.robot.holding=None
     p=brain.command('Open the claw',principal='carther'); assert p['status']=='proposed'   # control: reported empty
     brain.robot.holding='sample_b'                                                 # loaded between proposal and approval
-    with pytest.raises(Denied): approve(brain,p)
+    with pytest.raises((Denied,Stale)): approve(brain,p)                           # round 12: not the claw it was proposed for
     assert ('gripper_open',{}) not in brain.robot.calls
 
 

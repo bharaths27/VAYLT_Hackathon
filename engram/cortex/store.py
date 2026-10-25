@@ -634,8 +634,10 @@ class Store:
         return self.rows("SELECT a.*,r.rule_key,r.required_zone,r.status,c.revision FROM assertion a JOIN cx_rule r ON r.assertion_id=a.id "
                          "JOIN cx_source c ON c.source_id=a.source_id WHERE c.workspace=? AND c.status='accepted' AND r.status IN ('active','disputed') ORDER BY r.rule_key,a.id", (self.workspace,))
 
-    def related_rules(self, goal: Goal) -> list[dict]:
-        frontier, seen, relevant = list(goal.targets), set(), []
+    def related_rules(self, goal: Goal, held: frozenset = frozenset()) -> list[dict]:
+        """The prerequisite closure of what a goal handles: its targets, and the object in the claw (`held`) for a claw
+        primitive that grips it (Compiler.held)."""
+        frontier, seen, relevant = list(goal.targets) + sorted(held), set(), []
         rules = self.rules()
         while frontier:
             obj = frontier.pop()
@@ -671,15 +673,17 @@ class Store:
         row = self.one("SELECT g.* FROM cx_goal g JOIN cx_source s ON g.source_id=s.source_id WHERE g.name=? AND s.workspace=? AND s.status='accepted'", (name, self.workspace))
         return Goal.from_dict(json.loads(row['goal_json'])) if row else None
 
-    def basis(self, goal: Goal) -> str:
-        rules = self.related_rules(goal)
-        ids = set(goal.targets) | {r['subject'] for r in rules} | {r['object'] for r in rules}
+    def basis(self, goal: Goal, held: frozenset = frozenset()) -> str:
+        """Everything a plan for this goal rests on; with `held`, the held object's entity, rules and constraints too."""
+        rules = self.related_rules(goal, held)
+        ids = set(goal.targets) | set(held) | {r['subject'] for r in rules} | {r['object'] for r in rules}
         entities = [{k:o[k] for k in ('id','name','tag','graspable','version')} for o in self.objects() if o['id'] in ids]
         zones = self.rows('SELECT id,version FROM cx_station ORDER BY id')
         payload = {'goal':goal.to_dict(), 'rules':[{k:r[k] for k in ('id','rule_key','required_zone','object','subject','status')} for r in rules],
                    'entities':entities, 'zones':zones}
-        payload['unresolved']=self.unresolved_for(self.scope(goal,rules),handles=goal.kind=='fetch')
+        payload['unresolved']=self.unresolved_for(self.scope(goal,rules)|set(held),handles=goal.kind=='fetch' or bool(held))
         payload['prohibitions'] = self.prohibitions(ids)
+        if held: payload['held'] = sorted(held)
         return digest(payload)
 
     def evidence(self, chunk_id: str, *, history: bool = False, principal: str | None = None) -> dict:
@@ -701,9 +705,9 @@ class Store:
                          "JOIN cx_source x ON x.source_id=s.id WHERE source_chunk_fts MATCH ? AND x.workspace=? AND x.status='accepted' AND s.kind!='future' ORDER BY score,c.id LIMIT ?",
                          (q, self.workspace, min(max(int(limit),1),20)))
 
-    def bundle(self, request: str, goal: Goal | None = None, *, principal: str | None = None) -> dict:
-        rules = self.related_rules(goal) if goal else []
-        ids = set(goal.targets if goal else self.resolve_objects(request)) | {r['object'] for r in rules}
+    def bundle(self, request: str, goal: Goal | None = None, *, principal: str | None = None, held: frozenset = frozenset()) -> dict:
+        rules = self.related_rules(goal, held) if goal else []
+        ids = set(goal.targets if goal else self.resolve_objects(request)) | set(held) | {r['object'] for r in rules}
         objects = [o for o in self.objects() if o['id'] in ids]
         mandatory_ids = list(dict.fromkeys([r['chunk_id'] for r in rules]+[r['chunk_id'] for r in self.prohibitions(ids)]))
         evidence = [self.evidence(cid) for cid in mandatory_ids]
@@ -714,9 +718,10 @@ class Store:
         facts = [{'id':r['id'], 'subject':r['subject'], 'predicate':'requires_at_before', 'object':r['object'],
                   'required_zone':r['required_zone'], 'chunk_id':r['chunk_id'], 'source_id':r['source_id'], 'status':r['status']} for r in rules]
         b = {'goal':request, 'task':goal.to_dict() if goal else None, 'epoch':self.epoch(),
-             'basis': self.basis(goal) if goal else None, 'facts':facts, 'objects':objects, 'constraints':facts,
+             'basis': self.basis(goal, held) if goal else None, 'facts':facts, 'objects':objects, 'constraints':facts,
              'evidence':evidence, 'missing':missing, 'omitted':[], 'applicable_skills':[], 'derived':[]}
-        b['unresolved_constraints']=self.unresolved_for(self.scope(goal,rules) if goal else ids|set(self.zones_named(request)),handles=not goal or goal.kind=='fetch')
+        b['unresolved_constraints']=self.unresolved_for(self.scope(goal,rules)|set(held) if goal else ids|set(self.zones_named(request)),
+                                                        handles=not goal or goal.kind=='fetch' or bool(held))
         b['prohibitions'] = self.prohibitions(ids)
         # Optional declared facts never override sensor locations or authority.
         generic=self.generic_facts(request)[:8]
@@ -741,7 +746,7 @@ class Store:
         approved=self.approved_skills(principal,goal_key=goal.key() if goal else '',limit=3,fields=('id','name','digest'))
         related_derived=[]
         for d in self.derived(limit=32):
-            if d['status']=='VERIFIED' and self.refs_valid(d['refs']) and (not goal or d['basis_hash']==self.basis(goal)) and self.visible(d['refs'],principal):
+            if d['status']=='VERIFIED' and self.refs_valid(d['refs']) and (not goal or d['basis_hash']==self.basis(goal, held)) and self.visible(d['refs'],principal):
                 related_derived.append({'id':d['id'],'kind':d['kind'],'payload':d['payload'],'refs':d['refs']})
         optional={'related_episodes':episodes,'prospective':prospective,'applicable_skills':approved,'derived':related_derived[:3],
                   'parametric':{'knowledge_is_evidence':False,'weight_updates':False}}
@@ -885,7 +890,7 @@ class Store:
                     self.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(r['id'],))
             for r in self.rows("SELECT e.id,e.plan_json,e.skill_id,v.status skill_status FROM episode e JOIN cx_episode c ON c.id=e.id LEFT JOIN skill_version v ON v.id=e.skill_id WHERE e.outcome='proposed'"):
                 try:
-                    p=json.loads(r['plan_json']); valid=(not r['skill_id'] or r['skill_status']=='APPROVED') and self.refs_valid(p['refs']) and p['basis']==self.basis(Goal.from_dict(p['goal']))
+                    p=json.loads(r['plan_json']); valid=(not r['skill_id'] or r['skill_status']=='APPROVED') and self.refs_valid(p['refs']) and p['basis']==self.basis(Goal.from_dict(p['goal']),frozenset(p.get('held',[])))
                 except (CortexError,KeyError,TypeError,ValueError): valid=False
                 if not valid:self.settle(r['id'],'invalidated',('proposed',),'dependency changed')   # the commitment follows in this transaction
 

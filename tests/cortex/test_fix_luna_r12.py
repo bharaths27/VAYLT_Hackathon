@@ -46,3 +46,87 @@ def test_no_plan_may_carry_a_stop_step_and_the_model_is_never_offered_one(store)
     with pytest.raises(Denied,match='never a plan step'): validate_step({'op':'stop','args':{}},set(),store.zones())   # was: valid
     assert not verify(Goal.from_dict(STOP),[{'op':'stop','args':{}}],Compiler(store).fixture(symbolic=True),[],store.policy).ok
     assert goal_ops(STOP)==() and not any('stop' in goal_ops({'kind':k}) for k in ('fetch','goto','inspect'))           # was: ('stop',)
+
+
+# P1-2 (class D): a claw primitive handles what the claw holds, so that object's prerequisite rules apply as a pickup's
+# do: at planning (unmet or disputed), in the plan's basis, at approval (the same object still held) and at dispatch.
+SOP='Safety goggles must be at the ppe station before handling Sample B.'
+def holding(brain,oid): brain.robot.positions.pop(oid);brain.robot.holding=oid;brain.robot.open=False
+def seen_at(store,oid,zone): store.observe(oid,zone,origin='test',mode='SIMULATED')
+
+def test_closing_on_a_held_object_whose_prerequisite_is_unmet_is_refused(brain):
+    brain.store.teach('SOP',SOP,owner='carther');holding(brain,'sample_b')
+    with pytest.raises(Conflict,match='prerequisite'): brain.command('Close the claw',principal='carther')   # was: proposed
+    seen_at(brain.store,'goggles','ppe_station')
+    p=brain.command('Close the claw',principal='carther');assert p['plan']['held']==['sample_b']   # control: met
+    assert any(f['subject']=='sample_b' for f in p['memory']['facts'])                          # its rule is in the evidence
+    assert approve(brain,p)['status']=='success'
+
+def test_closing_on_a_held_object_with_disputed_prerequisites_is_refused(brain):
+    brain.store.teach('SOP',SOP,owner='carther');brain.store.teach('SOP 2','Safety goggles must be at shelf B before handling Sample B.',owner='carther')
+    seen_at(brain.store,'goggles','ppe_station');holding(brain,'sample_b')
+    with pytest.raises(Conflict,match='conflicting'): brain.command('Close the claw',principal='carther')    # was: proposed
+
+def test_a_prerequisite_taught_after_proposing_a_close_withdraws_it(brain):
+    holding(brain,'sample_b');p=brain.command('Close the claw',principal='carther');assert p['status']=='proposed'
+    brain.store.teach('SOP',SOP,owner='carther')
+    assert brain.operation(p['operation_id'])['status']=='invalidated'                     # was: still approvable
+    with pytest.raises(CortexError): approve(brain,p)
+    assert not [c for c in brain.robot.calls if c[0]=='gripper_close']
+
+def test_a_close_proposed_for_one_held_object_never_grips_another(brain):
+    brain.store.teach('SOP',SOP,owner='carther')
+    holding(brain,'sample_a');p=brain.command('Close the claw',principal='carther');assert p['plan']['held']==['sample_a']
+    brain.robot.positions['sample_a']='home';holding(brain,'sample_b')                    # the claw now holds Sample B
+    with pytest.raises(Stale,match='holds something else'): approve(brain,p)              # was: closed on Sample B
+    assert not [c for c in brain.robot.calls if c[0]=='gripper_close']
+
+def test_the_independent_check_alone_holds_a_close_to_the_held_objects_rules(store):
+    rule=lambda zone,status:{'id':'r-'+zone,'subject':'sample_b','object':'goggles','required_zone':zone,'status':status}
+    world={**Compiler(store).fixture(),'holding':'sample_b','holding_known':True};close=Goal('primitive',primitive='gripper_close')
+    world['positions']['goggles']='ppe_station'
+    assert verify(close,[{'op':'gripper_close','args':{}}],world,[rule('ppe_station','active')],store.policy).ok   # control: met
+    assert not verify(close,[{'op':'gripper_close','args':{}}],world,[rule('ppe_station','disputed')],store.policy).ok
+    assert not verify(close,[{'op':'gripper_close','args':{}}],world,[rule('shelf_b','active')],store.policy).ok
+
+def test_a_cyclic_prerequisite_graph_of_the_held_object_is_refused(brain):
+    brain.store.teach('SOP',SOP,owner='carther');brain.store.teach('Loop','Sample B must be at the bench before handling Safety goggles.',owner='carther')
+    holding(brain,'sample_b')
+    with pytest.raises(Conflict,match='cyclic'): brain.command('Close the claw',principal='carther')
+
+def test_guard_an_unrelated_source_leaves_a_close_on_a_held_object_pending(brain):
+    brain.store.teach('SOP',SOP,owner='carther');seen_at(brain.store,'goggles','ppe_station');holding(brain,'sample_b')
+    p=brain.command('Close the claw',principal='carther');brain.store.teach('Note','The tray is on shelf B.',owner='carther')
+    assert brain.operation(p['operation_id'])['status']=='proposed'                         # its basis is the held object's
+
+def test_a_close_for_a_held_object_is_composed_afresh_never_a_stored_procedure(arena,clock):
+    s=Store(clock=clock,policy=Policy(auto_publish_verified=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    first=b.command('Close the claw',principal='carther');b.reject(first['operation_id'],principal='carther')   # empty claw
+    assert b.skills.find(Goal('primitive',primitive='gripper_close'),'carther')                                   # published
+    s.teach('SOP',SOP,owner='carther');seen_at(s,'goggles','ppe_station');holding(b,'sample_b')
+    p=b.command('Close the claw',principal='carther')
+    assert p['status']=='proposed' and p['source']=='composed' and not p['skill_id'] and p['plan']['held']==['sample_b']
+    assert approve(b,p)['status']=='success'
+    b.close()
+
+def test_the_claw_changing_between_approval_and_dispatch_stops_the_close(brain):
+    brain.store.teach('SOP',SOP,owner='carther');seen_at(brain.store,'goggles','ppe_station');holding(brain,'sample_a')
+    p=brain.command('Close the claw',principal='carther');real=brain.operation
+    def swapped(ep):
+        out=real(ep)
+        if out['status']=='running' and brain.robot.holding=='sample_a': brain.robot.positions['sample_a']='home';holding(brain,'sample_b')
+        return out
+    brain.operation=swapped
+    assert approve(brain,p)['status']=='aborted'                                            # never closed on Sample B
+    assert not [c for c in brain.robot.calls if c[0]=='gripper_close']
+
+def test_a_prerequisite_no_longer_observed_at_dispatch_stops_the_close(brain,clock):
+    brain.store.teach('SOP',SOP,owner='carther');seen_at(brain.store,'goggles','ppe_station');holding(brain,'sample_b')
+    p=brain.command('Close the claw',principal='carther');real=brain.operation
+    def ageing(ep):
+        out=real(ep)
+        if out['status']=='running': clock.advance(brain.store.policy.freshness_s+1)       # the observation ages before dispatch
+        return out
+    brain.operation=ageing
+    assert approve(brain,p)['status']=='aborted'                                            # was: closed on a stale observation
+    assert not [c for c in brain.robot.calls if c[0]=='gripper_close']

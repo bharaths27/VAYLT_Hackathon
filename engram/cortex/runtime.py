@@ -14,7 +14,7 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
-from .planning import CAPS,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,CLAW,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import TASK_STATE,Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
@@ -128,6 +128,9 @@ class Brain:
         request=text(request,'request',2000)
         ih=digest({'goal':goal.to_dict(),'request':request,'principal':principal,'extra_refs':extra_refs or []})
         key=principal+':'+text(idempotency_key,'idempotency key',200) if idempotency_key else None
+        # One world for the whole proposal, the one it is planned, checked and published against; a claw primitive
+        # handles what the claw holds in it (Compiler.held), and that object's rules are part of its basis.
+        fixture=self._fixture(); held=Compiler.held(goal,fixture)
         with self.store.tx():
             ep=None
             if key:
@@ -138,32 +141,32 @@ class Brain:
                         if wake: self._link(prior['id'],wake)
                         return self.operation(prior['id'])
                     ep=prior['id']; self._recoverable_preparing.remove(ep)
-            t=self.store.clock(); basis=self.store.basis(goal)
+            t=self.store.clock(); basis=self.store.basis(goal,held)
             if ep is None:
                 ep=uid('ep')
                 self.store.conn.execute('INSERT INTO episode(id,goal,request,outcome,started_at) VALUES(?,?,?,?,?)',
                                         (ep,canonical(goal.to_dict()),request,'preparing',t))
                 self.store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',
-                    (ep,self.mode,canonical(goal.to_dict()),basis,self.store.policy.fingerprint(),canonical(self._fixture()),key,ih,t+self.store.policy.approval_ttl_s,principal))
+                    (ep,self.mode,canonical(goal.to_dict()),basis,self.store.policy.fingerprint(),canonical(fixture),key,ih,t+self.store.policy.approval_ttl_s,principal))
                 # Where the request came from (a task alias's or a commitment's source), kept from the start: deleting that
                 # source finds this episode even when planning failed before any plan cited it.
                 for ref in extra_refs or []:
                     if ref.startswith('source:'): self.store.conn.execute('INSERT OR IGNORE INTO cx_episode_source VALUES(?,?)',(ep,ref[len('source:'):]))
             else:
                 self.store.conn.execute('UPDATE cx_episode SET basis_hash=?,initial_json=?,expires_at=? WHERE id=?',
-                    (basis,canonical(self._fixture()),t+self.store.policy.approval_ttl_s,ep))
+                    (basis,canonical(fixture),t+self.store.policy.approval_ttl_s,ep))
         with self.activity.foreground():
             try:
                 # A command is an episode, not a source: it is never recalled as knowledge.
                 refs=self.skills.provenance(goal,ep,extra_refs,principal=principal)
-                bundle=self.store.bundle(request,goal,principal=principal)
-                fixture=self._fixture()
+                bundle=self.store.bundle(request,goal,principal=principal,held=held)
                 # Optional relevance advice ranks only explicitly cloud-permitted evidence.
                 shareable=[e for e in bundle['evidence'] if e.get('cloud_ok')]
                 if shareable:
                     self._advisor('relevance',{'request':request,'evidence':[{'id':e.get('id',e.get('chunk_id')),'text':e['text']} for e in shareable[:5]]},
                                   {'sufficient':'Does the supplied evidence directly support this request without missing a material condition?'},cloud_allowed)
-                skill=self.skills.find(goal,principal)                  # only a procedure this principal may see
+                # A procedure is the typed goal's: one for whatever the claw holds is composed afresh, never stored or reused.
+                skill=None if held else self.skills.find(goal,principal)     # only a procedure this principal may see
                 # A stored procedure is reused only where every step still makes progress; otherwise compose afresh.
                 if skill and not verify(goal,skill['definition']['steps'],fixture,self.store.related_rules(goal),self.store.policy).ok: skill=None
                 if skill and self.store.cloud_eligible(skill['definition']['refs']):
@@ -201,10 +204,11 @@ class Brain:
                             {'unsupported':'Does this procedure add an effect not requested by the typed goal?','ambiguous':'Is the specified task materially ambiguous?'},cloud_allowed)
                         if advice['status']=='ok' and max(advice['scores'].values())>=0.8:
                             raise Missing('advisory review raised an unresolved mismatch; clarification required')
-                    candidate=self.skills.create(plan,mode='SIMULATED')
-                    tested=candidate['validation'] if candidate['status']=='APPROVED' else self.skills.test(candidate['id'],fixture)
-                    if tested['ok'] and candidate['status']!='APPROVED' and self.store.policy.auto_publish_verified:
-                        self.skills.approve(candidate['id'],candidate['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
+                    if not held:
+                        candidate=self.skills.create(plan,mode='SIMULATED')
+                        tested=candidate['validation'] if candidate['status']=='APPROVED' else self.skills.test(candidate['id'],fixture)
+                        if tested['ok'] and candidate['status']!='APPROVED' and self.store.policy.auto_publish_verified:
+                            self.skills.approve(candidate['id'],candidate['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
                 plan['refs']=sorted(set(plan['refs']+refs))
                 plan_digest=digest({k:v for k,v in plan.items() if k!='verification'})
                 with self.store.tx():
@@ -215,9 +219,9 @@ class Brain:
                     else:
                         # The final checks run in the publishing transaction: a revocation lands before them (refused) or
                         # after it (its invalidation finds the proposal), never in between.
-                        if self.store.basis(goal)!=basis: raise Stale('memory changed during planning')
-                        checked=verify(goal,plan['steps'],fixture,self.store.related_rules(goal),self.store.policy,
-                                       expected_basis=plan['basis'],actual_basis=self.store.basis(goal))
+                        if self.store.basis(goal,held)!=basis: raise Stale('memory changed during planning')
+                        checked=verify(goal,plan['steps'],fixture,self.store.related_rules(goal,held),self.store.policy,
+                                       expected_basis=plan['basis'],actual_basis=self.store.basis(goal,held))
                         if not checked.ok or not self.store.refs_valid(plan['refs']): raise Stale('plan no longer satisfies current evidence')
                         changed=self._provenance_changed({'derived_memory_id':derived_id,'skill_id':skill['id'] if skill else None},plan)
                         if changed: raise Stale(changed+' during planning')
@@ -295,16 +299,19 @@ class Brain:
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
                     if supplied_digest!=actual or supplied_digest!=r['digest']: raise Conflict('approval does not match this exact plan')
                     goal=Goal.from_dict(plan['goal'])
+                    # The live world decides too: what the claw holds now is what a claw primitive handles, with its rules
+                    # and constraints, and it must be exactly what the plan was made and approved for.
+                    world=self._fixture(); held=Compiler.held(goal,world)
+                    if sorted(held)!=plan.get('held',[]): raise Stale('the claw holds something else than when this was proposed')
+                    rules=self.store.related_rules(goal,held)
                     changed=self._provenance_changed(r,plan)
                     if changed: raise Stale(changed+' after proposal')
-                    if plan['basis']!=self.store.basis(goal) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
+                    if plan['basis']!=self.store.basis(goal,held) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
                         raise Stale('rule, binding, source or policy changed after proposal')
-                    if self.store.prohibitions(set(goal.targets)|{r['object'] for r in self.store.related_rules(goal)}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
-                    # The live world decides too: what the claw holds now is what a claw primitive handles, with its constraints.
-                    world=self._fixture()
-                    try: self.compiler.refuse(goal,world,self.store.related_rules(goal))
+                    if self.store.prohibitions(set(goal.targets)|{x['object'] for x in rules}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
+                    try: self.compiler.refuse(goal,world,rules)
                     except CortexError as e: raise Denied(str(e)) from None
-                    v=verify(goal,plan['steps'],world,self.store.related_rules(goal),self.store.policy)
+                    v=verify(goal,plan['steps'],world,rules,self.store.policy)
                     if not v.ok: raise Denied('; '.join(v.errors))
                     claimed=self.store.conn.execute("UPDATE episode SET outcome='running' WHERE id=? AND outcome='proposed'",(ep,)).rowcount
                     if claimed!=1: raise Conflict('operation already claimed')
@@ -312,6 +319,15 @@ class Brain:
                     self.store.conn.execute('INSERT INTO approval VALUES(?,?,?,?,?,?,?,?)',(uid('apv'),'plan',ep,actual,principal,now,r['expires_at'],now))
                 return self._execute(ep,goal,plan)
         finally: self._effect_lock.release()
+
+    def _prerequisites_observed(self,goal: Goal,oid: str,held: frozenset) -> None:
+        """Each prerequisite of an object about to be handled is currently observed at its required station."""
+        objects={o['id']:o for o in self.store.objects()}
+        for rule in self.store.related_rules(goal,held):
+            if rule['subject']==oid:
+                obj=objects.get(rule['object'])
+                if not obj or not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
+                    raise Missing('prerequisite not currently observed at required station')
 
     def _provenance_changed(self,r: dict,plan: dict) -> str | None:
         """Why the recipe or approved skill a plan came from no longer backs it (None while it does). Checked at
@@ -328,7 +344,7 @@ class Brain:
 
     def _execute(self,ep: str,goal: Goal,plan: dict) -> dict:
         steps=[]; outcome='success'; reason=None; seen=set(); tags={o['tag']:o['id'] for o in self.store.objects()}; moved=False
-        op=self.operation(ep)
+        op=self.operation(ep); held=frozenset(plan.get('held',[]))
         try:
             for i,s in enumerate(plan['steps']):
                 # From its first check through its dispatch a step holds the vault's authority: a revocation, a new
@@ -336,18 +352,18 @@ class Brain:
                 # next step's check sees it.
                 with self.store.held_authority():
                     if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
-                    if self.store.basis(goal)!=plan['basis'] or not self.store.refs_valid(plan['refs']):
+                    if self.store.basis(goal,held)!=plan['basis'] or not self.store.refs_valid(plan['refs']):
                         raise Stale('evidence changed while executing')
                     validate_step(s,set(tags.values()),self.store.zones())
-                    # Observe/location steps must actually return a current observation before picking.
+                    # Handling an object needs its prerequisites observed at their stations now: a pickup's target (itself
+                    # observed in this operation), and for a claw step what the claw holds, still exactly the approved object.
                     if s['op']=='pick_tagged_object':
                         oid=s['args']['object_id']
                         if oid not in seen: raise Missing('no fresh in-operation observation for pickup')
-                        for rule in self.store.related_rules(goal):
-                            if rule['subject']==oid:
-                                obj=next(o for o in self.store.objects() if o['id']==rule['object'])
-                                if not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
-                                    raise Missing('prerequisite not currently observed at required station')
+                        self._prerequisites_observed(goal,oid,held)
+                    elif s['op'] in CLAW and held:
+                        if Compiler.held(goal,self._fixture())!=held: raise Stale('the claw holds something else than when this was approved')
+                        for oid in held: self._prerequisites_observed(goal,oid,held)
                     self.journal(ep,s['op'],s['args'],'pending',step=i)
                     # The recipe or skill behind this plan must still back it at every step: a revocation mid-run stops it.
                     changed=self._provenance_changed(op,plan)

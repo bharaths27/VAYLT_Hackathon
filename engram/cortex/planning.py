@@ -166,7 +166,9 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
     objects=dict(fixture.get('objects',{})); seen=set(); holding=None; at=fixture.get('at_zone')
     original=dict(positions); open_=True; stopped=False
     goal_ids=set(goal.targets)
-    relevant=set(goal_ids)
+    # A claw primitive handles what the adapter reports in the claw: that object's rules count as its targets' do.
+    held=Compiler.held(goal,fixture)
+    relevant=set(goal_ids)|held
     for _ in range(policy.max_nodes):
         old=len(relevant)
         relevant.update(r['object'] for r in rules if r['subject'] in relevant)
@@ -238,6 +240,10 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
                 # to check); unreported contents are unknown, never "empty".
                 if holding is None and not fixture.get('holding_known'):
                     raise Conflict('the claw contents are unknown (not reported by the adapter); gripper_close needs a reported claw state')
+                # Gripping it is handling it: each of its prerequisites must be at its required station, as for a pickup.
+                for r in rules:
+                    if r['subject'] in held and positions.get(r['object'])!=r['required_zone']:
+                        raise Conflict('prerequisite object is not at its required station')
                 open_=False
         if holding: raise Conflict('task ends with unplaced object')
         if goal.kind=='fetch' and any(positions.get(oid)!=goal.zone for oid in goal.targets):
@@ -285,18 +291,20 @@ class Compiler:
         refusals and the same independent check. A composed plan that check rejects is a CompilerGap."""
         goal=Goal.from_dict(goal.to_dict())
         f=copy.deepcopy(fixture or self.fixture(symbolic=True))   # no live world given: the symbolic start state
-        rules=self.store.related_rules(goal)
+        held=self.held(goal,f)                                     # a claw primitive handles what the claw holds
+        rules=self.store.related_rules(goal,held)
         self.refuse(goal,f,rules)
         if not set(goal.targets)<=set(f['objects']): raise Missing('unregistered goal target')
         if goal.zone and goal.zone not in f['zones']: raise Missing('unregistered destination')
-        if goal.kind=='fetch':
-            # Refuse a cyclic or too deep prerequisite graph, even where the current fixture already satisfies a rule.
+        if goal.kind=='fetch' or held:
+            # Refuse a cyclic or too deep prerequisite graph of what it handles, even where the current fixture already
+            # satisfies a rule.
             def visit(oid,path=()):
                 if oid in path: raise Conflict('cyclic prerequisite graph')
                 if len(path)>self.store.policy.max_depth: raise Conflict('dependency depth exceeded')
                 for r in rules:
                     if r['subject']==oid: visit(r['object'],path+(oid,))
-            for oid in goal.targets: visit(oid)
+            for oid in [*goal.targets,*sorted(held)]: visit(oid)
         composed=steps is None
         if composed: steps=self._compose(goal,f,rules)
         v=verify(goal,steps,f,rules,self.store.policy)
@@ -304,14 +312,15 @@ class Compiler:
         refs=sorted(set('source:'+r['source_id'] for r in rules)|set('rule:'+r['id'] for r in rules))
         plan={'goal':goal.to_dict(),'steps':steps,'rules_used':[r['id'] for r in rules],
               'evidence':sorted(set(r['chunk_id'] for r in rules)), 'refs':refs,
-              'basis':self.store.basis(goal),'policy_hash':self.store.policy.fingerprint(),
+              'basis':self.store.basis(goal,held),'policy_hash':self.store.policy.fingerprint(),
               'verification':v.to_dict(),'origin':'composed_from_current_memory' if composed else 'proposed_and_verified'}
+        if held: plan['held']=sorted(held)      # what it grips: approval and dispatch hold the claw to exactly that
         return plan
 
     @staticmethod
-    def held(goal: Goal, f: dict) -> set[str]:
+    def held(goal: Goal, f: dict) -> frozenset[str]:
         """What a claw primitive handles: the object the adapter reports in the claw (closing grips it, opening releases it)."""
-        return {f['holding']} if goal.kind=='primitive' and goal.primitive in CLAW and f.get('holding_known') and f.get('holding') else set()
+        return frozenset({f['holding']}) if goal.kind=='primitive' and goal.primitive in CLAW and f.get('holding_known') and f.get('holding') else frozenset()
 
     def refuse(self, goal: Goal, f: dict, rules: list[dict]) -> None:
         """Raise the refusal current memory sets for this goal in this world: an unresolved statement or a prohibition on
