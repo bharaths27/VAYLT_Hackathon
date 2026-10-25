@@ -17,6 +17,16 @@ def free_port():
 def run(tmp,*args,**extra):
     return subprocess.run([SH,str(ROOT/'scripts/cortex_sidecar.sh'),*args],env=env(tmp,**extra),capture_output=True,text=True,timeout=90)
 
+def kill_port_servers(port):
+    """Self-cleaning even when a mutant loses the PID file: kill any sidecar started for this test's unique port."""
+    for d in os.listdir('/proc'):
+        if d.isdigit():
+            try:cmd=Path(f'/proc/{d}/cmdline').read_bytes().split(bytes([0]))
+            except OSError:continue
+            if b'engram.cortex.api:create_app' in cmd and port.encode() in cmd:
+                try:os.kill(int(d),9)
+                except OSError:pass
+
 def private_state(tmp):
     state=tmp/'state';state.mkdir();os.chmod(state,0o700)
     token=state/'token';token.write_text('synthetic-test-operator-token-for-the-sidecar-0123456789'+chr(10));os.chmod(token,0o600)
@@ -36,7 +46,7 @@ def test_concurrent_starts_leave_exactly_one_server(tmp_path):
         assert b'engram.cortex.api:create_app' in Path(f'/proc/{pid}/cmdline').read_bytes()   # the PID file names the live server
         assert run(tmp_path,'status',CORTEX_PORT=port).returncode==0
     finally:
-        run(tmp_path,'stop',CORTEX_PORT=port)
+        run(tmp_path,'stop',CORTEX_PORT=port);kill_port_servers(port)
 
 def test_a_failing_start_leaves_a_process_it_did_not_start_alone(tmp_path):
     import json,threading,time
@@ -55,7 +65,28 @@ def test_a_failing_start_leaves_a_process_it_did_not_start_alone(tmp_path):
         assert p.returncode!=0 and 'started' not in out,(out,err)
         assert other.poll() is None and pidf.read_text().strip()==str(other.pid)  # not killed, not removed
     finally:
-        other.kill();srv.shutdown();srv.server_close()
+        other.kill();srv.shutdown();srv.server_close();kill_port_servers(port)
+
+def test_a_start_while_another_holds_the_lock_refuses_and_spawns_nothing(tmp_path):
+    state=private_state(tmp_path);lock=state/'start.lock';lock.mkdir();port=free_port()
+    holder=subprocess.Popen(['sleep','30']);(lock/'pid').write_text(str(holder.pid))   # a live start in progress
+    try:
+        r=run(tmp_path,'start',CORTEX_PORT=port)
+        assert r.returncode==1 and 'another start is in progress' in r.stderr,r.stdout+r.stderr
+        assert not (state/'cortex.pid').exists() and lock.exists()
+    finally:
+        holder.kill();kill_port_servers(port)
+
+def test_guard_start_with_captured_output_returns_and_the_daemon_holds_no_caller_pipe(tmp_path):
+    port=free_port()
+    try:
+        r=run(tmp_path,'start',CORTEX_PORT=port)                                  # capture_output=True, timeout=90
+        assert r.returncode==0,r.stdout+r.stderr
+        pid=(tmp_path/'state/cortex.pid').read_text().strip()
+        for fd in ('0','1','2'):                                                 # stdin /dev/null; stdout, stderr: its log
+            assert not os.readlink(f'/proc/{pid}/fd/{fd}').startswith('pipe:'),fd
+    finally:
+        run(tmp_path,'stop',CORTEX_PORT=port);kill_port_servers(port)
 
 def test_the_start_lock_admits_exactly_one_of_two_racers(tmp_path):
     state=private_state(tmp_path);lock=state/'start.lock'
@@ -74,7 +105,7 @@ def test_guard_a_lock_left_by_a_dead_starter_is_reclaimed(tmp_path):
         r=run(tmp_path,'start',CORTEX_PORT=port);assert r.returncode==0 and 'started' in r.stdout,r.stdout+r.stderr
         assert not lock.exists()
     finally:
-        run(tmp_path,'stop',CORTEX_PORT=port)
+        run(tmp_path,'stop',CORTEX_PORT=port);kill_port_servers(port)
 
 
 # P2-6 as stated is not reproducible: "$state/" against "$repo"/* already matches the root itself. Pinned here.
