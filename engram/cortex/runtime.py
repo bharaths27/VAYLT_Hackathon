@@ -34,7 +34,7 @@ class Brain:
         store.runtime_mode=self.mode
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
-        if acquire_lock and store.path!=':memory:':
+        if acquire_lock and store.path!=':memory:' and store.file_lock is None:
             self._file_lock=vault_lock.acquire(store.path)
         self.recover()
         if qwen: store.manifest('qwen','parametric',qwen.manifest())

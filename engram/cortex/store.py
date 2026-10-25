@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+from . import vault_lock
 from .schema import migrate
 from .types import (Conflict, CortexError, Denied, Goal, Missing, Policy, Stale,
                     canonical, digest, finite, normalize, text, uid)
@@ -28,28 +29,36 @@ RULE_RE = re.compile(
 
 class Store:
     def __init__(self, path: str | Path = ':memory:', *, workspace: str = 'local',
-                 policy: Policy | None = None, clock: Callable[[], float] = time.time):
+                 policy: Policy | None = None, clock: Callable[[], float] = time.time, lock: bool = True):
         self.path = str(path)
         self.workspace = text(workspace, 'workspace', 100)
         self.policy = policy or Policy()
         self.clock = clock
         self.lock = threading.RLock()
         self._depth = 0
-        self.conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
-        if self.path != ':memory:':
-            self.conn.execute('PRAGMA journal_mode=WAL')
-            self.conn.execute('PRAGMA synchronous=FULL')
-        migrate(self.conn)
-        with self.tx():
-            existing = self.one("SELECT value FROM meta WHERE key='cortex_workspace'")
-            if existing and existing['value'] != self.workspace:
-                raise Denied('one local workspace per vault; use a separate database for another workspace')
-            self.conn.execute("INSERT OR IGNORE INTO meta VALUES('cortex_workspace',?)", (self.workspace,))
+        # Own the vault before the first write (WAL switch, migration, arena registration).
+        # lock=False only for a caller that already holds vault_lock for this path.
+        self.file_lock = vault_lock.acquire(self.path) if lock and self.path != ':memory:' else None
+        self.conn = None
+        try:
+            self.conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+            self.conn.row_factory = sqlite3.Row
+            if self.path != ':memory:':
+                self.conn.execute('PRAGMA journal_mode=WAL')
+                self.conn.execute('PRAGMA synchronous=FULL')
+            migrate(self.conn)
+            with self.tx():
+                existing = self.one("SELECT value FROM meta WHERE key='cortex_workspace'")
+                if existing and existing['value'] != self.workspace:
+                    raise Denied('one local workspace per vault; use a separate database for another workspace')
+                self.conn.execute("INSERT OR IGNORE INTO meta VALUES('cortex_workspace',?)", (self.workspace,))
+        except BaseException:
+            self.close(); raise
 
     def close(self):
         with self.lock:
-            self.conn.close()
+            if self.conn: self.conn.close()
+            if self.file_lock: self.file_lock.close(); self.file_lock = None
 
     @contextmanager
     def tx(self):
