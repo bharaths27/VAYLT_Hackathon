@@ -37,8 +37,20 @@ SAFETY_RE = re.compile(r"\b(?:must|mustn't|never|should|shouldn't|shall|needs? t
                        r"not (?:allowed|permitted)|not\s+to\s+be|(?:is|are)\s+to\s+be\s+(?:kept|left|used|moved|handled|stored)|off[- ]limits|"
                        r"out\s+of\s+(?:bounds|service|order)|(?:no\s*one|nobody)\s+(?:may|should|can|is\s+to)|"
                        r"do not|don't|cannot|can't|may not|only|always|avoid|keep|hazard\w*|danger\w*|caution|warning)\b", re.I)
-# A negated handling statement in any word order ("must never be handled", "should not be moved").
-NEG_HANDLE_RE = re.compile(r"(?:\b(?:never|not|no|cannot)\b|n't\b).*\b(?:move[ds]?|moving|touch\w*|handl\w*|pick\w*|carr\w*|lift\w*|grab\w*|transport\w*)\b", re.I)
+# A negated handling statement in any word order ("must never be handled", "should not be moved", "nobody moves it").
+NEG_HANDLE_RE = re.compile(r"(?:\b(?:never|not|no|cannot|nobody|nothing)\b|n't\b).*\b(?:move[ds]?|moving|touch\w*|handl\w*|pick\w*|carr\w*|lift\w*|grab\w*|transport\w*)\b", re.I)
+# A handling limitation said without a modal or hazard word ("Sample A is too heavy to carry", "carry it upright"): an
+# excess or a limit, an inability, a manner or orientation of handling, a property that limits handling, or manipulation
+# wording itself. The robot only picks and places, so a statement of how an object is lifted, carried or held is one it
+# cannot honour unparsed: an unresolved constraint, like the safety wording above.
+LIMIT_RE = re.compile(r"\b(?:too\s+\w+|\w+\s+enough\s+(?:to|for)|at\s+(?:most|least)|no\s+more\s+than|maximum|minimum|limit\w*|exceed\w*|"
+                      r"unable|impossible|(?:does|do|did|will|would)(?:\s+not|n't)\s+fit|"
+                      r"carr(?:y|ies|ied|ying)|lift\w*|pick(?:s|ed|ing)?\s+(?:\w+\s+){0,3}up|grab\w*|grip\w*|grasp\w*|hold(?:s|ing)?|held|handl\w*|touch\w*|"
+                      r"tilt\w*|tip(?:s|ped|ping)?\s+over|drop\w*|shak\w*|stack\w*|squeez\w*|flip\w*|spill\w*|leak\w*|"
+                      r"upright|upside[\s-]+down|sideways|on\s+its\s+side|right\s+side\s+up|face\s+(?:up|down)|"
+                      r"gentl[ey]|careful(?:ly)?|with\s+care|slowly|with\s+(?:both|two)\s+hands|one\s+at\s+a\s+time|"
+                      r"heav(?:y|ier|iest)|weigh\w*|(?:\d+\s*)?(?:kg|kilo\w*)|hot|warm|cold|frozen|wet|sharp|brittle|breakable|delicate|slippery|"
+                      r"unstable|wobbl\w*|loose|cracked|broken|damaged|sterile|contaminat\w*|\w*hazard\w*|radioactive|pressuri[sz]ed)\b", re.I)
 # Conditionals: every if/unless/only-if/provided/except form and approval-gated forms ("when approved", "with permission").
 CONDITIONAL_RE = re.compile(r"\b(?:unless|except|exceptions?|only\s+if|if|provided|providing|as\s+long\s+as|so\s+long\s+as|on\s+condition|in\s+case|"
                             r"subject\s+to|pending|until\s+(?:\w+\s+){0,3}(?:approv\w*|authori[sz]\w*|clear\w*|permit\w*)|"
@@ -289,7 +301,12 @@ class Store:
               rules: list[dict] | None = None, supersedes: str | None = None,
               cloud_ok: bool = False, goal_definitions: dict | None = None, prohibitions: list[str] | None = None, facts: list[dict] | None = None) -> dict:
         title, body, owner = text(title, 'title', 200), text(body, 'source', 200000), text(owner, 'source owner', 100)
-        sentences = [s.replace(chr(0x2019), "'") for s in re.split(r'[.\n]', body)]
+        # A commitment is its owner's request, never shared knowledge: no rule, prohibition, fact, task alias or
+        # unresolved constraint comes from its text (its wake is parsed, planned and refused like any other request).
+        commitment = kind == 'future'
+        if commitment and (rules or prohibitions or facts or goal_definitions or supersedes):
+            raise CortexError('a commitment holds only its own request text')
+        sentences = [] if commitment else [s.replace(chr(0x2019), "'") for s in re.split(r'[.\n]', body)]
         extracted, unresolved = (rules, []) if rules is not None else ([], [])
         if rules is None:
             for s in sentences:
@@ -316,19 +333,19 @@ class Store:
         # names in its OWN sentence; with none of its own it is global (nothing is inherited from the document).
         stored = {(r.get('subject'), r.get('prerequisite'), r.get('required_zone')) for r in extracted if isinstance(r, dict)}
         banned = set(forbidden)
-        # A commitment's text is its owner's: its unresolved reasons do not copy it into shared memory.
-        quote = (lambda s: '(commitment text withheld)') if kind == 'future' else (lambda s: s.strip()[:300])
+        quote = lambda s: s.strip()[:300]
         for sent in sentences:
             named = self.named(sent)                      # its own names only
             masked = self._mask(sent)                     # registered names never count as wording ("Safety goggles")
             residual = sent
             for m in RULE_RE.finditer(sent):
-                if self._template_rule(m) in stored and not (SAFETY_RE.search(m['subject']) or CONDITIONAL_RE.search(self._mask(m['subject']))):
+                words = self._mask(' '.join((m['pre'], m['zone'], m['subject'])))   # the clause's own words, names masked
+                if self._template_rule(m) in stored and not any(rx.search(words) for rx in (SAFETY_RE, CONDITIONAL_RE, HAZARD_RE, LIMIT_RE, NEG_HANDLE_RE)):
                     residual = residual.replace(m.group(0), ' ')
             if PROHIBIT_RE.search(sent):
                 objs = self.resolve_objects(sent); forbidden.extend(objs)
                 if objs: residual = PROHIBIT_RE.sub(' ', residual)
-            elif (NEG_HANDLE_RE.search(sent) or HAZARD_RE.search(masked)) and named and set(named) <= banned and not CONDITIONAL_RE.search(masked):
+            elif (NEG_HANDLE_RE.search(sent) or HAZARD_RE.search(masked) or LIMIT_RE.search(masked)) and named and set(named) <= banned and not CONDITIONAL_RE.search(masked):
                 residual = ''                             # a reviewer's total ban on exactly these objects covers it
             rest = self._mask(residual)
             if CONDITIONAL_RE.search(masked):            # a conditional is never resolved: no structured form holds it
@@ -337,6 +354,8 @@ class Store:
                 pending.append(('Unparsed hazard or permission; structured review required: '+quote(sent), named or ['*']))
             elif SAFETY_RE.search(rest) or PROHIBIT_RE.search(residual):
                 pending.append(('Unparsed safety statement; structured review required: '+quote(sent), named or ['*']))
+            elif LIMIT_RE.search(rest) or NEG_HANDLE_RE.search(rest):
+                pending.append(('Unparsed handling limitation; structured review required: '+quote(sent), named or ['*']))
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
@@ -453,18 +472,16 @@ class Store:
                         self.conn.execute("UPDATE skill_version SET definition_json='{\"redacted\":true}' WHERE id=?",(k['id'],))
             if delete:
                 # Every other copy of the text goes too: unresolved reasons, declared facts, task aliases, the commitment's
-                # trigger and request, and the requests of the episodes it woke (with their search rows).
+                # trigger and request, the events that woke it and a failed wake's error text, and the episodes built from it.
+                aliases = [Goal.from_dict(json.loads(r['goal_json'])).to_dict() for r in self.rows('SELECT goal_json FROM cx_goal WHERE source_id=?', (sid,))]
+                tasks = {r['id'] for r in self.rows('SELECT id FROM prospective_task WHERE source_id=?', (sid,))}
                 self.conn.execute('DELETE FROM cx_unresolved WHERE source_id=?', (sid,))
                 self.conn.execute("UPDATE assertion SET subject='[deleted]',predicate='[deleted]',object='[deleted]' WHERE source_id=? AND id IN (SELECT assertion_id FROM cx_fact)", (sid,))
                 self.conn.execute('DELETE FROM cx_goal WHERE source_id=?', (sid,))
-                woke = [r['proposal_id'] for r in self.rows('SELECT proposal_id FROM prospective_task WHERE source_id=? AND proposal_id IS NOT NULL', (sid,))]
-                # The events that woke it carry its trigger, and a failed wake its error text.
                 self.conn.execute("UPDATE cx_event SET trigger='[deleted]' WHERE id IN (SELECT w.event_id FROM cx_wake w JOIN prospective_task p ON p.id=w.task_id WHERE p.source_id=?)", (sid,))
                 self.conn.execute("UPDATE cx_wake SET error=NULL WHERE task_id IN (SELECT id FROM prospective_task WHERE source_id=?)", (sid,))
                 self.conn.execute("UPDATE prospective_task SET trigger='[deleted]',goal='[deleted]',request='[deleted]' WHERE source_id=?", (sid,))
-                for ep in woke:
-                    self.conn.execute("UPDATE episode SET request='[deleted]',evidence_json=NULL WHERE id=?", (ep,))
-                    self.conn.execute('DELETE FROM cx_episode_fts WHERE episode_id=?', (ep,))
+                self._purge_episodes(sid, aliases, tasks)
         if delete:
             # ...and no residue stays on disk: full-text segments rebuilt without it, freed pages zeroed (secure_delete),
             # the write-ahead log checkpointed and truncated.
@@ -472,6 +489,36 @@ class Store:
                 self.conn.execute("INSERT INTO source_chunk_fts(source_chunk_fts) VALUES('optimize')")
                 self.conn.execute("INSERT INTO cx_episode_fts(cx_episode_fts) VALUES('optimize')")
             if self.path != ':memory:' and self._depth == 0: self.conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
+    def _purge_episodes(self, sid: str, aliases: list[dict], tasks: set[str]) -> None:
+        """Caller holds the transaction. The episodes built from a deleted source: plans citing it, its task aliases (a goal
+        with its own arguments), the wakes of its commitments (planned or not). Each keeps its outcome as an audit record
+        but loses every copy of the source: plan, evidence bundle, the step arguments journalled at execution, a goal's
+        free-text arguments, a commitment's request, and the idle memories made from it (summaries, practice, procedures)."""
+        redacted, gone, goals = canonical({'redacted': True}), set(), []
+        for e in self.rows('SELECT e.id,e.plan_json,c.goal_json,c.request_key FROM episode e JOIN cx_episode c ON c.id=e.id'):
+            key, goal = e['request_key'] or '', json.loads(e['goal_json'])
+            woken = ':wake:' in key and key.rsplit(':wake:', 1)[1].rsplit(':', 1)[0] in tasks
+            refs = json.loads(e['plan_json']).get('refs', []) if e['plan_json'] else []
+            if not (woken or 'source:'+sid in refs or (goal.get('args') and goal in aliases)): continue
+            gone.add('episode:'+e['id'])
+            self.settle(e['id'], 'invalidated', ('preparing','proposed'), 'source deleted')    # its plan is gone: never approvable
+            if goal.get('args'): goals.append(goal); goal = {**goal, 'args': {'redacted': True}}
+            self.conn.execute('UPDATE episode SET goal=?,plan_json=NULL,evidence_json=NULL WHERE id=?', (canonical(goal), e['id']))
+            self.conn.execute('UPDATE cx_episode SET goal_json=? WHERE id=?', (canonical(goal), e['id']))
+            self.conn.execute('UPDATE operation_event SET args_json=? WHERE episode_id=?', (redacted, e['id']))
+            if woken:
+                self.conn.execute("UPDATE episode SET request='[deleted]' WHERE id=?", (e['id'],))
+                self.conn.execute('DELETE FROM cx_episode_fts WHERE episode_id=?', (e['id'],))
+        for d in self.rows('SELECT id,refs_json FROM cx_derived'):
+            if gone & set(json.loads(d['refs_json'])):     # a fresh fingerprint: a purged memory never stands in for a new one
+                self.conn.execute("UPDATE cx_derived SET payload_json=?,status='DELETED',fingerprint=? WHERE id=?", (redacted, 'deleted:'+d['id'], d['id']))
+        for k in self.rows('SELECT id,definition_json FROM skill_version'):
+            if gone & set(json.loads(k['definition_json']).get('refs', [])):
+                self.conn.execute("UPDATE skill_version SET status='REVOKED',definition_json=? WHERE id=?", (redacted, k['id']))
+        for c in self.rows('SELECT id,case_json FROM cx_practice'):
+            if goals and json.loads(c['case_json']).get('goal') in goals:
+                self.conn.execute('UPDATE cx_practice SET case_json=?,expected_json=?,actual_json=? WHERE id=?', (redacted, redacted, redacted, c['id']))
 
     def settle(self, ep: str, outcome: str, allowed: tuple, failure: str | None = None) -> bool:
         """The one guarded episode transition; the linked commitment follows in the same transaction."""
@@ -607,7 +654,7 @@ class Store:
         approved=self.rows("SELECT v.id,v.name,v.digest FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' AND c.goal_key=? LIMIT 3",(goal.key() if goal else '',))
         related_derived=[]
         for d in self.derived(limit=32):
-            if d['status']=='VERIFIED' and self.refs_valid(d['refs']) and (not goal or d['basis_hash']==self.basis(goal)):
+            if d['status']=='VERIFIED' and self.refs_valid(d['refs']) and (not goal or d['basis_hash']==self.basis(goal)) and self.visible(d['refs'],principal):
                 related_derived.append({'id':d['id'],'kind':d['kind'],'payload':d['payload'],'refs':d['refs']})
         optional={'related_episodes':episodes,'prospective':prospective,'applicable_skills':approved,'derived':related_derived[:3],
                   'parametric':{'knowledge_is_evidence':False,'weight_updates':False}}
@@ -616,6 +663,12 @@ class Store:
             if len(canonical(trial).encode())<=self.policy.max_bundle_bytes: b=trial
             else: b['omitted'].append(name)
         return b
+
+    def visible(self, refs: list[str], principal: str | None) -> bool:
+        """Whether a memory may be shown to this principal (None: any). One citing another operator's episode is not: its
+        payload may quote that operator's request, which episode reads keep to the owner."""
+        eps = [r[len('episode:'):] for r in refs if r.startswith('episode:')]
+        return principal is None or all((o := self.one('SELECT owner FROM cx_episode WHERE id=?', (e,))) and o['owner'] == principal for e in eps)
 
     def prohibitions(self, object_ids=None):
         rs=self.rows("SELECT a.id,a.subject,a.source_id,a.chunk_id,c.effect FROM assertion a JOIN cx_constraint c ON c.assertion_id=a.id JOIN cx_source s ON s.source_id=a.source_id WHERE c.status='active' AND s.status='accepted' AND s.workspace=? ORDER BY a.id",(self.workspace,))

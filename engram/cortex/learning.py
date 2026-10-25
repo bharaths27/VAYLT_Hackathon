@@ -216,12 +216,15 @@ class Dreamer:
         try: return self._cycle(force=force)
         finally: self._cycle_lock.release()
 
-    def _model_budget(self) -> bool:
-        cap=self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
+    def _model_cap(self) -> int:
+        return self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
+
+    def _model_budget(self) -> float | None:
+        """None while an idle model call is allowed now; else when the oldest call in the rolling window leaves it."""
         st=self._model_state(); now=self.store.clock()
         calls=[t for t in st['calls'] if now-t<self.model_window_s]    # a stamp ahead of a stepped-back clock still counts
         if calls!=st['calls']: st['calls']=calls; self._save_model_state(st)
-        return cap>0 and len(calls)<cap
+        return None if len(calls)<self._model_cap() else min(calls,default=now)+self.model_window_s
 
     def _backoff(self, failed: bool):
         with self.store.tx():
@@ -243,10 +246,10 @@ class Dreamer:
                           'commitments':self.store.rows('SELECT id,status FROM prospective_task ORDER BY created_at DESC LIMIT 16')})
         last=self.store.one("SELECT value FROM meta WHERE key='cx_dream_watermark'")
         backlog=self.store.one("SELECT 1 FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('success','failed','unknown','aborted') AND NOT EXISTS (SELECT 1 FROM cx_consolidated k WHERE k.episode_id=e.id AND k.outcome=e.outcome) LIMIT 1")
-        wait=self.store.one("SELECT value FROM meta WHERE key='cx_dream_practice_wait'")
-        due=bool(wait) and self.store.clock()>=float(wait['value'])     # practice deferred by the cap may resume now
+        # Practice deferred by its rolling cap, or a model input deferred by the call budget, may resume now.
+        due=any(self.store.clock()>=float(w['value']) for w in self.store.rows("SELECT value FROM meta WHERE key IN ('cx_dream_practice_wait','cx_dream_model_wait')"))
         if not force and not backlog and last and last['value']==watermark and not due: return {'status':'no_new_evidence'}
-        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False; model_pending=model_failed=False; practice_wait=None
+        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False; model_pending=model_failed=False; practice_wait=model_wait=None
         with self.store.tx(): self.store.conn.execute('INSERT INTO cx_dream VALUES(?,?,?,?,?)',(run,self.store.clock(),None,'running','{}'))
         def interrupted():
             b,g,_=self.activity.snapshot()
@@ -332,11 +335,12 @@ class Dreamer:
                         if test_result['ok'] and skill['status']!='APPROVED' and self.store.policy.auto_publish_verified and still_idle():
                             self.skills.approve(skill['id'],skill['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
                 except CortexError as e: errors.append(type(e).__name__+': '+str(e))
-            # Local-model associations are hypotheses only, never automatically factual.
-            # Model work stays pending until the model answered this input or it was explicitly abandoned: a skipped
-            # (time or call budget) or failed attempt keeps the watermark open, and a failure also backs off.
-            if self.qwen and not (still_idle() and self._model_budget()): model_pending=True
-            elif self.qwen:
+            # Local-model associations are hypotheses only, never automatically factual. The input is built and compared
+            # first: one already answered (or explicitly abandoned), or none worth asking, is no pending work and lets the
+            # watermark advance. A new input stays pending until the model answered it: past the time budget it keeps the
+            # watermark open; past the call budget it waits, persisted, until the oldest call leaves the window (idle ticks
+            # do not re-run the cycle meanwhile); a failed attempt keeps it open and backs off. A cap of zero never asks.
+            if self.qwen and self._model_cap()>0:
                 evidence=[]; refs=[]
                 for r in self.store.rules()[:4]:
                     if r['status']=='active':
@@ -356,9 +360,11 @@ class Dreamer:
                 bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],
                         'declared_knowledge':declared,'source_passages':recent_sources}
                 asked=digest(bundle)
-                st=self._model_state()
-                if refs and live<self.LIVE_CAP and asked!=st['answered']:
-                    q=None; st['calls'].append(self.store.clock()); self._save_model_state(st)
+                if not (refs and live<self.LIVE_CAP and asked!=self._model_state()['answered']): pass     # nothing new to ask
+                elif not still_idle(): model_pending=True
+                elif (resume:=self._model_budget()) is not None: model_pending=True; model_wait=resume
+                else:
+                    st=self._model_state(); q=None; st['calls'].append(self.store.clock()); self._save_model_state(st)
                     try: q=self.qwen.complete('dream',bundle)
                     except CortexError as e: errors.append(type(e).__name__)
                     st=self._model_state()
@@ -381,15 +387,16 @@ class Dreamer:
                                 m=self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')
                                 made.append(m['id'])
                             except CortexError as e: errors.append('hypothesis rejected: '+type(e).__name__)
-            status='yielded' if interrupted() else 'complete'; leftover=leftover or model_pending
+            status='yielded' if interrupted() else 'complete'; leftover=leftover or (model_pending and model_wait is None)
         except Exception as e:
             status='failed'; errors.append(type(e).__name__)
         result={'id':run,'status':status,'derived_ids':list(dict.fromkeys(made)),'practice_ids':practiced,'errors':errors,'model_pending':model_pending,
                 'mode':'SIMULATED_PRACTICE','physical_actions':0,'weights_updated':False}
         with self.store.tx():
             if status=='complete' and not leftover: self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(watermark,))
-            if status=='complete' and practice_wait: self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_practice_wait',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(practice_wait),))
-            elif status=='complete': self.store.conn.execute("DELETE FROM meta WHERE key='cx_dream_practice_wait'")
+            for key,wait in (('cx_dream_practice_wait',practice_wait),('cx_dream_model_wait',model_wait)):
+                if status=='complete' and wait: self.store.conn.execute("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(wait)))
+                elif status=='complete': self.store.conn.execute('DELETE FROM meta WHERE key=?',(key,))
             self.store.conn.execute('UPDATE cx_dream SET finished_at=?,status=?,summary_json=? WHERE id=?',(self.store.clock(),status,canonical(result),run))
         if status!='yielded': self._backoff(status=='failed' or model_failed)
         return result

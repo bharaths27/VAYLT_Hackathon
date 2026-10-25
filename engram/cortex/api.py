@@ -259,6 +259,7 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         return {'path':str(p),'sha256':hashlib.sha256(body.encode()).hexdigest(),'contract':body,'model_prompt_enabled':bool(b.qwen)}
     @app.post('/memory/sources')
     def teach(body:Source,principal=Depends(operator)):
+        if body.kind=='future':raise Denied('the "future" kind is reserved for commitments; schedule one with POST /prospective')
         with b.activity.foreground():return b.store.teach(body.title,body.text,owner=principal,**body.model_dump(exclude={'title','text'}))
     @app.post('/memory/sources/{sid}/revoke')
     def revoke(sid:str,principal=Depends(operator)):
@@ -286,7 +287,7 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.get('/memory/facts')
     def facts(principal=Depends(operator)):return b.store.rules()
     @app.get('/memory/derived')
-    def derived(principal=Depends(operator)):return b.store.derived()
+    def derived(principal=Depends(operator)):return [d for d in b.store.derived() if b.store.visible(d['refs'],principal)]
     @app.get('/evidence/{cid}')
     def evidence(cid:str,principal=Depends(operator)):return b.store.evidence(cid,principal=principal)
     @app.post('/observations/operator')
@@ -382,7 +383,7 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     def turn(body:Turn,principal=Depends(operator)):
         return b.intent.turn(body.state,disclosure_allowed=bool(body.cloud_allowed and b.store.policy.cloud_enabled))
     @app.get('/metrics')
-    def metrics(principal=Depends(operator)):return b.metrics()
+    def metrics(principal=Depends(operator)):return b.metrics(principal)
     @app.get('/camera/status')
     def camera_status(principal=Depends(operator)):return hub.metadata() if hub else {'available':False,'reason':'not configured'}
     @app.get('/frame.jpg')

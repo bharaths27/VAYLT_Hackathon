@@ -390,18 +390,34 @@ class Brain:
 
     def clear_stop(self,*,principal: str):
         principal=text(principal,'operator',100); gen=self._stop_gen
-        with self.store.tx():
-            self._require_reconciled('rearming')
-            self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
-            self.journal(None,'clear_stop',{},'cleared',principal)
-        # Re-arm only after the durable transition committed: a refused COMMIT leaves the robot and the event stopped.
-        # A stop or failure latch that arrived meanwhile wins: the robot is stopped again and nothing is cleared.
-        self.robot.reset_stop()
-        if self._stop_gen!=gen:
-            self.robot.stop(); raise Conflict('a stop arrived while the latch was being cleared; the robot stays stopped')
+        self._require_reconciled('rearming')
+        # The durable latch stays until the adapter confirmed the reset. A reset that fails or times out (perhaps after
+        # the adapter re-armed) or that the adapter does not report leaves the vault latched, so a restart still refuses
+        # motion, and the robot is stopped again. Motion stays refused meanwhile: approval reads the latch and the event.
+        try:
+            self.robot.reset_stop(); why='it still reports stopped' if self.robot.state().get('stopped') else None
+        except Exception as e: why=type(e).__name__
+        if why:
+            self._restop(); raise Conflict(f'the adapter did not confirm the reset ({why}); the robot stays stopped and the stop stays latched')
+        # Then the latch is cleared in one transaction. A refused COMMIT, or a stop or failure latch that arrived
+        # meanwhile, wins: the robot is stopped again and nothing is cleared.
+        try:
+            with self.store.tx():
+                if self._stop_gen!=gen: raise Conflict('a stop arrived while the latch was being cleared; the robot stays stopped')
+                self._require_reconciled('rearming')
+                self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
+                self.journal(None,'clear_stop',{},'cleared',principal)
+        except BaseException:
+            self._restop(); raise
         self._stopped.clear()
+        if self._stop_gen!=gen: self._stopped.set()          # a stop landing after the commit keeps the event set as well
         self.activity.touch()
         return self.robot.state()
+
+    def _restop(self):
+        self._stopped.set()
+        try: self.robot.stop()
+        except Exception: pass
 
     def _latch(self,reason: str):
         # The stop latch is durable: recover() restores it, so a restart cannot silently re-arm motion.
@@ -536,8 +552,9 @@ class Brain:
         self.store.finish_task(ep,self.store.one('SELECT outcome FROM episode WHERE id=?',(ep,))['outcome'])
         return True
 
-    def metrics(self):
-        return {'episodes':self.store.rows('SELECT id,outcome,planner_calls,skill_id FROM episode ORDER BY started_at'),
+    def metrics(self,principal: str | None=None):
+        # With a principal, episode records are that owner's only, as operation reads and /events show them.
+        return {'episodes':self.store.rows('SELECT e.id,e.outcome,e.planner_calls,e.skill_id FROM episode e LEFT JOIN cx_episode c ON c.id=e.id WHERE (? IS NULL OR c.owner=?) ORDER BY e.started_at',(principal,principal)),
                 'derived':self.store.rows('SELECT kind,status,COUNT(*) n FROM cx_derived GROUP BY kind,status'),
                 'skills':self.store.rows('SELECT status,COUNT(*) n FROM skill_version GROUP BY status'),
                 'practice':self.store.rows('SELECT status,COUNT(*) n FROM cx_practice GROUP BY status'),
