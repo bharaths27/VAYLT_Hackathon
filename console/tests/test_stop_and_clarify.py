@@ -197,12 +197,14 @@ def test_an_unconfirmed_stop_says_so(c, held, monkeypatch):
 class FakeBrain:
     def __init__(self, reply, running=(), running_fails=False):
         self.reply, self.running, self.running_fails = reply, list(running), running_fails
-        self.calls = []
+        self.calls, self.pending = [], []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request.url.path)
         if request.url.path == "/commands":
             return httpx.Response(200, json=self.reply)
+        if request.url.path == "/operations/pending":
+            return httpx.Response(200, json=self.pending)
         if request.url.path == "/operations/running":
             return httpx.Response(500, json={}) if self.running_fails else httpx.Response(200, json=self.running)
         if request.url.path == "/stop":
@@ -488,3 +490,12 @@ def test_a_plan_the_brain_states_understood_is_staged_and_stops_nothing(c, on_br
     j = c.post("/commands", json={"text": "bring sample b to the bench"}).json()
     assert j["kind"] == "plan" and j["operation"]["id"] == PLAN["operation_id"]
     assert not main.engine.stopped and "/stop" not in fake.calls
+
+
+def test_a_plan_the_console_declined_is_not_staged_later_from_the_pending_list(c, on_brain):
+    fake = on_brain(FakeBrain({**PLAN, "classification": "unclear", "needs_clarification": True}))
+    assert c.post("/commands", json={"text": "bring sample b to the bench"}).json()["kind"] == "clarify"
+    fake.pending = [dict(PLAN), {**PLAN, "operation_id": "ep_gesture"}]   # the brain lists both as waiting
+    c.portal.call(main._stage_brain_pending)                    # one pass of the pending loop
+    assert PLAN["operation_id"] not in main.engine.ops          # declined once, never staged by another door
+    assert "ep_gesture" in main.engine.ops                      # a plan the brain made on its own still shows

@@ -441,6 +441,9 @@ async def _fire_later(task: dict, delay: float):
     await handle_command(task["text"], "prospective")
 
 
+_declined_brain_plans: set[str] = set()  # brain plans a command's reply did not state understood
+
+
 def _brain_understood(p: dict) -> bool:
     """Did the brain state that it understood this proposal? Only when it says so both ways it can: classification
     "understood" and needs_clarification false. A missing or contradictory field counts as unclear."""
@@ -467,6 +470,8 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
         # never staged, and a refusal it does not state it understood is not an understood refusal.
         reason = p.get("reason") or "I'm not sure what you meant."
         out["reason"] = reason
+        if p.get("operation_id") and p.get("digest"):  # a plan declined here is not staged later from the pending list
+            _declined_brain_plans.add(p["operation_id"])
         await _clarify(out, reason, source, running=True if p.get("stopped") is True else None)
         trace = [f"brain: {p.get('status')}", f"brain: classification {p.get('classification')!r}, needs_clarification "
                  f"{p.get('needs_clarification')!r}: not stated understood, so unclear"]
@@ -497,17 +502,23 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
     return out
 
 
+async def _stage_brain_pending() -> None:
+    """Show each new plan the brain lists as waiting (gestures, fired triggers) for approval. Not one the console
+    declined when a command's reply brought it: the brain did not state it understood it, so it is never staged."""
+    for p in await brain.pending():
+        oid = p.get("operation_id")
+        if oid and oid not in engine.ops and oid not in _declined_brain_plans and p.get("digest"):
+            try:
+                await engine.stage(brain.RemoteOperation(p, (p.get("plan") or {}).get("goal", ""), "brain", {}))
+                await bus.emit("say", text="A new plan is waiting for your approval.")
+            except Exception as e:  # noqa: BLE001
+                await bus.emit("log", level="warn", msg=f"pending plan not shown: {e}")
+
+
 async def _brain_pending_loop():
     """Plans the brain made on its own (gestures, fired triggers) also show up for approval."""
     while True:
-        for p in await brain.pending():
-            oid = p.get("operation_id")
-            if oid and oid not in engine.ops and p.get("digest"):
-                try:
-                    await engine.stage(brain.RemoteOperation(p, (p.get("plan") or {}).get("goal", ""), "brain", {}))
-                    await bus.emit("say", text="A new plan is waiting for your approval.")
-                except Exception as e:  # noqa: BLE001
-                    await bus.emit("log", level="warn", msg=f"pending plan not shown: {e}")
+        await _stage_brain_pending()
         await asyncio.sleep(2)
 
 
