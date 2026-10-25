@@ -440,3 +440,15 @@ def test_a_plan_that_fails_validation_while_a_task_runs_is_refused_and_stops_not
     assert said[-1] == "I can't plan that safely." and not main.engine.stopped
     held.finish.set()
     assert wait(c, op["id"])["status"] != "STOPPED"
+
+
+def test_a_rule_inside_two_delays_while_a_task_runs_is_refused_and_stops_nothing(c, held, said):
+    from server.parser import parse
+    text = "In 5 minutes, in 2 minutes, remember that the bench is wet."
+    assert parse(text, {}).classification == "understood"     # the inner refusal is understood, so the outer is
+    op = start_op(c, held)
+    j = c.post("/commands", json={"text": text}).json()
+    assert j["kind"] == "clarify" and "stopped" not in j and not main.engine.stopped
+    assert said[-1] == "I can only schedule a robot action."
+    held.finish.set()
+    assert wait(c, op["id"])["status"] != "STOPPED"

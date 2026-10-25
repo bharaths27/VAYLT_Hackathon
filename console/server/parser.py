@@ -534,9 +534,10 @@ def _not_schedulable(text: str, inner: str, sub: ParseResult, trace: list[str]) 
     one with no grammar must not run later on a guess (or go to the model fallback, which would plan it now)."""
     why = {"rule": "it is a rule", "prospective": "it has a delay of its own"}.get(sub.kind) or (
         "it does not move the robot" if sub.kind == "plan" else (sub.reason or "I can't do it").rstrip(". "))
-    # Understood: a rule, a second delay, something that does not move, or a task refused for itself (unsafe, a
-    # limit, "don't"). Unclear: the task inside is itself unclear or unparsed, so the whole command is.
-    understood = sub.kind in ("rule", "prospective", "plan") or (sub.kind == "abstain" and not sub.data.get("llm_eligible"))
+    # As the task inside was taken, as it states: understood (a rule, a second delay, something that does not move,
+    # a task refused for itself, or one that is itself understood but unschedulable, like a rule inside two delays),
+    # or unclear (the task inside is unclear, unparsed or unheard, so the whole command is).
+    understood = sub.understood
     return ParseResult("clarify", text, reason=f"I can only schedule a robot action, and not '{inner.strip(' .')}': "
                        f"{why}. Say the rule now, or schedule a robot action, like 'In 5 minutes, open the claw'.",
                        quip=quip("clarify"), trace=trace + [f"only a robot action is scheduled, not a {sub.kind}"] + sub.trace,
