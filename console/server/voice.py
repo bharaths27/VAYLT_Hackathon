@@ -318,22 +318,31 @@ def is_native_pcm(path: Path) -> bool:
 
 
 def wav_byte_limit() -> int:
-    """Largest WAV that STT will hand to whisper: STT_MAX_SECONDS of 16 kHz mono 16-bit PCM, plus
-    the extra second ffmpeg may write (see _transcribe_job) and a little slack for the header."""
+    """Largest WAV FILE that STT will hand to whisper: STT_MAX_SECONDS of 16 kHz mono 16-bit PCM,
+    plus the extra second ffmpeg may write (see _transcribe_job) and a little slack for the
+    header. A cap on the whole file; the length limit is measured on the data chunk alone."""
     return int((config.STT_MAX_SECONDS + 2) * 16000 * 2) + 4096
+
+
+def _too_long(seconds: float) -> str:
+    return f"audio too long: {seconds:.1f} s (limit {config.STT_MAX_SECONDS:g} s)"
+
+
+def _too_large(path: Path) -> str:
+    return f"file too large: {path.stat().st_size} bytes (limit {wav_byte_limit()} bytes)"
 
 
 def _wav_problem(wav: Path) -> str | None:
     """Why this WAV must not reach whisper, or None. Looks at its size on disk first and then
-    only at its header, so an oversized file is refused before anything reads it into memory."""
-    limit = config.STT_MAX_SECONDS
+    only at its header, so an oversized file is refused before anything reads it into memory.
+    The length comes from the data chunk, never from the size of the whole file."""
     if wav.stat().st_size > wav_byte_limit():
-        return f"audio too long: over {limit:g} s"
+        return _too_large(wav)
     seconds = _native_seconds(wav)
     if seconds is None:
         return "audio is not 16 kHz mono 16-bit PCM after conversion"
-    if seconds > limit:
-        return f"audio too long: {seconds:.1f} s (limit {limit:g} s)"
+    if seconds > config.STT_MAX_SECONDS:
+        return _too_long(seconds)
     return None
 
 
@@ -375,11 +384,14 @@ def _transcribe_job(audio: bytes, suffix: str) -> tuple[str | None, str]:
         # Different names: an upload called *.wav must never be the file ffmpeg writes.
         src = Path(d) / f"upload{suffix}"
         src.write_bytes(audio)
-        if is_native_pcm(src):
+        native = _native_seconds(src)  # reads only the chunk headers
+        if native is not None and native > config.STT_MAX_SECONDS:
+            return None, _too_long(native)  # its data chunk alone is too long: nothing to convert
+        if native is not None and src.stat().st_size <= wav_byte_limit():
             wav = src  # already what whisper reads; no ffmpeg
-        elif not st["ffmpeg"]:
-            return None, f"STT not installed: {st}"
-        else:
+        elif st["ffmpeg"]:
+            # Anything else, and a native clip that only extra chunks (metadata) make too big:
+            # ffmpeg rewrites it without them (-map_metadata -1).
             wav = Path(d) / "converted-16k-mono.wav"
             # Bound the DECODED audio while ffmpeg writes it (-t length, -fs file size): a small,
             # long compressed clip must not grow into a WAV that fills memory or /tmp. ffmpeg may
@@ -387,10 +399,14 @@ def _transcribe_job(audio: bytes, suffix: str) -> tuple[str | None, str]:
             # "exactly at the limit".
             conv = subprocess.run([config.FFMPEG_BIN, "-y", "-loglevel", "error", "-i", str(src),
                                    "-t", f"{config.STT_MAX_SECONDS + 1:g}", "-fs", str(wav_byte_limit()),
-                                   "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
+                                   "-map_metadata", "-1", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(wav)],
                                   capture_output=True, timeout=20)
             if conv.returncode != 0:
                 return None, "ffmpeg failed: " + conv.stderr.decode()[-200:]
+        elif native is not None:
+            return None, _too_large(src)  # would need ffmpeg to drop its extra chunks
+        else:
+            return None, f"STT not installed: {st}"
         problem = _wav_problem(wav)  # before the server or whisper-cli reads a byte of it
         if problem:
             return None, problem

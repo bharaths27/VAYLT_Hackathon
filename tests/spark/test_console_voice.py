@@ -902,7 +902,7 @@ def test_an_oversized_wav_is_refused_before_anything_reads_it(stt, whisper_serve
 
     monkeypatch.setattr(Path, "read_bytes", spy)
     text, why = run(voice.transcribe(wav_bytes(rate=44100), ".wav"))
-    assert (text, why) == (None, "audio too long: over 2 s")
+    assert (text, why) == (None, f"file too large: {stt.ffmpeg_wrote} bytes (limit {voice.wav_byte_limit()} bytes)")
     assert stt.ffmpeg_wrote > voice.wav_byte_limit()  # the converter really did misbehave
     assert reads and max(reads) <= voice.wav_byte_limit()  # and nothing read that file
     assert whisper_server["requests"] == [] and stt.tools() == ["ffmpeg"]
@@ -929,6 +929,11 @@ def riff(*chunks, data_size=None):
 
 def fmt(tag=1, channels=1, rate=16000, align=2, bits=16, extra=b""):
     return b"fmt ", struct.pack("<HHIIHH", tag, channels, rate, rate * align, align, bits) + extra
+
+
+def info_list(size):
+    """A LIST/INFO chunk holding a comment of `size` bytes: metadata, not audio."""
+    return b"LIST", b"INFO" + b"ICMT" + struct.pack("<I", size) + b"x" * size
 
 
 # WAVE_FORMAT_EXTENSIBLE: cbSize 22, 16 valid bits, front-centre, KSDATAFORMAT_SUBTYPE_PCM
@@ -991,9 +996,12 @@ REAL_FFMPEG = _real_ffmpeg()
 
 
 @pytest.mark.skipif(not REAL_FFMPEG, reason="no real ffmpeg on this machine")
-@pytest.mark.parametrize("seconds,expected", [(1.5, ("pick up the beaker", "ok")),
-                                              (5.0, (None, "audio too long: 3.0 s (limit 2 s)"))])
-def test_real_ffmpeg_output_passes_the_native_check(stt, monkeypatch, seconds, expected):
+@pytest.mark.parametrize("upload,expected", [
+    (wav_bytes(rate=44100, channels=2, frames=int(44100 * 1.5)), ("pick up the beaker", "ok")),
+    (wav_bytes(rate=44100, channels=2, frames=44100 * 5), (None, "audio too long: 3.0 s (limit 2 s)")),
+    (riff(fmt(), info_list(200_000), (b"data", PCM_1S)), ("pick up the beaker", "ok")),
+], ids=["1.5s-44k-stereo", "5s-44k-stereo", "1s-native-with-200KB-metadata"])
+def test_real_ffmpeg_output_passes_the_native_check(stt, monkeypatch, upload, expected):
     monkeypatch.setattr(config, "FFMPEG_BIN", REAL_FFMPEG)
     monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
     stt.installed.add(REAL_FFMPEG)
@@ -1006,10 +1014,51 @@ def test_real_ffmpeg_output_passes_the_native_check(stt, monkeypatch, seconds, e
         return stt(cmd, **kwargs)
 
     monkeypatch.setattr(voice, "subprocess", types.SimpleNamespace(run=procs))
-    upload = wav_bytes(rate=44100, channels=2, frames=int(44100 * seconds))
     assert run(voice.transcribe(upload, ".wav")) == expected
     if expected[0]:
         assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw[:4] == b"RIFF"
+        assert len(stt.whisper_saw) <= voice.wav_byte_limit() and b"ICMT" not in stt.whisper_saw
+
+
+# ------------------------------------------------------------------ length vs file size (review fix 8)
+@pytest.mark.parametrize("comment", [1000, 200_000], ids=["under-the-file-cap", "over-the-file-cap"])
+def test_a_short_native_clip_with_big_metadata_is_transcribed(stt, monkeypatch, comment):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    clip = riff(fmt(), info_list(comment), (b"data", PCM_1S))  # 1 s of audio
+    over_cap = len(clip) > voice.wav_byte_limit()
+    assert over_cap == (comment == 200_000)
+    assert run(voice.transcribe(clip, ".wav"))[0] == "pick up the beaker"
+    if over_cap:  # ffmpeg rewrites it without the metadata, and its output is checked as usual
+        (_, cmd), _ = stt.calls
+        assert stt.tools() == ["ffmpeg", "whisper-cli"] and cmd[cmd.index("-map_metadata") + 1] == "-1"
+        assert stt.whisper_saw == CONVERTED
+    else:
+        assert stt.tools() == ["whisper-cli"] and stt.whisper_saw == clip
+
+
+def test_a_native_clip_too_big_only_through_metadata_needs_ffmpeg(stt, monkeypatch):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    stt.installed.clear()  # no ffmpeg to drop the metadata with
+    clip = riff(fmt(), info_list(200_000), (b"data", PCM_1S))
+    expected = f"file too large: {len(clip)} bytes (limit {voice.wav_byte_limit()} bytes)"
+    assert run(voice.transcribe(clip, ".wav")) == (None, expected)
+    assert stt.calls == []
+
+
+def test_an_oversized_native_clip_whose_audio_is_too_long_is_refused_unread(stt, monkeypatch):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    clip = riff(fmt(), (b"data", PCM_1S * 10))  # 10 s of audio: over the length AND the file cap
+    assert len(clip) > voice.wav_byte_limit()
+    reads = []
+    real_read_bytes = Path.read_bytes
+
+    def spy(self):
+        reads.append(self.stat().st_size)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", spy)
+    assert run(voice.transcribe(clip, ".wav")) == (None, "audio too long: 10.0 s (limit 2 s)")
+    assert reads == [] and stt.calls == []  # judged from its chunk headers alone
 
 
 # ------------------------------------------------------------------ probe reference (review fix 5)
