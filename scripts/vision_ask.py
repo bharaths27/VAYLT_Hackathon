@@ -73,19 +73,20 @@ def main() -> int:
             return scene_check(img, client)
         return find_object(img, a.what, client)
 
-    def run(label: str, get) -> None:
+    def run(label: str, get) -> bool:
         try:
             out = ask(get())
             out.pop("probs", None)
             out.pop("posture_probs", None)
             print(json.dumps({"source": label, **out}), flush=True)
+            return True
         except (VisionError, OSError, ValueError) as e:
             print(json.dumps({"source": label, "error": str(e)}), flush=True)
+            return False
 
-    if a.image:
-        for p in a.image:
-            run(p, lambda p=p: Path(p).read_bytes())
-        return 0
+    if a.image:  # exit 1 if any file failed, so scripts can tell
+        results = [run(p, lambda p=p: Path(p).read_bytes()) for p in a.image]
+        return 0 if all(results) else 1
     cap = None
     if a.webcam is not None:
         import cv2
@@ -96,9 +97,9 @@ def main() -> int:
     try:
         next_at = time.monotonic()
         while True:
-            run(label, get)
+            ok = run(label, get)
             if a.every <= 0:
-                return 0
+                return 0 if ok else 1
             next_at += a.every  # a fixed cadence: each frame starts `every` seconds after the last one started,
             time.sleep(max(0.0, next_at - time.monotonic()))  # or at once when an answer took longer than that
             next_at = max(next_at, time.monotonic())

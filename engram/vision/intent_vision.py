@@ -135,14 +135,20 @@ def _prepare_cv2(data: bytes, max_side: int) -> bytes:
         import numpy as np
     except ImportError:
         raise VisionError("needs Pillow or OpenCV to read images: pip install pillow") from None
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    try:
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    except Exception as e:  # noqa: BLE001 - OpenCV raises cv2.error on some inputs (e.g. an empty buffer)
+        raise VisionError(f"not a readable image: {type(e).__name__}") from None
     if img is None:
         raise VisionError("not a readable image")
     h, w = img.shape[:2]
     scale = _scale(w, h, max_side)
-    if scale != 1.0:
-        img = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))))
-    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    try:
+        if scale != 1.0:
+            img = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))))
+        ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    except Exception as e:  # noqa: BLE001 - same: an OpenCV failure is "no image to send"
+        raise VisionError(f"could not prepare the image: {type(e).__name__}") from None
     if not ok:
         raise VisionError("could not encode the image")
     return jpg.tobytes()

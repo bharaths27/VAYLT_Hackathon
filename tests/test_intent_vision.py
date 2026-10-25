@@ -3,21 +3,40 @@
 import base64
 import io
 import json
+import struct
+import subprocess
+import sys
+import zlib
+from pathlib import Path
 
 import pytest
 
-PIL = pytest.importorskip("PIL")
-from PIL import Image  # noqa: E402
-
-from engram.vision import intent_vision as iv  # noqa: E402
+from engram.vision import intent_vision as iv
 
 KEY = "dummy-api-key-for-tests"  # not a real key; asserts below check it never leaks
+REPO = Path(__file__).resolve().parents[1]
 
 
 def png(w, h, color=(200, 30, 30)):
-    buf = io.BytesIO()
-    Image.new("RGB", (w, h), color).save(buf, format="PNG")
-    return buf.getvalue()
+    """A solid-colour PNG built by hand, so these tests need neither Pillow nor OpenCV to make inputs."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    row = b"\x00" + bytes(color) * w
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(row * h)) + chunk(b"IEND", b""))
+
+
+def image_size(jpeg):
+    """(width, height, format) of an image, read with whichever library is installed."""
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(jpeg))
+        return img.size[0], img.size[1], img.format
+    except ImportError:
+        cv2 = pytest.importorskip("cv2")
+        import numpy as np
+        img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        return img.shape[1], img.shape[0], "JPEG" if jpeg[:2] == b"\xff\xd8" else "?"
 
 
 class FakeTransport:
@@ -62,9 +81,9 @@ def test_request_shape_endpoint_header_and_single_referenced_asset():
 @pytest.mark.parametrize("size,expect_max,expect_min", [((4000, 3000), 768, 280), ((200, 150), None, 280),
                                                         ((640, 480), 768, 280)])
 def test_prepare_jpeg_fits_the_api_limits(size, expect_max, expect_min):
-    out = Image.open(io.BytesIO(iv.prepare_jpeg(png(*size))))
-    assert out.format == "JPEG"
-    assert min(out.size) >= expect_min and max(out.size) <= (expect_max or iv.MAX_SIDE)
+    w, h, fmt = image_size(iv.prepare_jpeg(png(*size)))
+    assert fmt == "JPEG"
+    assert min(w, h) >= expect_min and max(w, h) <= (expect_max or iv.MAX_SIDE)
 
 
 def test_prepare_jpeg_refuses_non_images_and_impossible_shapes():
@@ -237,5 +256,31 @@ def test_find_object_refuses_a_nonsense_threshold_before_asking(bad):
 
 
 def test_a_very_narrow_image_meets_the_minimum_without_passing_the_api_limit():
-    out = Image.open(io.BytesIO(iv.prepare_jpeg(png(1600, 300))))
-    assert min(out.size) >= iv.MIN_SIDE and max(out.size) <= iv.MAX_SIDE
+    w, h, _ = image_size(iv.prepare_jpeg(png(1600, 300)))
+    assert min(w, h) >= iv.MIN_SIDE and max(w, h) <= iv.MAX_SIDE
+
+
+def test_the_opencv_path_works_and_fails_closed_without_pillow(monkeypatch):
+    pytest.importorskip("cv2")
+    monkeypatch.setitem(sys.modules, "PIL", None)  # "from PIL import Image" now raises ImportError
+    w, h, fmt = image_size(iv.prepare_jpeg(png(4000, 3000)))
+    assert fmt == "JPEG" and max(w, h) <= iv.DEFAULT_SIDE and min(w, h) >= iv.MIN_SIDE
+    for bad in (b"", b"not an image"):
+        with pytest.raises(iv.VisionError):
+            iv.prepare_jpeg(bad)
+
+
+def _cli(*args, env_extra=None):
+    import os
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TYPESAFE_")}
+    env.update(env_extra or {})
+    return subprocess.run([sys.executable, str(REPO / "scripts" / "vision_ask.py"), *args],
+                          capture_output=True, text=True, env=env, timeout=60)
+
+
+def test_the_cli_exits_nonzero_when_a_file_fails_and_two_without_configuration(tmp_path):
+    missing = str(tmp_path / "no-such-photo.jpg")
+    r = _cli("hand", "--image", missing, env_extra={"TYPESAFE_API_KEY": KEY, "TYPESAFE_INTENT_MODEL": "m"})
+    assert r.returncode == 1 and '"error"' in r.stdout and KEY not in r.stdout + r.stderr
+    r = _cli("hand", "--image", missing)
+    assert r.returncode == 2

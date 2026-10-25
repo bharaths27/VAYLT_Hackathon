@@ -43,9 +43,10 @@ Stop a live run with Ctrl+C.
 The per-photo record (titles, ground truth, every answer and time) is in `docs/VISION_EVIDENCE_2026-10-25.md`.
 
 - **Speed:** 0.32 to 0.61 s per frame, end to end over the internet, frames resized to 768 px.
-- **Hand signals:** 10 of 11 photos right (fist, open palm, peace, thumbs up, no signal). The miss was a stone
-  sculpture of a pointing hand, read as a thumbs up. A wave and an open palm look the same in one still frame;
-  both read as `open_palm`.
+- **Hand signals:** 9 of 11 photos with the exact label. The two misses: a stone sculpture of a pointing hand
+  read as a thumbs up, and a person waving read as `open_palm`. A wave and an open palm look the same in one
+  still frame, so counting them as one signal it is 10 of 11. Fist, open palm, V sign, thumbs up and "no
+  signal" were all read right.
 - **Care-room scene:** 6 of 6 right: a person lying on a sidewalk (on the floor, 0.88), two people standing, a
   patient in an ICU bed, an empty room (person 0.07), a person in a wheelchair (sitting), and a person waving
   (asking for help, 0.95).
