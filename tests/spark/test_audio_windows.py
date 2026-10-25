@@ -63,8 +63,6 @@ def test_overflow_never_drops_the_start_and_makes_the_utterance_invalid():
 def test_chunks_must_arrive_in_order_and_hold_whole_samples():
     w = PcmWindow()
     w.append(pcm(1), seq=0)
-    with pytest.raises(OutOfOrder):
-        w.append(pcm(3), seq=2)
     w.append(pcm(2), seq=1)
     with pytest.raises(ValueError):
         w.append(b"\x01")
@@ -79,10 +77,12 @@ def test_empty_chunks_store_nothing_but_keep_their_sequence_number():
         w.append(b"")
     assert w._chunks == [] and w.duration_s == 0
     w.append(pcm(1), seq=20_000)
-    with pytest.raises(OutOfOrder):
-        w.append(b"", seq=5)
     w.append(b"", seq=20_001)
     assert len(w._chunks) == 1 and read_wav(w.snapshot())[3] == pcm(1)
+    with pytest.raises(OutOfOrder):
+        w.append(b"", seq=5)                                    # even an empty chunk out of order...
+    with pytest.raises(AudioOverflow):
+        w.snapshot()                                            # ...means the utterance is not whole
 
 
 def test_window_length_is_bounded():
@@ -615,3 +615,50 @@ def test_a_window_clipped_between_check_and_snapshot_ends_the_partials_cleanly(m
     tr.start()
     tr._thread.join(1.0)
     assert not tr._thread.is_alive() and crashed == [] and fake.calls == []
+
+
+# ---- a missing or misplaced chunk: the utterance is not whole -------------------------------------------------
+
+
+def test_an_out_of_order_chunk_is_a_kind_of_not_whole():
+    assert issubclass(OutOfOrder, AudioOverflow) and issubclass(OutOfOrder, ValueError)
+
+
+@pytest.mark.parametrize("arrival", [[0, 2, 3], [0, 2, 1, 3], [0, 1, 1, 2]], ids=["dropped", "reordered", "duplicated"])
+def test_an_out_of_order_chunk_makes_the_utterance_invalid_until_reset(arrival):
+    w = PcmWindow()
+    refused = []
+    for seq in arrival:                                         # a caller that catches the error and carries on
+        try:
+            w.append(pcm(seq + 1), seq=seq)
+        except (AudioOverflow, OutOfOrder) as e:
+            refused.append(type(e).__name__)
+    assert refused and refused[0] == "OutOfOrder"
+    first_bad = next(i for i, seq in enumerate(arrival) if seq != i)
+    assert len(refused) == len(arrival) - first_bad              # from the first bad chunk on, all refused
+    assert not w.intact(w.generation)
+    with pytest.raises(AudioOverflow):
+        w.snapshot()                                            # nothing with a hole in it is transcribed
+    with pytest.raises(AudioOverflow):
+        w.seal()                                                # and it can never be finalized
+    w.reset()                                                   # the next utterance starts clean
+    w.append(pcm(9), seq=0)
+    assert read_wav(w.snapshot())[3] == pcm(9)
+
+
+@pytest.mark.parametrize("arrival", [[0, 2, 3], [0, 2, 1, 3]], ids=["dropped", "reordered"])
+def test_an_utterance_with_a_missing_chunk_never_yields_a_final_transcript(arrival):
+    fake, window = _FakeWhisper(), PcmWindow()
+    fake.release.set()
+    for seq in arrival:
+        try:
+            window.append(pcm(*([1] * 8000)), seq=seq)          # 0.5 s of audio per chunk
+        except (AudioOverflow, OutOfOrder):
+            pass
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    time.sleep(0.1)
+    assert tr.poll() is None and "partial" not in fake.calls   # no partial of an utterance with a hole
+    with pytest.raises(AudioOverflow):
+        tr.finish()                                             # and no final transcript
+    assert "final" not in fake.calls

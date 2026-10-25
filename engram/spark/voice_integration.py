@@ -22,10 +22,16 @@ from ..engine import Engine
 from ..planner import refusal
 from ..skills import APPROVED
 from .audio_windows import AudioOverflow, LiveTranscriber
-from .presets import PRESETS, register_presets
+from .intent_client import IntentDecision
+from .presets import PRESETS, register_presets, voice_presets_enabled
 from .voice import Classifier, GateResult, SpeculationGate
 
 ACTING = ("propose", "schedule")   # gate actions that lead to an engine proposal, now or when a trigger fires
+
+
+def _presets_off(text: str, partial: bool) -> IntentDecision:
+    """The classifier while voice presets are turned off: nothing is a preset, and no model is asked."""
+    return IntentDecision(None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, model="presets-off")
 
 
 def memory_version(engine: Engine) -> Hashable:
@@ -46,9 +52,13 @@ def memory_version(engine: Engine) -> Hashable:
 
 class VoiceIntegration:
     def __init__(self, engine: Engine, classifier: Classifier, **gate_options: Any):
+        """With ENGRAM_VOICE_PRESETS off (read as engram/api.py reads it), no preset is registered, the
+        intent model is never asked, and nothing but a stop is acted on."""
         self.engine = engine
-        register_presets(engine)
-        self.gate = SpeculationGate(classifier, prefetch=self._prefetch,
+        self.presets_enabled = voice_presets_enabled()
+        if self.presets_enabled:
+            register_presets(engine)
+        self.gate = SpeculationGate(classifier if self.presets_enabled else _presets_off, prefetch=self._prefetch,
                                     context_version=lambda: memory_version(engine), **gate_options)
 
     @staticmethod
@@ -78,6 +88,8 @@ class VoiceIntegration:
         base = {"heard": r.text, "utterance": r.utterance, "revision": r.revision}
         if r.action == "stop":
             return {"kind": "stop", **base, "state": self.engine.stop()}
+        if not self.presets_enabled:
+            return {"kind": "none", **base, "reason": "Voice presets are turned off (ENGRAM_VOICE_PRESETS)."}
         if r.action in ACTING:
             why = self._precheck(r)
             if why:

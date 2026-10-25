@@ -13,7 +13,7 @@ from engram.db import SCHEMA
 from engram.engine import Engine, EngineError
 from engram.planner import refusal
 from engram.robot.mock import MockRobot
-from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscriber, PcmWindow
+from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscriber, OutOfOrder, PcmWindow
 from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
 from engram.spark.voice_integration import VoiceIntegration, memory_version
@@ -325,3 +325,43 @@ def test_audio_arriving_while_the_final_is_made_never_becomes_a_proposal(taught,
     assert out["r"]["kind"] == "clarify"                        # not final: say it again
     assert voice.gate.prepared() is None
     assert nothing_happened(taught)
+
+
+@pytest.mark.parametrize("later", [[2, 3], [2, 1, 3]], ids=["chunk 1 dropped", "chunk 1 late"])
+def test_an_utterance_with_a_missing_chunk_never_becomes_a_proposal(taught, spawn, clock, later):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=5.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)           # chunk 0 arrived; "open the gripper" prepared
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    for seq in later:                                           # a caller that catches the error and carries on
+        try:
+            window.append(bytes(3200), seq=seq)
+        except (AudioOverflow, OutOfOrder):
+            pass
+    out = voice.finish_live(1, 99, tr)
+    assert out["kind"] == "clarify" and voice.gate.prepared() is None
+    assert stt.calls.count("final") == 0
+    assert nothing_happened(taught)
+
+
+@pytest.mark.parametrize("flag", ["0", "false", "no", "off", " Off "])
+def test_presets_turned_off_are_off_in_voice_integration(taught, fake, spawn, clock, monkeypatch, flag):
+    monkeypatch.setenv("ENGRAM_VOICE_PRESETS", flag)
+    voice = VoiceIntegration(taught, fake, spawn=spawn, clock=clock)
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    out = voice.on_final(1, 1, "Open the claw")
+    assert out["kind"] == "none" and "turned off" in out["reason"]
+    later = voice.on_final(2, 0, "Open the claw after calibration finishes")
+    assert later["kind"] == "none" and taught.prospective.list() == []
+    assert fake.calls == []                                     # the intent model is never asked
+    assert count(taught, "episode") == 0 and taught.robot.calls == OBSERVED_ONLY
+    assert voice.on_partial(3, 0, "Stop")["kind"] == "stop"     # a stop still stops
+    assert taught.command("Open the gripper")["status"] == "refused"   # nothing was registered
+
+
+def test_voice_integration_reads_the_setting_exactly_as_the_api_does():
+    import engram.api as api
+    from engram.spark import presets
+
+    assert api.voice_presets_enabled is presets.voice_presets_enabled

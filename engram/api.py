@@ -37,13 +37,9 @@ from .db import connect
 from .engine import Engine, EngineError
 from .robot.mock import MockRobot
 from .skills import SkillError
-from .spark.presets import register_presets
+from .spark.presets import register_presets, voice_presets_enabled
 
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def voice_presets_enabled() -> bool:
-    return os.environ.get("ENGRAM_VOICE_PRESETS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 class SourceIn(BaseModel):
