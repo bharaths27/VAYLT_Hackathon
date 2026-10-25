@@ -202,6 +202,9 @@ status() {
     fi
 }
 
+# Sourced with CORTEX_SIDECAR_LIB=1 (the tests), only the functions above are defined; nothing runs.
+[ "${CORTEX_SIDECAR_LIB:-}" != 1 ] || return 0 2>/dev/null || exit 0
+
 case ${1:-} in
     start) start ;;
     stop) stop ;;

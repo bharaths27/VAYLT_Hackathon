@@ -57,6 +57,15 @@ def test_a_failing_start_leaves_a_process_it_did_not_start_alone(tmp_path):
     finally:
         other.kill();srv.shutdown();srv.server_close()
 
+def test_the_start_lock_admits_exactly_one_of_two_racers(tmp_path):
+    state=private_state(tmp_path);lock=state/'start.lock'
+    racer='. "'+str(ROOT/'scripts/cortex_sidecar.sh')+'"; start_lock && echo GOT && sleep .3'   # holds the lock briefly
+    for i in range(30):
+        shutil.rmtree(lock,ignore_errors=True)
+        ps=[subprocess.Popen([SH,'-c',racer],env=env(tmp_path,CORTEX_SIDECAR_LIB='1'),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True) for _ in range(2)]
+        outs=[p.communicate(timeout=30) for p in ps]
+        assert sum('GOT' in o for o,_ in outs)==1,(i,outs)
+
 def test_guard_a_lock_left_by_a_dead_starter_is_reclaimed(tmp_path):
     state=private_state(tmp_path);lock=state/'start.lock';lock.mkdir()
     dead=subprocess.Popen(['true']);dead.wait();(lock/'pid').write_text(str(dead.pid))
