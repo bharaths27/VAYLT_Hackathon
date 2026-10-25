@@ -70,3 +70,80 @@ def test_guard_a_claw_swapped_after_its_pickup_puts_nothing_down(brain):
 def test_control_the_plans_own_pickups_and_placements_are_what_it_expects(brain):
     brain.store.teach('SOP','Safety goggles must be at the ppe station before handling Sample B.',owner='carther')
     assert approve(brain,brain.command('Bring Sample B to the bench.',principal='carther'))['status']=='success'
+
+
+# P2-3 (class A): what an operation writes after a dispatch (the step's arguments, an adapter's echoed reply, the reason it
+# ended) is never written for an episode a deleted source purged meanwhile; and a purged operation stops at its next step.
+from .test_fix_luna_r7 import ANNOUNCE,dump
+class Echo(FakeRobot):
+    def __init__(self,arena,where): super().__init__(arena);self.where=where;self.on_stop=None
+    def execute(self,op,args):
+        r=super().execute(op,args)
+        if op=='speak': setattr(r,self.where,'said '+args['text'])
+        return r
+    def stop(self):
+        if self.on_stop: hook,self.on_stop=self.on_stop,None;hook()
+        super().stop()
+
+def announcing(tmp_path,arena,clock,where):
+    s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);b=Brain(s,Echo(arena,where))
+    src=s.teach('Announcement','To announce the result, say the zqxmarker phrase.',owner='carther',goal_definitions=ANNOUNCE)['source_id']
+    return s,b,src
+
+def test_a_deletion_between_a_dispatch_and_its_journal_leaves_no_copy(tmp_path,arena,clock):
+    s,b,src=announcing(tmp_path,arena,clock,'detail');p=b.command('announce the result',principal='carther');real=b.journal;deleted=threading.Event()
+    def journal(ep,op,args,status,detail='',step=0,**kw):              # the reply is in hand; another thread deletes the source
+        if op=='speak' and status!='pending' and not deleted.is_set():
+            threading.Thread(target=lambda:(s.revoke_source(src,delete=True),deleted.set()),daemon=True).start();deleted.wait(.5)
+        return real(ep,op,args,status,detail,step,**kw)
+    b.journal=journal
+    approve(b,p);assert deleted.wait(5)                                                         # the deletion ran, before or after
+    for name,row in dump(s): assert 'zqxmarker' not in row,(name,row)                       # was: the echoed reply written back
+    b.close()
+
+class Reply:
+    """An adapter reply read only after the step released the vault's authority; reading it runs the hook, in that window."""
+    observations=[]
+    def __init__(self,status,detail,hook): self.status,self.detail,self.hook=status,detail,hook
+    @property
+    def location_evidence(self): self.hook();return {}
+
+class WindowEcho(FakeRobot):
+    def __init__(self,arena,where): super().__init__(arena);self.where=where;self.in_window=lambda:None
+    def execute(self,op,args):
+        r=super().execute(op,args)
+        if op!='speak': return r
+        status,detail=('said '+args['text'],r.detail) if self.where=='status' else (r.status,'said '+args['text'])
+        return Reply(status,detail,self.in_window)
+
+@pytest.mark.parametrize('where',['detail','status'])
+def test_a_deletion_right_after_a_dispatch_leaves_no_copy_of_its_reply(tmp_path,arena,clock,where):
+    s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);b=Brain(s,WindowEcho(arena,where))
+    src=s.teach('Announcement','To announce the result, say the zqxmarker phrase.',owner='carther',goal_definitions=ANNOUNCE)['source_id']
+    p=b.command('announce the result',principal='carther')
+    b.robot.in_window=lambda:s.source_state(src)['status']=='accepted' and s.revoke_source(src,delete=True)
+    approve(b,p)
+    for name,row in dump(s): assert 'zqxmarker' not in row,(name,row)                       # was: written after the purge
+    b.close()
+
+def test_a_deletion_before_the_operation_ends_leaves_no_copy_in_its_reason(tmp_path,arena,clock):
+    s,b,src=announcing(tmp_path,arena,clock,'status');p=b.command('announce the result',principal='carther')
+    b.robot.on_stop=lambda:s.revoke_source(src,delete=True)                                # between its last step and its end
+    assert approve(b,p)['status']=='unknown'
+    for name,row in dump(s): assert 'zqxmarker' not in row,(name,row)                       # was: the echo in its failure reason
+    b.close()
+
+def test_an_operation_purged_while_it_runs_stops_before_its_next_step(tmp_path,arena,clock):
+    s,b,src=announcing(tmp_path,arena,clock,'detail')
+    p=b.propose(Goal.from_dict(ANNOUNCE['announce the result']),'Speak the phrase',principal='carther')   # no alias ref: not cited
+    real=b.operation
+    def deleting(ep):
+        out=real(ep)
+        if out['status']=='running' and s.source_state(src)['status']=='accepted': s.revoke_source(src,delete=True)
+        return out
+    b.operation=deleting
+    assert approve(b,p)['status']=='aborted' and not [c for c in b.robot.calls if c[0]=='speak']
+    # The purge itself stops it, before its next step is journalled, whatever else it revoked (here the plan's recipe).
+    assert not b.store.rows("SELECT 1 FROM operation_event WHERE episode_id=? AND op='speak'",(p['operation_id'],))   # was: journalled
+    for name,row in dump(s): assert 'zqxmarker' not in row,(name,row)
+    b.close()

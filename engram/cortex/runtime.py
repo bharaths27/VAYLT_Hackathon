@@ -15,7 +15,7 @@ from typing import Any
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable,model_context,prompt_refs
 from .planning import CAPS,CLAW,CLAW_BOUND,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
-from .store import TASK_STATE,Store
+from .store import JOURNAL_STATES,TASK_STATE,Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
 from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,digest,normalize,text,uid
@@ -375,6 +375,7 @@ class Brain:
                     if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
                     if self.store.basis(goal,held)!=plan['basis'] or not self.store.refs_valid(plan['refs']):
                         raise Stale('evidence changed while executing')
+                    if self._purged(ep): raise Stale('a source this operation was built from was deleted while it ran')
                     validate_step(s,set(tags.values()),self.store.zones())
                     # Handling an object needs its prerequisites observed at their stations now: a pickup's target (itself
                     # observed in this operation), and for a claw step what the claw holds, still exactly the approved object.
@@ -391,18 +392,18 @@ class Brain:
                         live=self.robot.state()
                         if 'holding' not in live or live['holding']!=expected:
                             raise Stale('the claw does not hold what this step expects (as approved, or as the plan left it)')
-                    self.journal(ep,s['op'],s['args'],'pending',step=i)
+                    self._record(ep,s['op'],s['args'],'pending',step=i)
                     # The recipe or skill behind this plan must still back it at every step: a revocation mid-run stops it.
                     changed=self._provenance_changed(op,plan)
                     if changed: raise Stale(changed+' while executing')
                     # STOP interlock: the last check sits immediately before dispatch (no validation or I/O in between),
                     # and the adapter refuses motion once stop() reached it, so a STOP in this gap cannot dispatch the step.
                     if self._stopped.is_set():
-                        self.journal(ep,s['op'],s['args'],'not_dispatched','stop arrived before dispatch',i); outcome='aborted'; reason='stop requested'; break
+                        self._record(ep,s['op'],s['args'],'not_dispatched','stop arrived before dispatch',i); outcome='aborted'; reason='stop requested'; break
                     moved=moved or s['op'] in PHYSICAL
                     try: result=self.robot.execute(s['op'],s['args'])
                     except Exception:
-                        self.journal(ep,s['op'],s['args'],'unknown','adapter exception; no automatic retry',i)
+                        self._record(ep,s['op'],s['args'],'unknown','adapter exception; no automatic retry',i)
                         outcome='unknown'; reason='adapter exception after possible effect'; break
                 for oid,proof in getattr(result,'location_evidence',{}).items():
                     current=next((x for x in self.store.objects() if x['id']==oid),None)
@@ -414,7 +415,7 @@ class Brain:
                         self.store.observe(oid,zone,origin='robot_adapter',mode=self.mode,evidence=f'{ep}:{i}')
                         seen.add(oid)
                 reported=str(getattr(result,'status','unknown'))
-                self.journal(ep,s['op'],s['args'],'reported_done' if reported=='done' else reported,getattr(result,'detail',''),i)
+                self._record(ep,s['op'],s['args'],'reported_done' if reported=='done' else reported,getattr(result,'detail',''),i)
                 steps.append({**s,'status':reported,'detail':getattr(result,'detail','')})
                 if reported!='done': outcome='unknown' if reported not in {'failed','rejected'} else 'failed'; reason='adapter outcome: '+reported; break
                 if s['op']=='pick_tagged_object': expected=s['args']['object_id']
@@ -444,8 +445,23 @@ class Brain:
             except Exception: reason=(reason or '')+'; stop not confirmed'
         with self.store.tx():
             if outcome in {'unknown','aborted','failed'}: self._latch(f'{ep} ended {outcome}')
-            self.store.settle(ep,outcome,('running',),reason)
+            # Its reason may echo the source (an adapter's own words): never written for an episode purged meanwhile.
+            self.store.settle(ep,outcome,('running',),'[deleted]' if reason and self._purged(ep) else reason)
         return {**self.operation(ep),'steps':steps}
+
+    def _purged(self,ep: str) -> bool:
+        """Whether a deleted source purged this episode meanwhile (Store._purge_episodes: its plan gone)."""
+        r=self.store.one('SELECT plan_json FROM episode WHERE id=?',(ep,))
+        return not r or r['plan_json'] is None
+
+    def _record(self,ep: str,op: str,args: dict,status: str,detail: str='',step: int=0):
+        """Journal a step of an operation, its free text only while no deleted source purged the episode: the check and
+        the write are one transaction, so a deletion lands before both or after both and its redaction is never undone."""
+        with self.store.tx():
+            if self._purged(ep):
+                args,detail={'redacted':True},('[deleted]' if detail else '')
+                if status not in JOURNAL_STATES: status='[deleted]'
+            self.journal(ep,op,args,status,detail,step)
 
     def verify_outcome(self,ep: str,*,principal: str,ok: bool,note: str):
         note=text(note,'verification evidence',1000); outcome='success' if ok else 'failed'
