@@ -126,11 +126,16 @@ def create_app(bot: RobotClient, transcribe, pin: str | None = None, brain: "Bra
             raise HTTPException(403, "wrong PIN")
 
     def busy() -> bool:
-        """Is the robot executing something now (its server's "busy")? If it cannot say, assume it is."""
+        """Is the robot executing something now? Its server says "busy": the operation in progress, or null when
+        idle. Only null (or false) means idle: a state without "busy", one it cannot read, or a value it does not
+        recognize counts as busy, so an unclear command stops it."""
         try:
-            return bool(bot.state().get("busy"))
+            state = bot.state()
         except Exception:
             return True
+        if not isinstance(state, dict) or "busy" not in state:
+            return True
+        return state["busy"] is not None and state["busy"] is not False
 
     def clarify(text: str, intent: dict) -> dict:
         """Carter's rule: "ambiguous or misheard command: we stop the task and ask user to please clarify."

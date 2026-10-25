@@ -246,3 +246,14 @@ def test_brain_mode_a_parenthesized_request_is_speech_not_noise(stack, monkeypat
     whisper.text = "(don't open the claw)"               # words in brackets: for the brain, which refuses "don't"
     r = transcribe(c)
     assert "stopped" not in r and not svc.safety.estop_latched and ("stop",) not in brain.calls
+
+
+@pytest.mark.parametrize("state", [{"safety": {}}, {"busy": "unknown"}, {"busy": 1}],
+                         ids=["no busy key", "a busy value it does not know", "a number"])
+def test_a_robot_that_does_not_say_it_is_idle_counts_as_busy(stack, monkeypatch, state):
+    c, d, whisper, svc = stack
+    whisper.text = "make me a sandwich"
+    monkeypatch.setattr(TestClient.bot, "state", lambda: state)
+    r = transcribe(c)
+    assert r["stopped"] is True and svc.safety.estop_latched    # only "null" (or false) says idle
+    svc.reset("test")
