@@ -179,7 +179,13 @@
 </template>
 
 <script src="/static/js/fx.js"></script>
-<script src="/static/js/voice.js"></script>
-<script src="/static/js/app.js"></script>
+<!-- Speech turn controller. Module scripts and defer scripts run in document
+     order after parsing, so window.SPEECH exists before voice.js and app.js. -->
+<script type="module">
+  import { createSpeechController } from "/static/js/speech_epoch.mjs";
+  window.SPEECH = createSpeechController();
+</script>
+<script src="/static/js/voice.js" defer></script>
+<script src="/static/js/app.js" defer></script>
 </body>
 </html>

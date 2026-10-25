@@ -12,6 +12,7 @@ from typing import Any
 
 from .db import now
 from .ids import new_id
+from .teach import rule_body
 
 # "When X, do Y" and the same shape with once / after / as soon as / whenever (EC15 t03.x).
 _WHEN = re.compile(
@@ -35,16 +36,30 @@ def is_question(text: str) -> bool:
     return text.strip().endswith("?")
 
 
+def _split_when(text: str) -> tuple[str, str] | None:
+    """(trigger, request) of "When X, Y" and its variants, before any check of what Y is."""
+    m = None if is_question(text) else _WHEN.match(text)
+    return (m.group("trigger"), m.group("request").strip()) if m else None
+
+
 def parse_when(text: str) -> tuple[str, str] | None:
-    if is_question(text):
+    """(normalized trigger, request) of a future task, or None. Only a robot action can wait for an event: a
+    question is recall, not a commitment, and a rule ("When X, remember that Y") is taught now or not at all, so
+    neither is scheduled. A rule is recognised by teach.rule_body, the same check that teaches one."""
+    split = _split_when(text)
+    if split is None:
         return None
-    m = _WHEN.match(text)
-    if not m:
+    trigger, request = split
+    if _QUESTION_START.match(request) or rule_body(request) is not None:
         return None
-    request = m.group("request").strip()
-    if _QUESTION_START.match(request):
-        return None
-    return normalize(m.group("trigger")), request
+    return normalize(trigger), request
+
+
+def deferred_rule(text: str) -> str | None:
+    """The request of "When X, <a rule>" (for example "remember that Sample B must stay at the bench"), or None.
+    parse_when refuses to schedule it; Engine.command answers it the way the console does."""
+    split = _split_when(text)
+    return split[1] if split and rule_body(split[1]) is not None else None
 
 
 class Prospective:

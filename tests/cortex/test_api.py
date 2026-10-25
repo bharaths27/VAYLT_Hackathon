@@ -72,3 +72,7 @@ def test_live_frame_bytes_metadata_not_timer_ticks(brain):
 
 def test_missing_auth_configuration_fails_closed(brain):
     with pytest.raises(Denied):create_app(brain,tokens={'short':'operator'})
+
+def test_a_blank_command_is_accepted_and_answered_as_misheard(client):
+    r=client.post('/commands',json={'text':''})
+    assert r.status_code==200 and (r.json()['classification'],r.json()['needs_clarification'])==('misheard',True)

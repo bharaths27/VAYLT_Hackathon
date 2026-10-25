@@ -23,6 +23,8 @@ class ExecResult:
     outcome: str                    # success | failed | aborted
     failure: str | None = None
     steps: list[dict[str, Any]] = field(default_factory=list)
+    stopped: bool = False           # aborted because the robot was stopped (a stop, or a command that needed
+                                    # clarifying): not an unknown outcome a person must check
 
 
 class Executor:
@@ -30,6 +32,9 @@ class Executor:
         self.conn = conn
         self.robot = robot
         self.memory = memory
+        # Engine.stop() counts here (a stop word, the stop button, a command that needed clarifying), so a step
+        # that a stop interrupted is told apart from a step that failed, or whose outcome is unknown, on its own.
+        self.stop_requests = 0
 
     def journal(self, operation_id: str, episode_id: str | None, op: str, args: dict[str, Any],
                 status: str, detail: str = "") -> None:
@@ -44,16 +49,25 @@ class Executor:
         for step in plan["steps"]:
             op, args = step["op"], step.get("args", {})
             op_id = new_id("op")
+            stops = self.stop_requests  # before the check: a stop from here on, however it lands, ends the run
             if self.robot.state().get("stopped") and op != "stop":
                 self.journal(op_id, episode_id, op, args, "rejected", "robot is stopped")
-                result.outcome, result.failure = "aborted", "stop was pressed"
+                result.outcome, result.failure, result.stopped = "aborted", "stop was pressed", True
                 break
             self.journal(op_id, episode_id, op, args, "pending")
             out = self.robot.execute(op, args)
+            # read at once, whatever the step returned (done included): a stop pressed here, or the robot's own
+            # latch set while a step that still reports done ran (on the last step no pre-step check follows to see
+            # it). A failed or unknown step keeps its own handling: an adapter latches itself on an unknown outcome.
+            stopped = self.stop_requests != stops or (
+                op != "stop" and out.status == "done" and bool(self.robot.state().get("stopped")))
             for tag_id, zone in out.observations:
                 self.memory.observe_tag(tag_id, zone, source="robot")
             self.journal(op_id, episode_id, op, args, out.status, out.detail)
             result.steps.append({"op": op, "args": args, "status": out.status, "detail": out.detail})
+            if stopped:  # stopped before or while it ran: the stop ended the run, not the step
+                result.outcome, result.failure, result.stopped = "aborted", "stop was pressed", True
+                break
             if out.status == "done":
                 continue
             subject = args.get("object_id") or args.get("zone") or op

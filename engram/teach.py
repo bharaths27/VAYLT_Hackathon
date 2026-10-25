@@ -12,6 +12,19 @@ import re
 
 from .memory import Memory
 
+# How a person states a rule: "Remember (that) ...", "Note (that) ...", "From now on, ...", "Rule: ...",
+# "New rule: ...", "Learn (that) ..." (the console parser's rule prefixes too). The brain recognises a rule here
+# and only here: Engine.command teaches it, and parse_when refuses to schedule it, so the two cannot drift apart.
+_RULE_PREFIX = re.compile(r"^\s*(?:new rule|rule|remember(?: that)?|from now on|note(?: that)?|learn(?: that)?)\b[\s:,-]*",
+                          re.IGNORECASE)
+
+
+def rule_body(text: str) -> str | None:
+    """The rule in a statement like "Remember that X" (that is, X), or None when the text does not state a rule."""
+    m = _RULE_PREFIX.match(text)
+    return text[m.end():].strip() if m else None
+
+
 _BEFORE = re.compile(
     r"(?P<pre>[A-Za-z0-9 ]+?)\s+(?:must|should|need to|needs to)\s+be\s+(?:at|on|in)\s+the\s+"
     r"(?P<zone>[A-Za-z0-9 ]+?)\s+before\s+(?:handling|using|moving|touching)\s+(?P<subj>[A-Za-z0-9 ]+)",

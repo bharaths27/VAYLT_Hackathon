@@ -1,0 +1,20 @@
+# Bot Pi: start the robot adapter at boot and restart it if it crashes.
+#   sudo cp deploy/engram-robot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now engram-robot
+#   journalctl -u engram-robot -f        # live log
+[Unit]
+Description=ENGRAM Cortex robot adapter (hardware + safety)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=starrasp
+SupplementaryGroups=dialout i2c video gpio
+WorkingDirectory=/home/starrasp/engram_robot
+EnvironmentFile=/home/starrasp/engram_robot/robot.env
+ExecStart=/home/starrasp/engram_robot/.venv/bin/python -m robot.server --driver real --config configs/ultrasonic.json --host 0.0.0.0 --port 8200
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

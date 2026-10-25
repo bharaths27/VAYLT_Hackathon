@@ -10,23 +10,23 @@ runs without the planner. The model files never change.
 
 All samples, procedures and people in this repo are made up demo data.
 
-## Run it on a Mac
+## Run it
+
+- **On a laptop (Mac, Windows or Linux), no robot needed:** follow `docs/LAPTOP_QUICKSTART.md`. It starts the
+  brain on port 8001 and Verna's console on port 8000, step by step, with a pretend robot.
+- **On the robot's Raspberry Pi:** follow `docs/CDS_RUNBOOK.md`.
+- **ENGRAM Assist (the healthcare demo):** `docs/ASSIST.md` on the `engram-assist` branch.
+
+Use Python 3.11 or newer (3.13 is the safest; the Mac's built-in `python3` is 3.9 and too old).
 
 ```bash
-git clone https://github.com/bharaths27/vaylt_hackathon.git
-cd vaylt_hackathon
-git checkout claude/project-thread-e3mto7     # until this is merged to main
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-python -m pytest                  # all tests
-python scripts/demo_cli.py        # the whole demo story in the terminal
-uvicorn --factory engram.api:create_app --host 0.0.0.0 --port 8000
+git clone https://github.com/mrrCarter/VAYLT_Hackathon.git
+cd VAYLT_Hackathon
+python3.13 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pytest                  # all tests
+.venv/bin/python scripts/demo_cli.py        # the whole demo story in the terminal
 ```
-
-Then open http://localhost:8000/docs to try every endpoint. From the iPad, use
-the Mac's local IP address instead of localhost.
 
 ## Open it in VS Code or Kiro
 
@@ -75,10 +75,11 @@ request -> memory bundle (sources, objects, rules, past lessons)
 | POST | /memory/sources | Teach a document; returns rules found, with citations |
 | POST | /memory/query | Memory bundle for a goal |
 | GET | /memory/objects | Where each tagged object was last seen |
-| POST | /commands | Typed or spoken command: "remember ...", "when X, Y", or a task |
+| POST | /commands | Typed or spoken command: "remember ...", "when X, Y", or a task. An unclear or misheard one stops a running plan and asks: "I stopped. ... Please clarify." Every result states `classification` (`understood`, `unclear` or `misheard`) and `needs_clarification`; the console acts on a result, and stages a plan, only when both say understood. A place that is not a zone is unclear ("Which place do you mean?"): the bench is never guessed. |
 | POST | /plan | Plan only |
 | POST | /plan/rest | Propose "return to rest" (drive home); needs approval |
 | GET | /operations/pending | Plans waiting for approval, including ones from gestures and fired triggers |
+| GET | /operations/running | Approved plans executing now |
 | POST | /operations/{id}/approve | Approve the exact plan digest and run it |
 | POST | /stop | Stop now |
 | GET | /robot/state | Robot state |

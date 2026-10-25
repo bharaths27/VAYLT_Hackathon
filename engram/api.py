@@ -15,10 +15,14 @@ Environment:
     ENGRAM_LLM_URL    llama.cpp server completion URL, e.g. http://127.0.0.1:8080/completion.
                       Leave unset to use the rule planner. Any model problem falls back to rules.
     ENGRAM_LLM_TIMEOUT  seconds to wait for the model (default 60; a Pi 4 is slow)
+    ENGRAM_VOICE_PRESETS  1 (default) lets "Open the gripper", "Close the gripper" and "Look around"
+                      plan as fixed steps (engram/spark/presets.py); 0 turns that off. Either way a
+                      person approves every plan by digest before anything moves.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,8 +36,10 @@ from pydantic import BaseModel, Field
 from .capabilities import describe_all
 from .db import connect
 from .engine import Engine, EngineError
+from .recall import Recall
 from .robot.mock import MockRobot
 from .skills import SkillError
+from .spark.presets import register_presets, voice_presets_enabled
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -49,8 +55,26 @@ class QueryIn(BaseModel):
 
 
 class CommandIn(BaseModel):
-    text: str = Field(min_length=1, max_length=500)
+    # May be empty: nothing heard is a misheard command, which is answered "... Please clarify." and stops a
+    # running plan (Engine.command), so a voice client sends even an empty transcript.
+    text: str = Field(max_length=500)
     who: str = "user"
+
+
+class RecallIn(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    kinds: list[str] | None = None
+
+
+def package_info() -> dict[str, Any]:
+    """The ENGRAM boot contract the planner is given, pinned by hash (EC03/EC20)."""
+    path = ROOT / "engram/package/ENGRAM.md"
+    if not path.exists():
+        return {"loaded": False}
+    data = path.read_bytes()
+    seed = json.loads((ROOT / "engram/package/engram_seed.json").read_text())
+    return {"loaded": True, "contract": data.decode().splitlines()[0].lstrip("# ").strip(),
+            "sha256": hashlib.sha256(data).hexdigest(), "words": len(data.split()), "seed_version": seed["version"]}
 
 
 class PlanIn(BaseModel):
@@ -105,6 +129,8 @@ def default_engine() -> Engine:
 
 def create_app(engine: Engine | None = None) -> FastAPI:
     engine = engine or default_engine()
+    if voice_presets_enabled():
+        register_presets(engine)   # same checker and digest-bound approval as every other plan
     app = FastAPI(title="ENGRAM Cortex", version="0.1.0")
     app.state.engine = engine
     # The iPad page is served from the same laptop on the local network.
@@ -136,6 +162,19 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     @app.get("/memory/facts")
     def memory_facts() -> list[dict[str, Any]]:
         return engine.memory.current_facts()
+
+    @app.post("/memory/recall")
+    def memory_recall(body: RecallIn) -> dict[str, Any]:
+        try:
+            return Recall(engine.memory).recall(body.question, kinds=body.kinds)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+    package = package_info()
+
+    @app.get("/memory/package")
+    def memory_package() -> dict[str, Any]:
+        return package
 
     @app.post("/observations/tag")
     def observe_tag(body: TagIn) -> dict[str, Any]:
@@ -169,6 +208,12 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     def operations_pending() -> list[dict[str, Any]]:
         """Plans waiting for approval that the iPad did not ask for (gestures, fired triggers)."""
         return engine.pending()
+
+    @app.get("/operations/running")
+    def operations_running() -> list[dict[str, Any]]:
+        """Approved plans executing now. The console reads it to apply the stop-and-clarify rule to a command
+        it answers itself (a misheard one), whoever started the plan."""
+        return engine.running()
 
     @app.post("/operations/{operation_id}/approve")
     def approve(operation_id: str, body: ApproveIn) -> dict[str, Any]:

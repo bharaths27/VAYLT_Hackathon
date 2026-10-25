@@ -14,7 +14,7 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable,model_context,prompt_refs
-from .planning import CAPS,CLAW,CLAW_BOUND,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,CLAW,CLAW_BOUND,FORBIDDEN,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import JOURNAL_STATES,TASK_STATE,Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
@@ -25,6 +25,26 @@ UNREPORTED=object()   # a claw state the adapter did not report: unknown, never 
 # The system events every operator sees (/events): they carry no operator's details. Any other event with no operation
 # is the operator's who caused it (journal(owner=...)), and one with neither (an older version's) is nobody's.
 PUBLIC_EVENTS=('stop','clock_jump')
+
+
+def taken(result: dict,classification: str) -> dict:
+    """A command result with how the request was taken, stated where the result is made: classification
+    ('understood', 'unclear' or 'misheard') and needs_clarification. The console stages a plan only when both say
+    understood, and stops a running task for anything else."""
+    return {**result,'classification':classification,'needs_clarification':classification!='understood'}
+
+
+# A clear "don't": the explicit negations among the safety check's NEGATED words, which also has cancellations
+# such as "wait" or "hold on" (those are not one).
+CLEAR_DONT=re.compile(r"\b(do not|don't|dont|never(?!\s+mind)|no need to|must not|mustn't)\b",re.I)  # "never mind" cancels: unclear
+
+
+def refusal_taken(request: str,error: CortexError | None=None) -> str:
+    """How a refused request was taken. Understood: a clear "don't", an action the robot may not do (both refused by
+    parse_goal's safety check: saying it again would not help), or a denial. Unclear: everything else, a
+    cancellation ("wait", "never mind") and an advisory signal on its own included, which err toward the stop."""
+    t=request.replace(chr(0x2019),"'")
+    return 'understood' if isinstance(error,Denied) or CLEAR_DONT.search(t) or FORBIDDEN.search(t) else 'unclear'
 
 
 class Brain:
@@ -104,37 +124,42 @@ class Brain:
 
     def command(self,request: str,*,principal: str,idempotency_key: str | None=None,cloud_allowed: bool=False) -> dict:
         stops=self._stop_requests     # when this request began: a STOP after it revokes what it proposes
-        request=text(request,'request',2000); principal=text(principal,'principal',100)
+        principal=text(principal,'principal',100)
+        if isinstance(request,str) and not request.strip():  # nothing was heard: misheard, before routing or planning
+            return taken({'kind':'proposal','status':'refused','reason':"I didn't catch anything."},'misheard')
+        request=text(request,'request',2000)
         with self.activity.foreground():
             low=normalize(request)
             # A stop wins before anything else, with the same vocabulary as the brain and the console (STOP_WORDS).
-            if STOP_WORDS.search(request): return {'kind':'stop',**self.stop()}
+            if STOP_WORDS.search(request): return taken({'kind':'stop',**self.stop()},'understood')
             # Cheap deterministic controls/recall precede optional cloud classification.
             if RECALL.search(request):
-                return self.store.recall(request,principal=principal)
+                return taken(self.store.recall(request,principal=principal),'understood')
             if low.startswith('remember '):
                 body=re.sub(r'^remember\s+(?:that\s+)?','',request,flags=re.I)
-                return self.store.teach('Instruction from '+principal,body,owner=principal,kind='spoken',cloud_ok=cloud_allowed)
+                return taken(self.store.teach('Instruction from '+principal,body,owner=principal,kind='spoken',cloud_ok=cloud_allowed),'understood')
             match=WHEN.match(request)
             if match and not request.rstrip().endswith('?'):
-                return self.schedule(match[1],match[2],principal=principal)
+                return taken(self.schedule(match[1],match[2],principal=principal),'understood')
             # Any other question asks memory ("what do you see" stays an observe proposal, "can you ..." an instruction).
             if asks_memory(request):
                 answer=self.store.recall(request,principal=principal)
                 if not asks_memory(request.rstrip().rstrip('?')):   # only the "?" made it a question: keep the instruction hint
                     answer['reply']='Answered as a question, so nothing was proposed; to have the robot act, say it without the question mark. '+answer['reply']
-                return answer
+                return taken(answer,'understood')
             # Advisory interpretation cannot remove qualifiers or alter the original request.
             advice=self.intent.route(request,disclosure_allowed=bool(cloud_allowed and self.store.policy.cloud_enabled))
             self.store.decision('route',advice.get('provider','local'),advice.get('model'),advice['status']=='ok',advice['status'])
             if advice['status']=='ok' and (advice['scores'].get('negated',0)>=0.5 or advice['scores'].get('ambiguous',0)>=0.8):
-                return {'kind':'proposal','status':'refused','reason':'Intent needs clarification; advisory signal is not permission.'}
+                taken_as=refusal_taken(request)
+                reason=safety_reason(request) if taken_as=='understood' else 'Intent needs clarification; advisory signal is not permission.'
+                return taken({'kind':'proposal','status':'refused','reason':reason},taken_as)
             try: goal=parse_goal(request,self.store)
-            except CortexError as e: return {'kind':'proposal','status':'refused','reason':str(e),'code':e.code}
+            except CortexError as e: return taken({'kind':'proposal','status':'refused','reason':str(e),'code':e.code},refusal_taken(request,e))
             alias_source=self.store.one("SELECT g.source_id FROM cx_goal g JOIN cx_source s ON s.source_id=g.source_id WHERE g.name=? AND s.status='accepted'",(normalize(request),))
             alias_refs=['source:'+alias_source['source_id']] if alias_source else []
-            return {'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,
-                                                     cloud_allowed=cloud_allowed,stops=stops)}
+            return taken({'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,
+                                                           cloud_allowed=cloud_allowed,stops=stops)},'understood')
 
     def propose(self,goal: Goal,request: str,*,principal: str,idempotency_key: str | None=None,
                 extra_refs: list[str] | None=None,cloud_allowed: bool=False,wake: tuple | None=None,stops: int | None=None) -> dict:

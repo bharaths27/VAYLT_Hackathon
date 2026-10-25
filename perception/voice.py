@@ -60,6 +60,13 @@ def send_command(server: str, text: str, who: str) -> dict:
 def describe_reply(r: dict) -> tuple[str, str]:
     """(text for the screen, short sentence to say out loud)."""
     kind = r.get("kind")
+    if kind == "clarify" or r.get("needs_clarification"):  # unclear or misheard: the reply asks, and may say it stopped
+        reply = str(r.get("reply") or r.get("reason"))
+        return f"{'STOPPED; ' if r.get('stopped') else ''}PLEASE CLARIFY  {reply}", reply
+    if kind == "answer":
+        lines = [f"FROM MEMORY  {a['kind']}: {a['text']}" for a in r.get("answers", [])[:5]]
+        lines += [f"    unknown: {m}" for m in r.get("missing", [])]
+        return "\n".join(lines) or "FROM MEMORY  nothing recorded", str(r.get("reply"))
     if kind == "taught":
         n = len(r.get("rules", []))
         return f"LEARNED  saved as a source, {n} rule(s) found", f"Got it. I saved that{' and found a rule' if n else ''}."
@@ -248,9 +255,10 @@ def main():
                 t0 = time.perf_counter()
                 text = transcriber.transcribe(audio)
                 print(f"  heard: \"{text}\"  ({time.perf_counter() - t0:.2f}s)")
-            if not text:
-                print("  (nothing heard)\n")
-                continue
+            if not text and args.typed:
+                continue  # an empty line: nothing was said
+            if not text:  # a recording with no words in it: misheard. The server answers it and stops a running plan.
+                print("  (nothing heard)")
             if not args.no_pointing:
                 from engram.vision.gestures import recent_pointing
                 filled = fill_pointing(text, recent_pointing(args.pointing_age))

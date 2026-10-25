@@ -34,7 +34,7 @@ class Source(Input):
     prohibitions:list[str]|None=None
     facts:list[dict]|None=None
 class Command(Input):
-    text:str=Field(min_length=1,max_length=2000)
+    text:str=Field(max_length=2000)  # blank is accepted: the brain answers it as misheard
     who:str|None=None # compatibility only; never used as authenticated identity
     cloud_allowed:bool=False
     idempotency_key:str|None=Field(default=None,max_length=200)

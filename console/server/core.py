@@ -2,18 +2,103 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
+import inspect
 import json
+import logging
 import socket
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import WebSocket
 
 from . import config
 from .plan import PRIMITIVES, Plan
+
+log = logging.getLogger("console.core")
+TELEMETRY_TIMEOUT_S = 0.5
+
+
+async def best_effort(*calls: Callable[[], Any], timeout_s: float = TELEMETRY_TIMEOUT_S) -> None:
+    """Run telemetry calls (bus emits, ledger writes) in order, after a safety action, never before it.
+    Each failure is logged and skipped, and all of them together get at most timeout_s, so none can raise
+    into or stall the caller. (A call that blocks the event loop could not be cut short; the ledger's writes
+    happen on its own thread for that reason.)"""
+    async def run() -> None:
+        for call in calls:
+            try:
+                r = call()
+                if inspect.isawaitable(r):
+                    await r
+            except Exception as e:  # noqa: BLE001
+                log.warning("telemetry failed: %s: %s", type(e).__name__, e)
+
+    try:
+        await asyncio.wait_for(run(), timeout_s)
+    except asyncio.TimeoutError:
+        log.warning("telemetry took over %.1f s; the rest was skipped", timeout_s)
+
+
+def _stop_reply(r: Any) -> dict:
+    """A stop call's reply as a dict. One that raised becomes the failure record the HTTP robot adapter already
+    returns; one that is not a dict at all is kept under "reply" (it confirms nothing)."""
+    if isinstance(r, BaseException):
+        return {"status": "stop_request_failed", "error": f"{type(r).__name__}: {r}"}
+    if not isinstance(r, dict):
+        return {"status": "stop_reply_unrecognised", "reply": r}
+    return r
+
+
+# What a confirmed stop looks like, per target; each is the target's own documented reply, nothing looser.
+def _robot_server_stopped(r: dict) -> bool:
+    """The robot server's /robot/stop reply (the HTTP robot adapter): stopped and latched, both exactly true."""
+    return r.get("stopped") is True and r.get("latched") is True
+
+
+def _mock_robot_stopped(r: dict) -> bool:
+    """The console mock robot's reply, {"status": "stopped"}: accepted from the mock adapter only."""
+    return r.get("status") == "stopped" and r.get("stopped", True) is True
+
+
+def _brain_stopped(r: dict) -> bool:
+    """The brain's /stop reply: its robot's state, which names the adapter and says "stopped": true (and, when it
+    reports the connection at all, "connected": true)."""
+    return (isinstance(r.get("adapter"), str) and r.get("stopped") is True
+            and ("connected" not in r or r["connected"] is True))
+
+
+_ROBOT_REPLIES = {"robot_server": _robot_server_stopped, "mock": _mock_robot_stopped}
+
+
+def _not_stopped(r: Any, confirms: Callable[[dict], bool]) -> str | None:
+    """Why this reply does not confirm a stop, or None when `confirms` (its target's shape) accepts it. An error
+    or a lost connection always fails it: the brain's state says "stopped" even when it could not reach its
+    robot, next to "connected": false and an error. Anything missing, malformed or unknown fails closed."""
+    if not isinstance(r, dict):
+        return f"the reply was {json.dumps(r, default=str)[:80]}"
+    if r.get("error") or r.get("status") == "stop_request_failed":
+        return str(r.get("error") or "the stop request failed")
+    if r.get("connected") is False:
+        return "it is not connected to the robot"
+    return None if confirms(r) else f"the reply did not confirm a stop: {json.dumps(r, default=str)[:80]}"
+
+
+def stop_unconfirmed(res: Any, robot: Any = None) -> list[str]:
+    """What an Engine.stop() result does not confirm: "robot: ..." and/or "brain: ..." for each stop target whose
+    reply is not an explicit confirmation in that target's own shape. The console robot's shape comes from its
+    adapter (STOP_REPLY); an adapter that does not say gets the strictest, the robot server's. An empty list
+    means every target confirmed."""
+    confirms = _ROBOT_REPLIES.get(getattr(robot, "STOP_REPLY", None), _robot_server_stopped)
+    robot_reply = {k: v for k, v in res.items() if k != "brain"} if isinstance(res, dict) else res
+    parts = [f"robot: {w}" for w in [_not_stopped(robot_reply, confirms)] if w]
+    if isinstance(res, dict) and "brain" in res and (w := _not_stopped(res["brain"], _brain_stopped)):
+        parts.append(f"brain: {w}")
+    return parts
 
 
 # --------------------------------------------------------------------------- bus
@@ -40,31 +125,138 @@ class Bus:
 
 
 # ------------------------------------------------------------------------ ledger
+class LedgerBusy(Exception):
+    """The ledger's disk is not answering in time, so a record that may exist cannot be read now."""
+
+
 class Ledger:
     """Append only JSONL. Evidence format from the team packet:
-    ticket | commit | input fixture | procedure | observed result | limitation | next owner"""
+    ticket | commit | input fixture | procedure | observed result | limitation | next owner
 
-    def __init__(self, path: Path) -> None:
+    Every write happens on the ledger's own thread, in order: append() serializes the record and adds it to a
+    backlog, so a slow or stalled disk can never block the event loop (and with it a stop, or any other request).
+    The backlog holds at most max_pending records, so a long stall under sustained traffic cannot exhaust memory
+    and take the console down with its software stop: when it is full, append() drops the oldest record that is
+    not being written and counts it in `dropped`, never blocking or raising. A stall that drops records logs once
+    as the drops start and once, with the count, when the writer has caught up.
+    Reads (find) happen on a reader thread for the same reason, and also see records that are not on disk yet.
+    A write that fails is logged; the caller is not told."""
+
+    def __init__(self, path: Path, max_pending: int = 1000) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_pending = max(2, max_pending)
+        self.dropped = 0  # records dropped because the backlog was full, since start
+        self._pending: OrderedDict[str, str] = OrderedDict()  # id -> line, oldest first, until it is on disk
+        self._writing: str | None = None  # the record in the writer's hands, which may yet land: never dropped
+        self._stall_drops = 0
+        self._cond = threading.Condition()  # guards the fields above; never held during disk I/O
+        self._reader = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger-reader")
+        self._scanning: concurrent.futures.Future | None = None  # the one disk read in flight (see find)
+        self.read_timeout_s = 2.0
+        threading.Thread(target=self._writer, name="ledger-writer", daemon=True).start()
 
     def append(self, event: str, **rec: Any) -> str:
         eid = "ev_" + uuid.uuid4().hex[:10]
-        line = {"id": eid, "kind": event, "ts": time.time(), **rec}
-        with self.path.open("a") as f:
-            f.write(json.dumps(line, default=str) + "\n")
+        line = json.dumps({"id": eid, "kind": event, "ts": time.time(), **rec}, default=str) + "\n"
+        with self._cond:
+            if len(self._pending) >= self.max_pending:
+                oldest = next((k for k in self._pending if k != self._writing), None)
+                if oldest is not None:
+                    del self._pending[oldest]
+                self.dropped += 1
+                self._stall_drops += 1
+                if self._stall_drops == 1:
+                    log.error("ledger backlog is full (%d records; is the disk stalled?): dropping the oldest records",
+                              self.max_pending)
+                if oldest is None:  # nothing else to drop: this record is the one that goes
+                    return eid
+            self._pending[eid] = line
+            self._cond.notify_all()
         return eid
 
-    def find(self, eid: str) -> dict | None:
+    def _writer(self) -> None:
+        while True:
+            with self._cond:
+                while not self._pending:
+                    self._cond.wait()
+                eid, line = next(iter(self._pending.items()))
+                self._writing = eid
+            try:
+                self._write(line)
+            except Exception as e:  # noqa: BLE001
+                log.error("ledger write failed, record %s lost: %s: %s", eid, type(e).__name__, e)
+            with self._cond:
+                self._pending.pop(eid, None)
+                self._writing = None
+                if self._stall_drops and not self._pending:  # caught up: the stall is over
+                    log.error("ledger dropped %d records during a stall", self._stall_drops)
+                    self._stall_drops = 0
+                self._cond.notify_all()
+
+    def _write(self, line: str) -> None:
+        with self.path.open("a") as f:
+            f.write(line)
+
+    def flush(self, timeout_s: float = 5.0) -> bool:
+        """Wait in the calling thread until every pending record is written (or has failed). For shutdown and tests."""
+        deadline = time.monotonic() + timeout_s
+        with self._cond:
+            while self._pending:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+            return True
+
+    async def find(self, eid: str) -> dict | None:
+        """The first (oldest) record with this id or operation id, or None. The file is read on the ledger's reader
+        thread with at most one read in flight, so a slow or stalled disk delays only lookups (each by at most
+        read_timeout_s) and never the event loop or a stop. While that read is stuck, a lookup queues nothing:
+        it searches the records not on disk yet and, failing that, raises LedgerBusy. So does a lookup whose own
+        read ran out of time or failed."""
+        with self._cond:  # snapshot first: a record written after this is then in the file
+            pending = list(self._pending.values())
+            scan = None
+            if self._scanning is None or self._scanning.done():
+                self._scanning = scan = self._reader.submit(self._scan, eid)
+        j, unread = None, scan is None
+        if scan is not None:
+            try:
+                j = await asyncio.wait_for(asyncio.wrap_future(scan), self.read_timeout_s)
+            except asyncio.TimeoutError:
+                log.warning("ledger read took over %.1f s; searched only records not on disk yet", self.read_timeout_s)
+                unread = True
+            except OSError as e:
+                log.error("ledger read failed: %s", e)
+                unread = True
+        if j:
+            return j
+        for line in pending:
+            if j := _ledger_match(line, eid):
+                return j
+        if unread:
+            raise LedgerBusy("the ledger's disk is not answering; try again")
+        return None
+
+    def _scan(self, eid: str) -> dict | None:
         if not self.path.exists():
             return None
         with self.path.open() as f:
-            for line in f:
-                if eid in line:
-                    j = json.loads(line)
-                    if j.get("id") == eid or j.get("operation_id") == eid:
-                        return j
+            for line in f:  # oldest first
+                if j := _ledger_match(line, eid):
+                    return j
         return None
+
+
+def _ledger_match(line: str, eid: str) -> dict | None:
+    if eid not in line:
+        return None
+    try:
+        j = json.loads(line)
+    except ValueError:  # a line the writer has not finished
+        return None
+    return j if j.get("id") == eid or j.get("operation_id") == eid else None
 
 
 # ------------------------------------------------------------------- operations
@@ -267,19 +459,27 @@ class Engine:
             await self.bus.emit("log", level="warn", msg=f"episode not recorded: {e}")
 
     async def stop(self, by="operator") -> dict:
-        self.stopped = True
-        res = await self.robot.stop()
-        from . import brain
-        if brain.enabled():
-            res = {**(res or {}), "brain": await brain.stop()}
+        """E-STOP. The latch, the cancellations and the stop calls to the robot and the brain all happen before
+        any telemetry, which comes last and is best effort: a stalled HUD client or a failed ledger write can
+        neither delay nor skip a stop."""
+        self.stopped = True  # the executor checks this before every step, and approve() refuses while it is set
         for op in self.ops.values():
             if op.status == "PENDING_APPROVAL":
                 op.status = "CANCELLED"
-            if op.task and not op.task.done():
-                pass  # executor sees self.stopped and skips remaining steps
-            await self.bus.emit("operation", op=op.public())
-        self.ledger.append("estop", by=by, robot=res)
-        await self.bus.emit("stop", by=by, robot=res)
+        from . import brain
+        # Both at once, each failure on its own: a slow or failing robot call must not hold up the brain's stop.
+        robot_res, *brain_res = await asyncio.gather(self.robot.stop(), *([brain.stop()] if brain.enabled() else []),
+                                                     return_exceptions=True)
+        res = _stop_reply(robot_res)
+        if brain_res:
+            res = {**res, "brain": _stop_reply(brain_res[0])}
+        unconfirmed = stop_unconfirmed(res, self.robot)
+        await best_effort(lambda: self.ledger.append("estop", by=by, robot=res, unconfirmed=unconfirmed),
+                          lambda: self.bus.emit("stop", by=by, robot=res, confirmed=not unconfirmed),
+                          *([lambda: self.bus.emit("log", level="error", msg="E-STOP NOT CONFIRMED ("
+                                                   + "; ".join(unconfirmed) + "). Cut the motor power.")]
+                            if unconfirmed else []),
+                          *[lambda op=op: self.bus.emit("operation", op=op.public()) for op in list(self.ops.values())])
         return res
 
     async def clear_stop(self) -> dict:

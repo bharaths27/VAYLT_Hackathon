@@ -81,3 +81,56 @@ def test_negated_requests_never_plan_a_move(taught, text):
 def test_negation_can_still_be_taught_as_a_rule(taught):
     out = taught.command("Remember that you must never move Sample B without goggles", "test")
     assert out["kind"] == "taught"
+
+
+# A rule cannot wait for an event: "When calibration ends, remember that Sample B must stay at the bench" was saved
+# as a future task, and when the trigger fired the brain proposed MOVING Sample B to the bench. It is refused now,
+# the way the console answers: say the rule now, or schedule a robot action.
+DEFERRED_RULES = [
+    "When calibration ends, remember that Sample B must stay at the bench",
+    "When calibration ends, remember Sample B must stay at the bench",
+    "When calibration ends, note that the bench is wet",
+    "When calibration ends, from now on keep Sample B at the bench",
+    "After the meeting, rule: goggles before any move",
+    "Once the timer goes off, learn that the beaker is fragile",
+    "As soon as the bench is clear, new rule: Sample A stays at home",
+]
+
+
+def _sources(engine) -> int:
+    return engine.conn.execute("SELECT COUNT(*) FROM source").fetchone()[0]
+
+
+@pytest.mark.parametrize("text", DEFERRED_RULES)
+def test_a_deferred_rule_is_neither_scheduled_nor_taught(taught, text):
+    from engram.prospective import parse_when
+
+    facts, sources = len(taught.memory.current_facts()), _sources(taught)
+    out = taught.command(text, "test")
+    assert out["kind"] == "proposal" and out["status"] == "refused", out
+    assert "rule now" in out["reason"] and "robot action" in out["reason"], out["reason"]
+    assert parse_when(text) is None
+    assert taught.prospective.list() == []
+    assert (len(taught.memory.current_facts()), _sources(taught)) == (facts, sources)  # nothing taught
+    assert taught.robot.calls == [("observe", {})]
+
+
+@pytest.mark.parametrize("text,request_", [("When calibration ends, open the gripper", "open the gripper"),
+                                           ("When calibration ends, bring Sample B to the bench",
+                                            "bring Sample B to the bench")])
+def test_a_deferred_robot_action_still_schedules(taught, text, request_):
+    from engram.prospective import parse_when
+
+    assert parse_when(text) == ("calibration ends", request_)
+    out = taught.command(text, "test")
+    assert out["kind"] == "scheduled" and out["created"] is True and out["request"] == request_, out
+
+
+@pytest.mark.parametrize("text", ["Remember that goggles come before Sample B", "Note that goggles come before Sample B",
+                                  "From now on, goggles come before Sample B", "Rule: goggles come before Sample B"])
+def test_a_rule_said_now_is_taught(engine, text):
+    # The brain recognises a rule in one place (engram.teach.rule_body), for teaching it and for refusing to
+    # schedule it, so the two cannot drift apart.
+    out = engine.command(text, "test")
+    assert out["kind"] == "taught", out
+    assert not engine.robot.state()["stopped"]

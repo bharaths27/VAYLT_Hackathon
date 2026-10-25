@@ -1,0 +1,7 @@
+{
+  "safety_latency_s": 0.35,
+  "veto_cone_deg": 20,
+  "lidar_min_valid_m": 0.03,
+  "blind_reverse_max_speed": 0.05,
+  "blind_reverse_max_m": 0.20
+}
