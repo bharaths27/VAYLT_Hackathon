@@ -2,15 +2,19 @@
 
 import io
 import json
+import socket
 import struct
 import threading
+import time
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import pytest
 
+from engram.spark import _http
 from engram.spark.audio_windows import (
-    SAMPLE_RATE, AudioOverflow, OutOfOrder, PcmWindow, WhisperError, WhisperServerClient,
+    SAMPLE_RATE, AudioOverflow, Cancelled, CancelToken, LiveTranscriber, OutOfOrder, PcmWindow,
+    WhisperError, WhisperServerClient,
 )
 
 
@@ -158,3 +162,225 @@ def test_whisper_client_does_not_follow_redirects():
         assert [h[0] for h in srv.hits] == ["/inference"]
     finally:
         srv.close()
+
+
+# ---- end of speech cancels the partial in flight --------------------------------------------------------------
+
+
+def _no_workers_left(within_s=1.0):
+    end = time.monotonic() + within_s
+    while time.monotonic() < end:
+        if not any(t.name == "spark-http" and t.is_alive() for t in threading.enumerate()):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class _OneAtATimeWhisper:
+    """Like whisper.cpp's server: one request at a time; the n-th request "decodes" for seconds[n] and
+    stops early if its client hangs up (checked every 10 ms). Records what happened."""
+
+    def __init__(self, seconds):
+        self.seconds = list(seconds)
+        self.lock = threading.Lock()          # the server's single inference slot
+        self.log = []                         # (n, event, t)
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                self.rfile.read(int(self.headers["Content-Length"]))
+                with outer.lock:
+                    n = len(outer.events("start"))
+                    outer.log.append((n, "start", time.monotonic()))
+                    end = time.monotonic() + outer.seconds[min(n, len(outer.seconds) - 1)]
+                    self.connection.settimeout(0.01)
+                    while time.monotonic() < end:
+                        try:
+                            if self.connection.recv(1) == b"":
+                                outer.log.append((n, "client gone", time.monotonic()))
+                                return
+                        except socket.timeout:
+                            pass
+                        except OSError:
+                            outer.log.append((n, "client gone", time.monotonic()))
+                            return
+                    self.connection.settimeout(None)
+                    reply = json.dumps({"text": f"text {n}"}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(reply)))
+                    self.end_headers()
+                    self.wfile.write(reply)
+                    outer.log.append((n, "done", time.monotonic()))
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def events(self, kind):
+        return [e for e in self.log if e[1] == kind]
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def test_cancel_closes_the_connection_and_returns_at_once():
+    srv = _OneAtATimeWhisper([3.0])
+    try:
+        token = CancelToken()
+        threading.Timer(0.2, token.cancel).start()
+        t0 = time.monotonic()
+        with pytest.raises(Cancelled):
+            WhisperServerClient(srv.url, timeout_s=10).transcribe(PcmWindow().snapshot(), cancel=token)
+        assert time.monotonic() - t0 < 0.5                     # did not wait for the 3 s "decode"
+        assert _no_workers_left()
+        end = time.monotonic() + 1.0
+        while not srv.events("client gone") and time.monotonic() < end:
+            time.sleep(0.01)
+        assert srv.events("client gone") and not srv.events("done")   # the server could drop the work
+    finally:
+        srv.close()
+
+
+class _SlowConnect(socket.socket):
+    def connect(self, address):
+        time.sleep(0.3)
+        super().connect(address)
+
+
+def test_a_request_cancelled_while_connecting_is_never_sent(monkeypatch):
+    srv = _OneAtATimeWhisper([0.0])
+    monkeypatch.setattr(_http, "_new_socket", _SlowConnect)   # the TCP connect takes 0.3 s
+    try:
+        token = CancelToken()
+        threading.Timer(0.1, token.cancel).start()             # cancelled while still connecting
+        t0 = time.monotonic()
+        with pytest.raises(Cancelled):
+            WhisperServerClient(srv.url, timeout_s=5).transcribe(PcmWindow().snapshot(), cancel=token)
+        assert time.monotonic() - t0 < 0.25                     # released at the cancel, not after the connect
+        time.sleep(0.5)                                         # the connect completes meanwhile...
+        assert srv.log == []                                    # ...but the request is never sent
+        assert _no_workers_left()
+    finally:
+        srv.close()
+
+
+def test_a_request_cancelled_before_it_starts_is_never_sent():
+    srv = _OneAtATimeWhisper([0.0])
+    try:
+        token = CancelToken()
+        token.cancel()
+        with pytest.raises(Cancelled):
+            WhisperServerClient(srv.url).transcribe(PcmWindow().snapshot(), cancel=token)
+        time.sleep(0.1)
+        assert srv.log == []
+    finally:
+        srv.close()
+
+
+def _speech(window, seconds):
+    window.append(b"\x01\x00" * int(seconds * SAMPLE_RATE))
+
+
+def test_end_of_speech_cancels_the_partial_so_the_final_does_not_queue_behind_it():
+    srv = _OneAtATimeWhisper([3.0, 0.05])     # the partial would take 3 s; the final takes 0.05 s
+    try:
+        window = PcmWindow()
+        _speech(window, 0.6)
+        tr = LiveTranscriber(WhisperServerClient(srv.url, timeout_s=10), window)
+        tr.start()
+        end = time.monotonic() + 2.0
+        while not srv.events("start") and time.monotonic() < end:
+            time.sleep(0.01)                                     # the partial is being "decoded"
+        _speech(window, 0.3)
+        t0 = time.monotonic()
+        final = tr.finish()
+        assert time.monotonic() - t0 < 0.6                      # not ~3 s behind the partial
+        assert final == "text 1" and tr.cancelled == 1 and tr.partials == 1
+        assert srv.events("client gone")[0][0] == 0             # the partial's request was dropped
+        assert tr.poll() is None
+    finally:
+        srv.close()
+
+
+class _FakeWhisper:
+    """In-process stand-in: partial calls (with a cancel token) block until released or cancelled."""
+
+    def __init__(self):
+        self.calls = []
+        self.release = threading.Event()
+        self.started = threading.Semaphore(0)
+
+    def transcribe(self, wav, cancel=None):
+        if cancel is None:
+            self.calls.append("final")
+            return "[BLANK_AUDIO] Open the claw."
+        self.calls.append("partial")
+        self.started.release()
+        while not self.release.wait(0.005):
+            if cancel.cancelled:
+                raise Cancelled("cancelled")
+        return " Open the claw (wind) "
+
+
+def test_partials_are_handed_out_by_poll_one_newest_at_a_time():
+    fake, window = _FakeWhisper(), PcmWindow()
+    fake.release.set()
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    assert tr.poll() is None
+    _speech(window, 0.6)
+    tr.start()
+    end = time.monotonic() + 2.0
+    got = None
+    while got is None and time.monotonic() < end:
+        got = tr.poll()
+        time.sleep(0.005)
+    assert got == (1, "Open the claw")                          # noise markers dropped
+    assert tr.finish() == "Open the claw."
+
+
+def test_nothing_partial_happens_after_end_of_speech():
+    fake, window = _FakeWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.started.acquire(timeout=2)                      # a partial is in flight, held
+    assert tr.finish() == "Open the claw." and tr.cancelled == 1
+    _speech(window, 1.0)                                        # more audio after the end of speech
+    fake.release.set()
+    time.sleep(0.15)
+    assert fake.calls == ["partial", "final"]                   # no new partial was started
+    assert tr.poll() is None                                    # and none is handed out
+
+
+def test_a_partial_not_taken_before_end_of_speech_is_dropped():
+    fake, window = _FakeWhisper(), PcmWindow()
+    fake.release.set()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    end = time.monotonic() + 2.0
+    while "partial" not in fake.calls and time.monotonic() < end:
+        time.sleep(0.005)
+    time.sleep(0.05)                                            # its text is waiting in the slot
+    tr.finish()
+    assert tr.poll() is None
+
+
+def test_no_partial_starts_after_end_of_speech_even_when_none_was_in_flight():
+    fake, window = _FakeWhisper(), PcmWindow()
+    fake.release.set()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    end = time.monotonic() + 2.0
+    while 'partial' not in fake.calls and time.monotonic() < end:
+        time.sleep(0.005)
+    time.sleep(0.05)                                            # idle: no request in flight
+    tr.finish()
+    _speech(window, 1.0)                                        # new audio after the end of speech
+    time.sleep(0.15)
+    assert fake.calls.count('partial') == 1 and tr.cancelled == 0
