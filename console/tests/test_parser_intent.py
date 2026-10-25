@@ -8,6 +8,7 @@
 Expected kinds were written down before the fix; every table had failing rows on the old parser.
 """
 import asyncio
+import threading
 import time
 
 import pytest
@@ -305,9 +306,107 @@ def test_a_failing_robot_stop_still_stops_the_brain(monkeypatch):
             m.setattr(main.brain, "clear_stop", brain_clear)
             m.setattr(main.engine.robot, "stop", robot_stop)
             r = c.post("/stop")
-            assert r.status_code == 200 and main.engine.stopped and told == ["stop"], (r.status_code, told)
+            # 502, not 200: the HUD then shows "STOP request failed: use the robot's physical button!"
+            assert r.status_code == 502 and main.engine.stopped and told == ["stop"], (r.status_code, told)
             assert r.json()["status"] == "stop_request_failed" and "ValueError" in r.json()["error"], r.json()
             c.post("/stop/clear")
+
+
+@pytest.mark.parametrize("failure", ["robot stop raises", "robot stop request failed", "robot says not stopped",
+                                     "brain stop failed"])
+def test_an_unconfirmed_stop_says_so_and_stays_latched(monkeypatch, failure):
+    # Review round 5: the voice route answered "Stopping." even when the robot never confirmed the stop.
+    async def robot_stop():
+        if failure == "robot stop raises":
+            raise ValueError("robot reply was not JSON")
+        if failure == "robot stop request failed":
+            return {"status": "stop_request_failed", "error": "connect timeout"}
+        if failure == "robot says not stopped":
+            return {"stopped": False, "latched": False}
+        return {"stopped": True, "latched": True}
+
+    async def brain_stop():
+        return {"error": "brain unreachable"}
+
+    async def brain_clear():
+        return {}
+
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.engine.robot, "stop", robot_stop)
+            if failure == "brain stop failed":
+                m.setattr(main.brain, "enabled", lambda: True)
+                m.setattr(main.brain, "stop", brain_stop)
+                m.setattr(main.brain, "clear_stop", brain_clear)
+            out = c.post("/commands", json={"text": "Stop.", "source": "voice"}).json()
+            latched = main.engine.stopped
+            said = [e["text"] for e in main.bus.log if e["type"] == "say"][-1]
+            button = c.post("/stop")
+            c.post("/stop/clear")
+    assert out["kind"] == "stop" and out["stop_confirmed"] is False and latched, out
+    assert "could not confirm" in out["reason"] and "Cut the motor power" in out["quip"], out
+    assert said == out["quip"] and out["robot"], (said, out)
+    assert button.status_code == 502, button.status_code
+
+
+def test_a_confirmed_stop_says_stopping():
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        out = c.post("/commands", json={"text": "Stop.", "source": "voice"}).json()
+        assert out["stop_confirmed"] is True and out["reason"] == "" and out["quip"] == "Stopping.", out
+        assert out["robot"]["status"] == "stopped" and c.post("/stop").status_code == 200
+        c.post("/stop/clear")
+
+
+class StalledDisk:
+    """A ledger file whose every open hangs, like a stalled SD card, until released."""
+
+    def __init__(self, release: threading.Event):
+        self.release = release
+
+    def open(self, *args, **kwargs):
+        self.release.wait(3)
+        raise OSError("the disk stalled")
+
+    def exists(self):
+        return False
+
+
+def test_a_stalled_ledger_disk_never_delays_a_stop(monkeypatch):
+    # Review round 5: ledger writes ran on the event loop, so a stalled disk blocked the stop response (the time
+    # budget cannot interrupt a blocked loop) and every other request. Writes now happen on the ledger's thread.
+    release = threading.Event()
+    calls = []
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        real_stop = main.engine.robot.stop
+
+        async def robot_stop():
+            calls.append("robot.stop")
+            return await real_stop()
+
+        try:
+            with monkeypatch.context() as m:
+                m.setattr(main.ledger, "path", StalledDisk(release))
+                m.setattr(main.engine.robot, "stop", robot_stop)
+                t0 = time.monotonic()
+                r = c.post("/commands", json={"text": "Stop.", "source": "voice"})
+                stop_s = time.monotonic() - t0
+                t1 = time.monotonic()
+                other = c.post("/commands", json={"text": "What do you see?", "source": "typed"})
+                other_s = time.monotonic() - t1
+                eid = main.ledger.append("probe")
+                found = main.ledger.find(eid)
+                latched = main.engine.stopped
+        finally:
+            release.set()
+        assert r.status_code == 200 and r.json()["kind"] == "stop" and stop_s < 2.0, stop_s
+        assert calls == ["robot.stop"] and latched
+        assert other.status_code == 200 and other_s < 2.0, other_s  # the event loop was never blocked
+        assert found and found["kind"] == "probe"  # a record that is not on disk yet can still be found
+        assert main.ledger.flush(10)
+        c.post("/stop/clear")
 
 
 def test_spoken_stop_does_not_wait_on_the_brain(monkeypatch):

@@ -6,7 +6,9 @@ import hashlib
 import inspect
 import json
 import logging
+import queue
 import socket
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -24,7 +26,8 @@ TELEMETRY_TIMEOUT_S = 0.5
 async def best_effort(*calls: Callable[[], Any], timeout_s: float = TELEMETRY_TIMEOUT_S) -> None:
     """Run telemetry calls (bus emits, ledger writes) in order, after a safety action, never before it.
     Each failure is logged and skipped, and all of them together get at most timeout_s, so none can raise
-    into or stall the caller. (A write that blocks the event loop cannot be cut short: it comes last.)"""
+    into or stall the caller. (A call that blocks the event loop could not be cut short; the ledger's writes
+    happen on its own thread for that reason.)"""
     async def run() -> None:
         for call in calls:
             try:
@@ -45,6 +48,24 @@ def _stop_failed(r: Any) -> Any:
     if isinstance(r, BaseException):
         return {"status": "stop_request_failed", "error": f"{type(r).__name__}: {r}"}
     return r
+
+
+def stop_unconfirmed(res: Any) -> list[str]:
+    """What an Engine.stop() result does not confirm: "robot: ..." and/or "brain: ..." for each stop call that
+    failed, raised, or answered that it did not stop. An empty list means every stop call confirmed."""
+    def why(r: Any) -> str | None:
+        if not isinstance(r, dict):
+            return None
+        if r.get("status") == "stop_request_failed" or r.get("error"):
+            return str(r.get("error") or r.get("status"))
+        if r.get("stopped") is False:
+            return "it answered that it did not stop"
+        return None
+
+    parts = [f"robot: {w}" for w in [why(res)] if w]
+    if isinstance(res, dict) and (w := why(res.get("brain"))):
+        parts.append(f"brain: {w}")
+    return parts
 
 
 # --------------------------------------------------------------------------- bus
@@ -73,28 +94,71 @@ class Bus:
 # ------------------------------------------------------------------------ ledger
 class Ledger:
     """Append only JSONL. Evidence format from the team packet:
-    ticket | commit | input fixture | procedure | observed result | limitation | next owner"""
+    ticket | commit | input fixture | procedure | observed result | limitation | next owner
+
+    Every write happens on the ledger's own thread, in order: append() serializes the record and queues it,
+    so a slow or stalled disk can never block the event loop (and with it a stop, or any other request).
+    find() also sees records that are not on disk yet. A write that fails is logged; the caller is not told."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._queue: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
+        self._unwritten: dict[str, str] = {}  # id -> line, until it is on disk
+        self._lock = threading.Lock()  # guards _unwritten only; never held during disk I/O
+        threading.Thread(target=self._writer, name="ledger-writer", daemon=True).start()
 
     def append(self, event: str, **rec: Any) -> str:
         eid = "ev_" + uuid.uuid4().hex[:10]
-        line = {"id": eid, "kind": event, "ts": time.time(), **rec}
-        with self.path.open("a") as f:
-            f.write(json.dumps(line, default=str) + "\n")
+        line = json.dumps({"id": eid, "kind": event, "ts": time.time(), **rec}, default=str) + "\n"
+        with self._lock:
+            self._unwritten[eid] = line
+        self._queue.put((eid, line))
         return eid
 
+    def _writer(self) -> None:
+        while True:
+            eid, line = self._queue.get()
+            try:
+                self._write(line)
+            except Exception as e:  # noqa: BLE001
+                log.error("ledger write failed, record %s lost: %s: %s", eid, type(e).__name__, e)
+            with self._lock:
+                self._unwritten.pop(eid, None)
+
+    def _write(self, line: str) -> None:
+        with self.path.open("a") as f:
+            f.write(line)
+
+    def flush(self, timeout_s: float = 5.0) -> bool:
+        """Wait in the calling thread until every queued record is written (or has failed). For shutdown and tests."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                if not self._unwritten:
+                    return True
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.01)
+
     def find(self, eid: str) -> dict | None:
-        if not self.path.exists():
+        def match(line: str) -> dict | None:
+            if eid in line:
+                j = json.loads(line)
+                if j.get("id") == eid or j.get("operation_id") == eid:
+                    return j
             return None
-        with self.path.open() as f:
-            for line in f:
-                if eid in line:
-                    j = json.loads(line)
-                    if j.get("id") == eid or j.get("operation_id") == eid:
+
+        with self._lock:  # snapshot first: a record written after this is then in the file
+            pending = list(self._unwritten.values())
+        if self.path.exists():
+            with self.path.open() as f:
+                for line in f:  # oldest first, as before
+                    if j := match(line):
                         return j
+        for line in pending:
+            if j := match(line):
+                return j
         return None
 
 
@@ -312,8 +376,12 @@ class Engine:
         res = _stop_failed(robot_res)
         if brain_res:
             res = {**(res or {}), "brain": _stop_failed(brain_res[0])}
-        await best_effort(lambda: self.ledger.append("estop", by=by, robot=res),
-                          lambda: self.bus.emit("stop", by=by, robot=res),
+        unconfirmed = stop_unconfirmed(res)
+        await best_effort(lambda: self.ledger.append("estop", by=by, robot=res, unconfirmed=unconfirmed),
+                          lambda: self.bus.emit("stop", by=by, robot=res, confirmed=not unconfirmed),
+                          *([lambda: self.bus.emit("log", level="error", msg="E-STOP NOT CONFIRMED ("
+                                                   + "; ".join(unconfirmed) + "). Cut the motor power.")]
+                            if unconfirmed else []),
                           *[lambda op=op: self.bus.emit("operation", op=op.public()) for op in list(self.ops.values())])
         return res
 

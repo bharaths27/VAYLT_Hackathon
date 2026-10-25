@@ -36,8 +36,9 @@ PRONOUNS = r"\b(it|that|this|them|those|the thing|the stuff|something)\b"
 # company ("Stop.", "STOP!", "stop, stop", "Please stop.", "Wait!", "Hold on.", "Stop. Open the claw.").
 # whisper.cpp writes "Stop." and the old exact match missed it. This deliberately also stops on "don't stop
 # the timer", "stop sign", "remember to stop at zone A" or "remember to wait for the student": on a robot a
-# needless stop costs one Clear Stop, a missed stop can hurt someone, so we err toward stopping. A rule with a
-# stop word in it must be taught through /rules. "hold on", "hold it" and "hang on" are phrases, so "hold the
+# needless stop costs one Clear Stop, a missed stop can hurt someone, so we err toward stopping. Decided and
+# kept on purpose (warden, under Carter's rule): "Wait, don't open the claw" latches a stop, even though it
+# only meant "don't". A rule with a stop word in it must be taught through /rules. "hold on", "hold it" and "hang on" are phrases, so "hold the
 # vial" is not a stop. ("e-stop" is covered by "stop".) The same pattern as STOP_WORDS in engram/engine.py
 # (tests/test_spoken_stop.py checks that they are equal).
 STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b")

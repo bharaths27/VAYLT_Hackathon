@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from . import brain, config, llm, voice
 from .adapters.memory import make_memory
 from .adapters.robot import make_camera, make_robot
-from .core import Bus, Engine, Ledger, Operation, best_effort, hash_models, upstream_online
+from .core import Bus, Engine, Ledger, Operation, best_effort, hash_models, stop_unconfirmed, upstream_online
 from .parser import is_stop, parse, quip
 
 WEB = config.ROOT / "web"
@@ -71,6 +71,7 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
+    ledger.flush(2.0)  # the ledger writes on its own thread; give queued records a moment to reach the disk
 
 
 app = FastAPI(title="ENGRAM Cortex Console", lifespan=lifespan)
@@ -230,13 +231,21 @@ async def handle_command(text: str, source: str) -> dict:
 async def _stop_command(text: str, source: str, t0: float) -> dict:
     """A spoken or typed stop acts before telemetry, memory, the brain bridge or any planner: none of them may
     delay it or read it as something else. engine.stop() latches and stops the robot (and the brain, when the
-    bridge is on) before its own telemetry; this command's telemetry comes after that, best effort."""
-    await engine.stop(by=f"command:{source}")
+    bridge is on) before its own telemetry; this command's telemetry comes after that, best effort.
+    If a stop call did not confirm, the answer and the spoken text say so: the latch holds, but the robot may
+    still be moving."""
+    res = await engine.stop(by=f"command:{source}")
+    unconfirmed = stop_unconfirmed(res)
     out = {"kind": "stop", "reason": "", "quip": quip("stop"), "trace": ["stop word"], "data": {},
+           "robot": res, "stop_confirmed": not unconfirmed,
            "metrics": {"plan_ms": int((time.time() - t0) * 1000), "planner_calls": 0}}
+    if unconfirmed:
+        out["reason"] = f"I could not confirm the robot stopped ({'; '.join(unconfirmed)}). Cut the motor power."
+        out["quip"] = "I could not confirm the robot stopped. Cut the motor power."
+        out["trace"].append(f"stop not confirmed: {'; '.join(unconfirmed)}")
     await best_effort(lambda: ledger.append("command", text=text, source=source),
-                      lambda: ledger.append("parse", text=text, result_kind="stop", reason="", trace=out["trace"],
-                                            metrics=out["metrics"]),
+                      lambda: ledger.append("parse", text=text, result_kind="stop", reason=out["reason"],
+                                            trace=out["trace"], metrics=out["metrics"]),
                       lambda: bus.emit("heard", text=text, source=source),
                       lambda: bus.emit("parsed", **out),
                       lambda: bus.emit("say", text=out["quip"]))
@@ -344,7 +353,10 @@ async def operations():
 
 @app.post("/stop")
 async def stop():
-    return await engine.stop(by="hud_button")
+    res = await engine.stop(by="hud_button")
+    if stop_unconfirmed(res):  # 502: the HUD shows "STOP request failed: use the robot's physical button!"
+        return JSONResponse(res, status_code=502)
+    return res
 
 
 @app.post("/stop/clear")
