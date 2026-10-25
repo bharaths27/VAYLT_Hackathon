@@ -128,17 +128,23 @@ refuse_unsafe_config() {
     [ -f "$ARENA" ] || die "lab arena not found at $ARENA"
 }
 
-# One start at a time: an OS lock, flock(2) on $STATE/sidecar.lock, taken by Python on this shell's own descriptor 9.
-# The kernel holds it exactly as long as this shell runs and releases it however the shell ends, so no lock is ever
-# stale and none is ever removed or reclaimed by a starter. The server is started with descriptor 9 closed. (A local
-# state directory, as the default under $HOME: NFS emulates flock per process, which would end with the Python call.)
-start_lock() {
+# One start or stop at a time: an OS lock, flock(2) on $STATE/sidecar.lock, taken by Python on this shell's own
+# descriptor 9. The kernel holds it exactly as long as this shell runs and releases it however the shell ends, so no
+# lock is ever stale and none is ever removed or reclaimed. The server is started with descriptor 9 closed. A start that
+# finds it held refuses; a stop waits up to $1 seconds for it. (A local state directory, as the default under $HOME:
+# NFS emulates flock per process, which would end with the Python call.)
+state_lock() {
     [ ! -L "$STATE/sidecar.lock" ] || die "refusing $STATE/sidecar.lock: the lock path is a symlink"
     exec 9>>"$STATE/sidecar.lock"
-    "$(python_bin)" -c 'import fcntl,sys
-try: fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB)
-except OSError: sys.exit(1)' || die "another start is in progress"
+    "$(python_bin)" -c 'import fcntl,sys,time
+end=time.monotonic()+float(sys.argv[1])
+while True:
+    try: fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB); break
+    except OSError:
+        if time.monotonic()>=end: sys.exit(1)
+        time.sleep(.1)' "$1"
 }
+start_lock() { state_lock 0 || die "another start is in progress (or a stop); retry when it is done"; }
 
 start() {
     refuse_unsafe_config
@@ -187,13 +193,18 @@ start() {
 }
 
 stop() {
+    [ -d "$STATE" ] || { echo "cortex-sidecar: not running"; return 0; }
+    # Under the start lock: a start in progress finishes first, and none begins until this stop is done, so the server
+    # it stops is the one the PID file names, and no replacement can be started unseen meanwhile.
+    state_lock 120 || die "a start is still in progress after 120 s; retry the stop"
     if ! running; then rm -f "$PID_FILE" "$CONF"; echo "cortex-sidecar: not running"; return 0; fi
     pid=$(cat "$PID_FILE")
-    kill "$pid"
+    kill "$pid" 2>/dev/null || true
     i=0
     while kill -0 "$pid" 2>/dev/null && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done
     if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid"; echo "cortex-sidecar: did not exit in 15 s; killed"; fi
-    rm -f "$PID_FILE" "$CONF"
+    # Only the files that still name the process stopped here.
+    [ "$(cat "$PID_FILE" 2>/dev/null || true)" != "$pid" ] || rm -f "$PID_FILE" "$CONF"
     echo "cortex-sidecar: stopped (pid $pid)"
 }
 
