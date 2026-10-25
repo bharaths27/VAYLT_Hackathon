@@ -49,22 +49,23 @@ class Executor:
         for step in plan["steps"]:
             op, args = step["op"], step.get("args", {})
             op_id = new_id("op")
+            stops = self.stop_requests  # before the check: a stop from here on, however it lands, ends the run
             if self.robot.state().get("stopped") and op != "stop":
                 self.journal(op_id, episode_id, op, args, "rejected", "robot is stopped")
                 result.outcome, result.failure, result.stopped = "aborted", "stop was pressed", True
                 break
-            stops = self.stop_requests
             self.journal(op_id, episode_id, op, args, "pending")
             out = self.robot.execute(op, args)
+            stopped = self.stop_requests != stops  # read at once, whatever the step returned (done included)
             for tag_id, zone in out.observations:
                 self.memory.observe_tag(tag_id, zone, source="robot")
             self.journal(op_id, episode_id, op, args, out.status, out.detail)
             result.steps.append({"op": op, "args": args, "status": out.status, "detail": out.detail})
-            if out.status == "done":
-                continue
-            if self.stop_requests != stops:  # stopped while it ran (it came back aborted): the stop ended the run
+            if stopped:  # stopped before or while it ran: the stop ended the run, not the step
                 result.outcome, result.failure, result.stopped = "aborted", "stop was pressed", True
                 break
+            if out.status == "done":
+                continue
             subject = args.get("object_id") or args.get("zone") or op
             if out.status == "unknown":
                 self.robot.stop()

@@ -216,7 +216,7 @@ def lessons(engine):
     return engine.conn.execute("SELECT COUNT(*) FROM negative_memory").fetchone()[0]
 
 
-@pytest.mark.parametrize("status", ["unknown", "failed"])
+@pytest.mark.parametrize("status", ["unknown", "failed", "done"])   # done: the step finished in spite of the stop
 @pytest.mark.parametrize("which", ["the only step", "the final step"])
 def test_a_stop_during_a_step_ends_the_run_as_stopped(arena, which, status):
     hold_on = "go_to_zone" if which == "the only step" else "speak"
@@ -233,6 +233,68 @@ def test_a_stop_during_a_step_ends_the_run_as_stopped(arena, which, status):
     assert r["stopped"] is True
     assert (out["run"]["outcome"], out["run"]["stopped"], out["run"]["failure"]) == ("aborted", True, "stop was pressed")
     assert lessons(eng) == before                            # a stopped step is no lesson about the step
+
+
+class StopsAfterTheCheck(MockRobot):
+    """A stop lands just after the executor saw that the robot was not stopped, before the next step starts: the
+    state it hands back is the one from before the stop."""
+
+    def __init__(self, arena):
+        super().__init__(arena)
+        self.engine, self.executed, self.fired = None, [], False
+
+    def execute(self, op, args):
+        self.executed.append(op)
+        return super().execute(op, args)
+
+    def state(self):
+        seen = super().state()
+        if self.engine is not None and self.executed and not self.fired:
+            self.fired = True
+            self.engine.stop()
+        return seen
+
+
+def test_a_stop_between_the_check_and_the_step_ends_the_run_as_stopped(arena):
+    eng = Engine(connect(":memory:"), StopsAfterTheCheck(arena), set(arena["zones"]))
+    eng.load_arena(arena)
+    eng.overhead_scan()
+    eng.teach("SOP 004", (ROOT / "fixtures/lab/SOP_004.md").read_text())
+    p = eng.command(REQUEST, "test")
+    before = lessons(eng)
+    eng.robot.engine, eng.robot.executed = eng, []           # armed: fires in the check before the second step
+    run = eng.approve_and_run(p["operation_id"], p["digest"], "tester")
+    assert eng.robot.fired
+    assert (run["outcome"], run["stopped"], run["failure"]) == ("aborted", True, "stop was pressed")
+    assert len(run["steps"]) == 2 and lessons(eng) == before   # the second step met a stopped robot: no lesson
+
+
+class LatchesItself(MockRobot):
+    """The robot's own STOP button: it latches without the engine counting a stop, here as soon as a step is done."""
+
+    armed = False
+
+    def execute(self, op, args):
+        out = super().execute(op, args)
+        if self.armed:
+            self.stopped = True
+        return out
+
+
+@pytest.mark.parametrize("when", ["before the run", "between steps"])
+def test_a_robot_stopped_on_its_own_ends_the_run_as_stopped(arena, when):
+    eng = Engine(connect(":memory:"), LatchesItself(arena), set(arena["zones"]))
+    eng.load_arena(arena)
+    eng.overhead_scan()
+    eng.teach("SOP 004", (ROOT / "fixtures/lab/SOP_004.md").read_text())
+    p = eng.command(REQUEST, "test")
+    if when == "before the run":
+        eng.robot.stop()                                      # latched already: the first step's check sees it
+    else:
+        eng.robot.armed = True                                # latches once the first step is done
+    run = eng.approve_and_run(p["operation_id"], p["digest"], "tester")
+    assert (run["outcome"], run["stopped"], run["failure"]) == ("aborted", True, "stop was pressed")
+    assert len(run["steps"]) == (0 if when == "before the run" else 1)
 
 
 # ---- every command result states its classification; the console reads it, never the words or a missing flag --
