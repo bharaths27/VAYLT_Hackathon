@@ -753,3 +753,33 @@ def test_a_final_that_waits_in_vain_for_the_model_is_ambiguous(fake, spawn, cloc
     gate.on_partial(1, 0, "Open the claw")               # dispatched but never run
     r = gate.on_final(1, 1, "Open the claw")
     assert (r.action, r.cause) == ("clarify", "ambiguous")
+
+
+# ---- reject() says whether it took the utterance, so an overflow cannot stop a newer task ---------------------
+
+
+def test_reject_takes_only_an_utterance_the_gate_has_not_set_aside(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Open the claw")
+    gate.on_partial(2, 0, "Close the claw")                   # utterance 2 has begun
+    r = gate.reject(1)                                         # 1's overflow, reported late
+    assert (r.action, r.cause) == ("ignored", "superseded")
+    r = gate.reject(2)                                         # the current one: taken, and misheard
+    assert (r.action, r.cause) == ("clarify", "misheard")
+    r = gate.reject(2)                                         # taken once only
+    assert (r.action, r.cause) == ("ignored", "rejected")
+
+
+def test_reject_of_a_stopped_utterance_is_ignored(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    assert gate.on_partial(1, 0, "Open the claw, stop").action == "stop"
+    r = gate.reject(1)
+    assert (r.action, r.cause) == ("ignored", "stopped")
+
+
+def test_reject_of_an_utterance_the_gate_has_not_heard_yet_is_taken(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Open the claw")
+    r = gate.reject(2)                                         # 2 overflowed before any of its partials arrived
+    assert (r.action, r.cause) == ("clarify", "misheard")
+    assert gate.on_final(2, 0, "Open the claw").action == "ignored"   # and it is still set aside

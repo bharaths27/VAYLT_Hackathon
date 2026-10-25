@@ -152,10 +152,16 @@ class VoiceIntegration:
         """End of speech for audio fed through a LiveTranscriber: transcribe, then on_final.
 
         An utterance whose audio overflowed the window is refused: no transcript, no proposal, and the
-        gate voids whatever the partials prepared for it, so nothing of it can be reused."""
+        gate voids whatever the partials prepared for it, so nothing of it can be reused. Carter's rule
+        applies only if the gate took it as the utterance being heard now: one it had already set aside
+        (superseded by a newer one, or stopped) asks nothing and stops nothing, since the task running
+        now is not this utterance's."""
         try:
             text = transcriber.finish()
         except AudioOverflow:
             r = self.gate.reject(utterance, "That was too long for me to take in at once.")
-            return self._clarify({"heard": "", "utterance": utterance, "revision": revision}, r.reason)
+            base = {"heard": "", "utterance": utterance, "revision": revision}
+            if r.cause in RULE_CAUSES:
+                return self._clarify(base, r.reason)
+            return {"kind": r.action, **base, "reason": r.reason, "cause": r.cause}
         return self.on_final(utterance, revision, text)

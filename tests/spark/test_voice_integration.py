@@ -654,3 +654,17 @@ def test_the_rule_follows_the_gates_cause_not_its_action(held, spawn, clock, mon
     r = voice.on_final(1, 0, "Open the claw")
     run = finish(held, t, out)
     assert r["kind"] == "clarify" and "stopped" not in r and run["outcome"] == "success"
+
+
+def test_an_overflow_of_an_utterance_the_gate_set_aside_stops_nothing(held, spawn, clock):
+    voice = VoiceIntegration(held, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=1.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)
+    with pytest.raises(AudioOverflow):
+        window.append(b"\x01\x00" * int(0.6 * SAMPLE_RATE))   # utterance 1 overflowed...
+    voice.on_partial(2, 0, "Close the claw")                  # ...but utterance 2 has begun
+    t, out = run_a_plan(held)                                 # and a newer task is running now
+    r = voice.finish_live(1, 99, tr)
+    run = finish(held, t, out)
+    assert (r["kind"], r["cause"]) == ("ignored", "superseded") and "stopped" not in r
+    assert run["outcome"] == "success" and held.robot.state()["stopped"] is False

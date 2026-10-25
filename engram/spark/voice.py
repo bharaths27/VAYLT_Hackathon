@@ -378,18 +378,28 @@ class SpeculationGate:
     def reject(self, utterance: int, reason: str = "I could not hear that properly.") -> GateResult:
         """This utterance, and only this one, cannot be trusted (for example, its audio overflowed the
         window): void its prediction, pending partial and in-flight answer, and refuse its later partials
-        and final. Any other utterance, a newer one in particular, is untouched; only a stop is global."""
+        and final. Any other utterance, a newer one in particular, is untouched; only a stop is global.
+
+        Says whether it took the utterance: "clarify", cause misheard, for the one being heard now (or one
+        newer than any heard yet), the only case its caller may act on (Carter's rule). One the gate had
+        already set aside is "ignored", cause superseded (a newer one has begun), stopped or rejected: the
+        caller has nothing to ask, and must stop nothing, since a task running now is not this one's."""
         with self._cv:
             self.stats.rejected += 1
-            if _valid_id(utterance):
-                self._rejected = {u for u in self._rejected if self._utt is None or u >= self._utt}
-                self._rejected.add(utterance)
-                if utterance == self._utt:
-                    self._pred = None              # an in-flight answer fails _current() when it lands
-                    if self._pending is not None and self._pending[0] == utterance:
-                        self._pending = None
-                self._cv.notify_all()
-        return GateResult("clarify", utterance, -1, "", reason=reason)
+            if not _valid_id(utterance):
+                return GateResult("ignored", utterance, -1, "", reason="not an utterance", cause="invalid")
+            aside = ("superseded" if self._utt is not None and utterance < self._utt
+                     else self._void_why(utterance) if self._is_stopped(utterance) else None)
+            self._rejected = {u for u in self._rejected if self._utt is None or u >= self._utt}
+            self._rejected.add(utterance)
+            if utterance == self._utt:
+                self._pred = None              # an in-flight answer fails _current() when it lands
+                if self._pending is not None and self._pending[0] == utterance:
+                    self._pending = None
+            self._cv.notify_all()
+        if aside:
+            return GateResult("ignored", utterance, -1, "", reason=aside, cause=aside)
+        return GateResult("clarify", utterance, -1, "", reason=reason, cause="misheard")
 
     def _latch_stop(self, utterance: Any) -> None:
         """A stop: void all speculation, and refuse further transcripts of the utterance it was heard in
