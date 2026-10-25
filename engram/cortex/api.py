@@ -354,18 +354,23 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     def camera_status(principal=Depends(operator)):return hub.metadata() if hub else {'available':False,'reason':'not configured'}
     @app.get('/frame.jpg')
     def frame(principal=Depends(operator)):
-        f=hub.latest() if hub else None
+        f=None
+        if hub:
+            hub.touch();f=hub.latest() # a viewer: the poller runs while frames are being requested
+            if not f or time.time()-f.received_at>2:f=hub.latest(after=f.seq if f else 0,wait_s=1)
         if not f or time.time()-f.received_at>2:raise HTTPException(503,'camera frame unavailable/stale')
         return Response(f.jpeg,media_type='image/jpeg',headers={'X-Frame-Sequence':str(f.seq),'X-Frame-Received-At':str(f.received_at),'X-Frame-Captured-At':str(f.captured_at) if f.captured_at else 'unknown'})
     @app.get('/video.mjpg')
     async def video(req:Request,principal=Depends(operator)):
         if not hub:raise HTTPException(503,'camera not configured')
         async def frames():
-            seq=0
-            while not await req.is_disconnected():
-                f=await asyncio.to_thread(hub.latest,after=seq,wait_s=.5)
-                if f and time.time()-f.received_at<2:
-                    seq=f.seq
-                    yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
+            seq=0;hub.watch() # the poller runs while at least one stream is attached
+            try:
+                while not await req.is_disconnected():
+                    f=await asyncio.to_thread(hub.latest,after=seq,wait_s=.5)
+                    if f and time.time()-f.received_at<2:
+                        seq=f.seq
+                        yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
+            finally:hub.unwatch()
         return StreamingResponse(frames(),media_type='multipart/x-mixed-replace; boundary=frame')
     return app
