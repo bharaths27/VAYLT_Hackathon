@@ -86,6 +86,46 @@ class Turn(Input):
     cloud_allowed:bool=False
 
 
+MAX_BODY=300000
+SAFE_METHODS={'GET','HEAD','OPTIONS'}
+
+class Guard:
+    """Outermost pure-ASGI gate. A cross-site or uncredentialed mutation is refused before ONE body
+    byte is read; every body is counted as it arrives (declared or chunked) and refused past MAX_BODY.
+    Route dependencies still decide operator versus sensor; this only checks that a credential exists."""
+    def __init__(self,app,*,credentials):self.app=app;self.credentials=[c.encode() for c in credentials]
+    async def __call__(self,scope,receive,send):
+        if scope['type']!='http':return await self.app(scope,receive,send)
+        h={k.decode('latin-1').lower():v.decode('latin-1') for k,v in scope['headers']}
+        if scope['method'] not in SAFE_METHODS:
+            # Refuse cross-site browser mutations; serve through a paired same-origin TLS proxy.
+            if h.get('sec-fetch-site')=='cross-site':return await refuse(send,403,'cross-site mutation refused')
+            auth=h.get('authorization','')
+            if not (auth.startswith('Bearer ') and any(hmac.compare_digest(auth[7:].encode(),c) for c in self.credentials)):
+                return await refuse(send,401,'operator credential required')
+        try:declared=int(h.get('content-length','0'))
+        except ValueError:return await refuse(send,400,'invalid length')
+        if declared>MAX_BODY:return await refuse(send,413,'input too large')
+        body=b'';more=True
+        while more:
+            m=await receive()
+            if m['type']!='http.request':return
+            body+=m.get('body',b'');more=m.get('more_body',False)
+            if len(body)>MAX_BODY:return await refuse(send,413,'input too large')
+        replayed=False
+        async def replay():
+            nonlocal replayed
+            if replayed:return await receive()
+            replayed=True;return {'type':'http.request','body':body,'more_body':False}
+        await self.app(scope,replay,send)
+
+async def refuse(send,status,detail):
+    data=json.dumps({'detail':detail}).encode()
+    await send({'type':'http.response.start','status':status,'headers':[(b'content-type',b'application/json'),(b'content-length',str(len(data)).encode()),
+        (b'cache-control',b'no-store'),(b'x-content-type-options',b'nosniff'),(b'referrer-policy',b'no-referrer'),(b'connection',b'close')]})
+    await send({'type':'http.response.body','body':data})
+
+
 def present(result:dict)->dict:
     """Old iPad card shape, while retaining the exact internal signed goal contract."""
     out=copy.deepcopy(result)
@@ -176,18 +216,13 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         code=403 if isinstance(exc,Denied) else 404 if isinstance(exc,Missing) and str(exc).endswith('not found') else 409
         return JSONResponse(status_code=code,content={'code':exc.code,'detail':str(exc)})
     @app.middleware('http')
-    async def bounded(req,call_next):
-        try:length=int(req.headers.get('content-length','0'))
-        except ValueError:return JSONResponse(status_code=400,content={'detail':'invalid length'})
-        if length>300000:return JSONResponse(status_code=413,content={'detail':'input too large'})
-        # Refuse cross-site browser mutations; serve through a paired same-origin TLS proxy.
-        if req.method not in {'GET','HEAD','OPTIONS'} and req.headers.get('sec-fetch-site')=='cross-site':
-            return JSONResponse(status_code=403,content={'detail':'cross-site mutation refused'})
+    async def headers(req,call_next):
         response=await call_next(req)
         response.headers['Cache-Control']='no-store'
         response.headers['X-Content-Type-Options']='nosniff'
         response.headers['Referrer-Policy']='no-referrer'
         return response
+    app.add_middleware(Guard,credentials=[*keys,*skeys]) # added last = outermost
     adapter_label=b.robot.state().get('adapter')
     @app.get('/health')
     def health():return {'ok':True,'robot':adapter_label,'mode':b.mode,'service':'cortex'}
