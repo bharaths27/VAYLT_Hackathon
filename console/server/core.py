@@ -54,31 +54,49 @@ def _stop_reply(r: Any) -> dict:
     return r
 
 
-def _not_stopped(r: Any) -> str | None:
-    """Why this reply does not confirm a stop, or None when it does. Only an explicit "yes" in the target's own
-    shape confirms: the robot server's {"stopped": true, "latched": true}, the console mock robot's
-    {"status": "stopped"}, or the brain's /stop reply, its robot's state with {"stopped": true} (which also
-    carries "connected": false and an error when the brain could not reach its robot). Anything missing,
-    malformed or unknown fails closed."""
+# What a confirmed stop looks like, per target; each is the target's own documented reply, nothing looser.
+def _robot_server_stopped(r: dict) -> bool:
+    """The robot server's /robot/stop reply (the HTTP robot adapter): stopped and latched, both exactly true."""
+    return r.get("stopped") is True and r.get("latched") is True
+
+
+def _mock_robot_stopped(r: dict) -> bool:
+    """The console mock robot's reply, {"status": "stopped"}: accepted from the mock adapter only."""
+    return r.get("status") == "stopped" and r.get("stopped", True) is True
+
+
+def _brain_stopped(r: dict) -> bool:
+    """The brain's /stop reply: its robot's state, which names the adapter and says "stopped": true (and, when it
+    reports the connection at all, "connected": true)."""
+    return (isinstance(r.get("adapter"), str) and r.get("stopped") is True
+            and ("connected" not in r or r["connected"] is True))
+
+
+_ROBOT_REPLIES = {"robot_server": _robot_server_stopped, "mock": _mock_robot_stopped}
+
+
+def _not_stopped(r: Any, confirms: Callable[[dict], bool]) -> str | None:
+    """Why this reply does not confirm a stop, or None when `confirms` (its target's shape) accepts it. An error
+    or a lost connection always fails it: the brain's state says "stopped" even when it could not reach its
+    robot, next to "connected": false and an error. Anything missing, malformed or unknown fails closed."""
     if not isinstance(r, dict):
         return f"the reply was {json.dumps(r, default=str)[:80]}"
     if r.get("error") or r.get("status") == "stop_request_failed":
         return str(r.get("error") or "the stop request failed")
     if r.get("connected") is False:
         return "it is not connected to the robot"
-    if "latched" in r and r["latched"] is not True:
-        return "the stop did not latch"
-    if r.get("stopped") is True or ("stopped" not in r and r.get("status") == "stopped"):
-        return None
-    return f"the reply did not confirm a stop: {json.dumps(r, default=str)[:80]}"
+    return None if confirms(r) else f"the reply did not confirm a stop: {json.dumps(r, default=str)[:80]}"
 
 
-def stop_unconfirmed(res: Any) -> list[str]:
+def stop_unconfirmed(res: Any, robot: Any = None) -> list[str]:
     """What an Engine.stop() result does not confirm: "robot: ..." and/or "brain: ..." for each stop target whose
-    reply is not an explicit confirmation (see _not_stopped). An empty list means every target confirmed."""
-    robot = {k: v for k, v in res.items() if k != "brain"} if isinstance(res, dict) else res
-    parts = [f"robot: {w}" for w in [_not_stopped(robot)] if w]
-    if isinstance(res, dict) and "brain" in res and (w := _not_stopped(res["brain"])):
+    reply is not an explicit confirmation in that target's own shape. The console robot's shape comes from its
+    adapter (STOP_REPLY); an adapter that does not say gets the strictest, the robot server's. An empty list
+    means every target confirmed."""
+    confirms = _ROBOT_REPLIES.get(getattr(robot, "STOP_REPLY", None), _robot_server_stopped)
+    robot_reply = {k: v for k, v in res.items() if k != "brain"} if isinstance(res, dict) else res
+    parts = [f"robot: {w}" for w in [_not_stopped(robot_reply, confirms)] if w]
+    if isinstance(res, dict) and "brain" in res and (w := _not_stopped(res["brain"], _brain_stopped)):
         parts.append(f"brain: {w}")
     return parts
 
@@ -107,6 +125,10 @@ class Bus:
 
 
 # ------------------------------------------------------------------------ ledger
+class LedgerBusy(Exception):
+    """The ledger's disk is not answering in time, so a record that may exist cannot be read now."""
+
+
 class Ledger:
     """Append only JSONL. Evidence format from the team packet:
     ticket | commit | input fixture | procedure | observed result | limitation | next owner
@@ -130,6 +152,7 @@ class Ledger:
         self._stall_drops = 0
         self._cond = threading.Condition()  # guards the fields above; never held during disk I/O
         self._reader = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger-reader")
+        self._scanning: concurrent.futures.Future | None = None  # the one disk read in flight (see find)
         self.read_timeout_s = 2.0
         threading.Thread(target=self._writer, name="ledger-writer", daemon=True).start()
 
@@ -187,25 +210,33 @@ class Ledger:
             return True
 
     async def find(self, eid: str) -> dict | None:
-        """The first (oldest) record with this id or operation id. The file is read on the ledger's reader thread,
-        so a slow or stalled disk can delay only this lookup, by at most read_timeout_s (after which only the
-        records not on disk yet are searched), and never the event loop or a stop."""
+        """The first (oldest) record with this id or operation id, or None. The file is read on the ledger's reader
+        thread with at most one read in flight, so a slow or stalled disk delays only lookups (each by at most
+        read_timeout_s) and never the event loop or a stop. While that read is stuck, a lookup queues nothing:
+        it searches the records not on disk yet and, failing that, raises LedgerBusy. So does a lookup whose own
+        read ran out of time or failed."""
         with self._cond:  # snapshot first: a record written after this is then in the file
             pending = list(self._pending.values())
-        try:
-            reading = asyncio.get_running_loop().run_in_executor(self._reader, self._scan, eid)
-            j = await asyncio.wait_for(reading, self.read_timeout_s)
-        except asyncio.TimeoutError:
-            log.warning("ledger read took over %.1f s; searched only records not on disk yet", self.read_timeout_s)
-            j = None
-        except OSError as e:
-            log.error("ledger read failed: %s", e)
-            j = None
+            scan = None
+            if self._scanning is None or self._scanning.done():
+                self._scanning = scan = self._reader.submit(self._scan, eid)
+        j, unread = None, scan is None
+        if scan is not None:
+            try:
+                j = await asyncio.wait_for(asyncio.wrap_future(scan), self.read_timeout_s)
+            except asyncio.TimeoutError:
+                log.warning("ledger read took over %.1f s; searched only records not on disk yet", self.read_timeout_s)
+                unread = True
+            except OSError as e:
+                log.error("ledger read failed: %s", e)
+                unread = True
         if j:
             return j
         for line in pending:
             if j := _ledger_match(line, eid):
                 return j
+        if unread:
+            raise LedgerBusy("the ledger's disk is not answering; try again")
         return None
 
     def _scan(self, eid: str) -> dict | None:
@@ -442,7 +473,7 @@ class Engine:
         res = _stop_reply(robot_res)
         if brain_res:
             res = {**res, "brain": _stop_reply(brain_res[0])}
-        unconfirmed = stop_unconfirmed(res)
+        unconfirmed = stop_unconfirmed(res, self.robot)
         await best_effort(lambda: self.ledger.append("estop", by=by, robot=res, unconfirmed=unconfirmed),
                           lambda: self.bus.emit("stop", by=by, robot=res, confirmed=not unconfirmed),
                           *([lambda: self.bus.emit("log", level="error", msg="E-STOP NOT CONFIRMED ("

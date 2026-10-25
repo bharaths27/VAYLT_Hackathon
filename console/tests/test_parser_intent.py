@@ -362,7 +362,7 @@ def test_a_failing_robot_stop_still_stops_the_brain(monkeypatch):
 
     async def brain_stop():
         told.append("stop")
-        return {"stopped": True}
+        return {"adapter": "mock", "stopped": True}
 
     async def brain_clear():
         return {}
@@ -381,32 +381,55 @@ def test_a_failing_robot_stop_still_stops_the_brain(monkeypatch):
             c.post("/stop/clear")
 
 
+OFF = "brain bridge off"
 ROBOT_OK = {"stopped": True, "latched": True}  # the robot server's reply to /robot/stop
-# Review round 7: a reply confirms a stop only when it says so explicitly, in its target's own shape. Anything
-# else (missing, malformed, unknown, or a string where a boolean belongs) does not.
-STOP_REPLIES = [  # (robot reply, brain reply or None when the brain bridge is off, confirmed)
-    (ROBOT_OK, None, True),
-    ({"stopped": True}, None, True),
-    ({"status": "stopped", "simulated": True}, None, True),  # the console's mock robot
-    (ROBOT_OK, {"adapter": "mock", "stopped": True}, True),  # the brain answers /stop with its robot's state
-    (ROBOT_OK, {"adapter": "brian8200", "connected": True, "stopped": True}, True),
-    (None, None, False), ({}, None, False), ([], None, False), ("stopped", None, False), (True, None, False),
-    ({"status": "error"}, None, False), ({"status": "ok"}, None, False), ({"status": "STOPPED"}, None, False),
-    ({"stopped": "yes"}, None, False), ({"stopped": "true"}, None, False), ({"stopped": 1}, None, False),
-    ({"stopped": None}, None, False), ({"latched": True}, None, False),
-    ({"stopped": True, "latched": False}, None, False), ({"stopped": True, "latched": "yes"}, None, False),
-    ({"stopped": True, "error": "driver fault"}, None, False), ({"status": "stopped", "stopped": False}, None, False),
-    ([], {"adapter": "mock", "stopped": True}, False),
-    (ROBOT_OK, {}, False), (ROBOT_OK, {"stopped": False}, False), (ROBOT_OK, {"adapter": "masterpi", "stopped": "yes"}, False),
+MOCK_OK = {"status": "stopped", "simulated": True}  # the console mock robot's reply
+BRAIN_OK = {"adapter": "mock", "stopped": True}  # the brain answers /stop with its robot's state
+# Review rounds 7 and 9: a reply confirms a stop only when it says so explicitly, in its own target's documented
+# shape. The robot server must say stopped and latched, both exactly true; the status-only shape counts only from
+# the console's mock robot; the brain must answer with its robot's state. Anything else fails closed.
+STOP_REPLIES = [  # (the console robot adapter's reply contract, robot reply, brain reply or OFF, confirmed)
+    ("robot_server", ROBOT_OK, OFF, True),
+    ("robot_server", {"stopped": True}, OFF, False),  # stopped, but no latch
+    ("robot_server", {"latched": True}, OFF, False),
+    ("robot_server", {"stopped": True, "latched": False}, OFF, False),
+    ("robot_server", {"stopped": True, "latched": "yes"}, OFF, False),
+    ("robot_server", {"stopped": "yes", "latched": True}, OFF, False),
+    ("robot_server", {"stopped": 1, "latched": True}, OFF, False),
+    ("robot_server", {"status": "stopped"}, OFF, False),  # the mock's shape, from a real robot
+    ("robot_server", MOCK_OK, OFF, False),
+    ("robot_server", {**ROBOT_OK, "error": "driver fault"}, OFF, False),
+    ("robot_server", None, OFF, False), ("robot_server", {}, OFF, False), ("robot_server", [], OFF, False),
+    ("robot_server", "stopped", OFF, False), ("robot_server", True, OFF, False),
+    ("robot_server", {"status": "error"}, OFF, False), ("robot_server", {"status": "ok"}, OFF, False),
+    ("mock", MOCK_OK, OFF, True),
+    ("mock", {"status": "stopped"}, OFF, True),
+    ("mock", {"status": "STOPPED"}, OFF, False),
+    ("mock", {"status": "stopped", "stopped": False}, OFF, False),
+    ("mock", {"status": "stopped", "error": "boom"}, OFF, False),
+    ("mock", ROBOT_OK, OFF, False),  # not the mock's shape
+    ("mock", {}, OFF, False), ("mock", None, OFF, False),
+    ("robot_server", ROBOT_OK, BRAIN_OK, True),
+    ("robot_server", ROBOT_OK, {"adapter": "brian8200", "connected": True, "stopped": True}, True),
+    ("robot_server", ROBOT_OK, {"adapter": "masterpi", "at_zone": "home", "holding": None, "stopped": True}, True),
+    ("robot_server", ROBOT_OK, {"stopped": True}, False),  # no adapter: not the brain's robot state
+    ("robot_server", ROBOT_OK, {"status": "stopped"}, False),  # the mock robot's shape, from the brain
+    ("robot_server", ROBOT_OK, {"adapter": "mock", "status": "stopped"}, False),
+    ("robot_server", ROBOT_OK, {"adapter": 7, "stopped": True}, False),
+    ("robot_server", ROBOT_OK, {"adapter": "masterpi", "stopped": "yes"}, False),
+    ("robot_server", ROBOT_OK, {"adapter": "brian8200", "connected": "yes", "stopped": True}, False),
     # When the brain cannot reach its robot, its state says "stopped" anyway, next to the failure.
-    (ROBOT_OK, {"adapter": "brian8200", "connected": False, "error": "timed out", "stopped": True}, False),
-    (ROBOT_OK, {"adapter": "masterpi", "connected": False, "stopped": True}, False),
-    (ROBOT_OK, {"error": "brain unreachable"}, False),
+    ("robot_server", ROBOT_OK, {"adapter": "brian8200", "connected": False, "error": "timed out", "stopped": True}, False),
+    ("robot_server", ROBOT_OK, {"adapter": "masterpi", "connected": False, "stopped": True}, False),
+    ("robot_server", ROBOT_OK, {"error": "brain unreachable"}, False),
+    ("robot_server", ROBOT_OK, {}, False), ("robot_server", ROBOT_OK, None, False),
+    ("robot_server", ROBOT_OK, {"adapter": "mock", "stopped": False}, False),
+    ("robot_server", [], BRAIN_OK, False),
 ]
 
 
-@pytest.mark.parametrize("robot_reply,brain_reply,confirmed", STOP_REPLIES)
-def test_only_an_explicit_reply_confirms_a_stop(monkeypatch, robot_reply, brain_reply, confirmed):
+@pytest.mark.parametrize("contract,robot_reply,brain_reply,confirmed", STOP_REPLIES)
+def test_only_an_explicit_reply_confirms_a_stop(monkeypatch, contract, robot_reply, brain_reply, confirmed):
     async def robot_stop():
         return robot_reply
 
@@ -420,7 +443,8 @@ def test_only_an_explicit_reply_confirms_a_stop(monkeypatch, robot_reply, brain_
         c.post("/stop/clear")
         with monkeypatch.context() as m:
             m.setattr(main.engine.robot, "stop", robot_stop)
-            if brain_reply is not None:
+            m.setattr(main.engine.robot, "STOP_REPLY", contract, raising=False)  # as if this adapter answered
+            if brain_reply != OFF:
                 m.setattr(main.brain, "enabled", lambda: True)
                 m.setattr(main.brain, "stop", brain_stop)
                 m.setattr(main.brain, "clear_stop", brain_clear)
@@ -442,8 +466,8 @@ def test_an_unconfirmed_stop_says_so_and_stays_latched(monkeypatch, failure):
         if failure == "robot stop request failed":
             return {"status": "stop_request_failed", "error": "connect timeout"}
         if failure == "robot says not stopped":
-            return {"stopped": False, "latched": False}
-        return {"stopped": True, "latched": True}
+            return {"status": "not stopped"}
+        return MOCK_OK  # the console robot here is the mock: only the brain fails
 
     async def brain_stop():
         return {"error": "brain unreachable"}
@@ -480,7 +504,15 @@ def test_the_http_robot_never_passes_an_error_reply_off_as_a_stop(status, body, 
     robot = HttpRobot("http://robot.test")
     robot.fast = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status, json=body)))
     res = asyncio.run(robot.stop())
-    assert (not stop_unconfirmed(res)) is confirmed, res
+    assert (not stop_unconfirmed(res, robot)) is confirmed, res
+
+
+def test_a_robot_adapter_without_a_reply_contract_gets_the_strictest_one():
+    from server.core import stop_unconfirmed
+
+    unknown = object()  # an adapter that does not say what its stop reply looks like
+    assert stop_unconfirmed({"status": "stopped"}, unknown) and stop_unconfirmed({"stopped": True}, unknown)
+    assert not stop_unconfirmed(ROBOT_OK, unknown)
 
 
 def test_a_confirmed_stop_says_stopping():
@@ -496,8 +528,9 @@ class StalledDisk:
     """A ledger file whose every open hangs, like a stalled SD card, until released. With reads_stall, looking
     the file up (exists()) hangs too, and `reading` is set once a read is stuck."""
 
-    def __init__(self, release: threading.Event, reads_stall: bool = False, stall_s: float = 3.0):
-        self.release, self.reads_stall, self.stall_s = release, reads_stall, stall_s
+    def __init__(self, release: threading.Event, reads_stall: bool = False, stall_s: float = 3.0,
+                 read_stall_s: float = 5.0):
+        self.release, self.reads_stall, self.stall_s, self.read_stall_s = release, reads_stall, stall_s, read_stall_s
         self.reading, self.writing = threading.Event(), threading.Event()
 
     def open(self, *args, **kwargs):  # only writes open the file here: reads stop at exists()
@@ -508,8 +541,50 @@ class StalledDisk:
     def exists(self):
         if self.reads_stall:
             self.reading.set()
-            self.release.wait(5)
+            self.release.wait(self.read_stall_s)
         return False
+
+
+def test_a_stuck_ledger_read_queues_no_more_reads(monkeypatch):
+    # Review round 9: with the one reader thread stuck on a stalled disk, every /evidence lookup queued another
+    # read behind it (the time budget gave up on the caller but left the queued work), so sustained lookups could
+    # exhaust memory. Only one read is ever in flight now; while it is stuck, a lookup searches the records that
+    # are not on disk yet and otherwise answers 503 at once, queuing nothing.
+    release = threading.Event()
+    disk = StalledDisk(release, reads_stall=True, read_stall_s=30)
+    submitted = []
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        real_submit = main.ledger._reader.submit
+
+        def counting_submit(*args, **kwargs):
+            submitted.append(args[0])
+            return real_submit(*args, **kwargs)
+
+        try:
+            with monkeypatch.context() as m:
+                m.setattr(main.ledger, "path", disk)
+                m.setattr(main.ledger, "read_timeout_s", 0.2, raising=False)
+                m.setattr(main.ledger._reader, "submit", counting_submit)
+                stuck = threading.Thread(target=lambda: c.get("/evidence/ev_stuck"))
+                stuck.start()
+                assert disk.reading.wait(5), "the first lookup never reached the disk"
+                statuses, slowest = [], 0.0
+                for i in range(50):
+                    t0 = time.monotonic()
+                    statuses.append(c.get(f"/evidence/ev_{i}").status_code)
+                    slowest = max(slowest, time.monotonic() - t0)
+                t0 = time.monotonic()
+                stop = c.post("/stop")
+                stop_s = time.monotonic() - t0
+                queued = main.ledger._reader._work_queue.qsize()
+                stuck.join(5)
+        finally:
+            release.set()
+        c.post("/stop/clear")
+    assert len(submitted) == 1 and queued == 0, (len(submitted), queued)  # one read in flight, nothing queued
+    assert set(statuses) == {503} and slowest < 1.0, (set(statuses), slowest)  # a controlled error, at once
+    assert stop.status_code == 200 and stop_s < 1.0, (stop.status_code, stop_s)
 
 
 def _backlog(ledger) -> dict:
@@ -599,7 +674,7 @@ def test_a_stalled_ledger_read_never_delays_a_stop(monkeypatch):
         assert main.ledger.flush(10)
         c.post("/stop/clear")
     assert r.status_code == 200 and r.json()["kind"] == "stop" and latched and stop_s < 1.0, stop_s
-    assert lookup["status"] == 404 and lookup["s"] < 3.0, lookup  # the lookup gave up after its time budget
+    assert lookup["status"] == 503 and lookup["s"] < 3.0, lookup  # gave up after its time budget: not a 404
 
 
 def test_a_stalled_ledger_disk_never_delays_a_stop(monkeypatch):
@@ -648,7 +723,7 @@ def test_spoken_stop_does_not_wait_on_the_brain(monkeypatch):
 
     async def brain_stop():
         told.append("stop")
-        return {"stopped": True}
+        return BRAIN_OK
 
     async def brain_clear():
         return {}
