@@ -15,6 +15,7 @@ One JSON line per frame. Errors print {"error": ...} and the loop carries on.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 import time
@@ -28,8 +29,11 @@ from engram.vision.intent_vision import (VisionClient, VisionError, classify_han
 
 
 def robot_frame(base: str) -> bytes:
-    with urllib.request.urlopen(base.rstrip("/") + "/robot/frame?annotate=false&quality=85", timeout=5) as r:
-        return r.read()
+    try:
+        with urllib.request.urlopen(base.rstrip("/") + "/robot/frame?annotate=false&quality=85", timeout=5) as r:
+            return r.read()
+    except http.client.HTTPException as e:  # e.g. IncompleteRead: a truncated reply is a failed frame, not a crash
+        raise VisionError(f"robot frame: {type(e).__name__}") from None
 
 
 def webcam_frame(cap) -> bytes:

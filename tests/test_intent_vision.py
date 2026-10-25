@@ -284,3 +284,26 @@ def test_the_cli_exits_nonzero_when_a_file_fails_and_two_without_configuration(t
     assert r.returncode == 1 and '"error"' in r.stdout and KEY not in r.stdout + r.stderr
     r = _cli("hand", "--image", missing)
     assert r.returncode == 2
+
+
+def test_a_truncated_robot_frame_is_a_failed_frame_not_a_crash(monkeypatch):
+    import http.client
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("vision_ask", REPO / "scripts" / "vision_ask.py")
+    va = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(va)
+
+    class Truncated:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"partial", 100)
+
+    monkeypatch.setattr(va.urllib.request, "urlopen", lambda *a, **k: Truncated())
+    with pytest.raises(iv.VisionError):
+        va.robot_frame("http://robot.invalid:8200")
