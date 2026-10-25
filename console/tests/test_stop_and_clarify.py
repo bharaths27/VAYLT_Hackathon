@@ -499,3 +499,38 @@ def test_a_plan_the_console_declined_is_not_staged_later_from_the_pending_list(c
     c.portal.call(main._stage_brain_pending)                    # one pass of the pending loop
     assert PLAN["operation_id"] not in main.engine.ops          # declined once, never staged by another door
     assert "ep_gesture" in main.engine.ops                      # a plan the brain made on its own still shows
+
+
+class SlowToAnswerBrain(FakeBrain):
+    """Answers a command only when the test lets it, and meanwhile lists that command's plan as waiting."""
+
+    def __init__(self, reply):
+        super().__init__(reply)
+        self.asked, self.answer = threading.Event(), threading.Event()
+
+    async def __call__(self, request):
+        if request.url.path == "/commands":
+            self.asked.set()
+            while not self.answer.is_set():
+                await asyncio.sleep(0.01)
+        return super().__call__(request)
+
+
+def test_the_pending_loop_stages_nothing_before_a_command_reply_is_checked(c, on_brain):
+    fake = on_brain(SlowToAnswerBrain({**PLAN, "classification": "unclear", "needs_clarification": True}))
+    fake.pending = [dict(PLAN), {**PLAN, "operation_id": "ep_gesture"}]   # listed before the brain answers
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault(
+        "reply", c.post("/commands", json={"text": "bring sample b to the bench"}).json()))
+    t.start()
+    try:
+        assert fake.asked.wait(5)                               # the command's reply is in flight
+        c.portal.call(main._stage_brain_pending)                # the pending loop polls now
+        assert PLAN["operation_id"] not in main.engine.ops and "ep_gesture" not in main.engine.ops
+    finally:
+        fake.answer.set()
+        t.join(10)
+    assert out["reply"]["kind"] == "clarify"                    # checked: declined
+    c.portal.call(main._stage_brain_pending)                    # the next poll
+    assert PLAN["operation_id"] not in main.engine.ops          # never staged
+    assert "ep_gesture" in main.engine.ops                      # a plan the brain made on its own shows now

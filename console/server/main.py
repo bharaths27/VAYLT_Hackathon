@@ -442,6 +442,7 @@ async def _fire_later(task: dict, delay: float):
 
 
 _declined_brain_plans: set[str] = set()  # brain plans a command's reply did not state understood
+_brain_replies_unchecked = 0  # brain commands sent whose reply is not checked yet
 
 
 def _brain_understood(p: dict) -> bool:
@@ -451,7 +452,18 @@ def _brain_understood(p: dict) -> bool:
 
 
 async def _brain_command(text: str, source: str, t0: float) -> dict:
-    """EC08: Bharath's brain plans; the console shows it and relays the human approval."""
+    """EC08: Bharath's brain plans; the console shows it and relays the human approval. Until the reply is checked,
+    the pending loop stages nothing: the brain may list this command's plan as waiting before it answers, and only
+    the checked reply decides whether that plan is staged or declined."""
+    global _brain_replies_unchecked
+    _brain_replies_unchecked += 1
+    try:
+        return await _brain_reply(text, source, t0)
+    finally:
+        _brain_replies_unchecked -= 1
+
+
+async def _brain_reply(text: str, source: str, t0: float) -> dict:
     try:
         p = await brain.command(text)
     except Exception as e:  # noqa: BLE001
@@ -504,8 +516,11 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
 
 async def _stage_brain_pending() -> None:
     """Show each new plan the brain lists as waiting (gestures, fired triggers) for approval. Not one the console
-    declined when a command's reply brought it: the brain did not state it understood it, so it is never staged."""
+    declined when a command's reply brought it: the brain did not state it understood it, so it is never staged.
+    And nothing while a command's reply is not checked yet: the next pass shows what is still waiting then."""
     for p in await brain.pending():
+        if _brain_replies_unchecked:  # a command's plan may be in this list: its reply decides, never this loop
+            return
         oid = p.get("operation_id")
         if oid and oid not in engine.ops and oid not in _declined_brain_plans and p.get("digest"):
             try:
