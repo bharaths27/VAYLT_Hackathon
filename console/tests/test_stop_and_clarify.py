@@ -401,3 +401,17 @@ def test_a_brain_too_slow_to_say_what_runs_counts_as_running(c, on_brain, monkey
     j = c.post("/commands", json={"text": "bring the thing"}).json()
     assert j["kind"] == "clarify" and j["stopped"] is True and main.engine.stopped
     assert time.monotonic() - t0 < 0.9                       # it stopped without waiting for the slow answer
+
+
+def test_a_brain_plan_aborted_for_an_unknown_outcome_still_needs_verification(c, on_brain):
+    class UnknownBrain(RunningBrain):
+        async def __call__(self, request):
+            if request.url.path.endswith("/approve"):           # aborted, but not by a stop: a person must check
+                return httpx.Response(200, json={"operation_id": "ep_run", "outcome": "aborted", "stopped": False,
+                                                 "failure": "pick_tagged_object outcome unknown", "steps": []})
+            return await super().__call__(request)
+
+    on_brain(UnknownBrain())
+    op = c.post("/commands", json={"text": "bring sample b to the bench"}).json()["operation"]
+    assert c.post(f"/operations/{op['id']}/approve", json={"digest": op["digest"]}).status_code == 200
+    assert wait(c, op["id"])["status"] == "NEEDS_VERIFICATION"
