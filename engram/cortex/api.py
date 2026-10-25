@@ -193,8 +193,10 @@ def env_token() -> str:
     return Path(path).read_text(encoding='utf-8').strip() if path else os.environ.get('CORTEX_API_TOKEN','')
 
 def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:FrameHub|None=None,
-               start_idle:bool|None=None,sensor_tokens:dict[str,str]|None=None)->FastAPI:
+               start_idle:bool|None=None,sensor_tokens:dict[str,str]|None=None,admins:set[str]|None=None)->FastAPI:
     supplied=brain is not None
+    # Operators who may revoke, delete or revise any operator's source: explicit, none by default (CORTEX_ADMINS).
+    admins=set(admins) if admins is not None else {p.strip() for p in os.environ.get('CORTEX_ADMINS','').split(',') if p.strip()}
     keys=tokens if tokens is not None else {env_token():os.environ.get('CORTEX_OPERATOR','operator')}
     if not keys or any(len(k)<32 or not v.strip() for k,v in keys.items()):
         raise Denied('configure a random server-side CORTEX_API_TOKEN of at least 32 characters')
@@ -264,13 +266,20 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.post('/memory/sources')
     def teach(body:Source,principal=Depends(operator)):
         if body.kind=='future':raise Denied('the "future" kind is reserved for commitments; schedule one with POST /prospective')
+        if body.supersedes:own_source(body.supersedes,principal)      # a revision retires the old source: its owner's act
         with b.activity.foreground():return b.store.teach(body.title,body.text,owner=principal,**body.model_dump(exclude={'title','text'}))
+    def own_source(sid,principal):
+        """A source is revoked, deleted or revised by its owner, or by an explicitly configured administrator; another
+        operator's source (a commitment included) is refused."""
+        if b.store.source_state(sid)['origin']!=principal and principal not in admins:raise Denied('the source belongs to another operator')
     @app.post('/memory/sources/{sid}/revoke')
     def revoke(sid:str,principal=Depends(operator)):
+        own_source(sid,principal)
         with b.activity.foreground():b.store.revoke_source(sid)
         return {'source_id':sid,'status':'revoked'}
     @app.delete('/memory/sources/{sid}')
     def delete(sid:str,principal=Depends(operator)):
+        own_source(sid,principal)
         with b.activity.foreground():b.store.revoke_source(sid,delete=True)
         return {'source_id':sid,'status':'deleted'}
     @app.post('/memory/rules/{aid}/resolve')
@@ -355,19 +364,24 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.get('/skills')
     def skills(principal=Depends(operator)):return [s for s in b.skills.list() if b.store.visible(s['definition'].get('refs',[]),principal)]
     @app.get('/skills/{sid}')
-    def get_skill(sid:str,principal=Depends(operator)):
+    def get_skill(sid:str,principal=Depends(operator)):return seen_skill(sid,principal)
+    def seen_skill(sid,principal):
+        """A procedure this principal may see; one hidden from them (built on another's commitment or episode) is, for
+        reading, testing, approving and revoking alike, not there."""
         s=b.skills.get(sid)
         if not b.store.visible(s['definition'].get('refs',[]),principal):raise Missing('skill not found in the Cortex registry')
         return s
     @app.post('/skills/{sid}/test')
     def test_skill(sid:str,principal=Depends(operator)):
+        seen_skill(sid,principal)
         with b.activity.foreground():return b.skills.test(sid)
     @app.post('/skills/{sid}/approve')
     def approve_skill(sid:str,body:Decision,principal=Depends(operator)):
+        seen_skill(sid,principal)
         return b.skills.approve(sid,body.digest,principal=principal)
     @app.post('/skills/{sid}/revoke')
     def revoke_skill(sid:str,principal=Depends(operator)):
-        b.skills.revoke(sid);return {'id':sid,'status':'REVOKED'}
+        seen_skill(sid,principal);b.skills.revoke(sid);return {'id':sid,'status':'REVOKED'}
     @app.get('/prospective')
     def tasks(principal=Depends(operator)):
         return b.store.rows('SELECT p.* FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE c.owner=? ORDER BY p.created_at',(principal,))

@@ -64,13 +64,13 @@ def published(arena,clock):
     yield b
     b.close()
 
-def commitment_skill(b):
-    """Alice's commitment wakes into a proposal; with auto-publish its procedure is approved, citing her commitment."""
+def commitment_skill(b,status='APPROVED'):
+    """Alice's commitment wakes into a proposal; its procedure cites her commitment (approved under auto-publish)."""
     b.schedule('the tray arrives','bring Sample A to the bench',principal='alice')
     assert b.trigger('the tray arrives',event_id='ev1',principal='alice')[0]['proposal']['status']=='proposed'
     fsid=b.store.one("SELECT id FROM source WHERE kind='future'")['id']
     skill=next(s for s in b.skills.list() if 'source:'+fsid in s['definition']['refs'])
-    assert skill['status']=='APPROVED'
+    assert skill['status']==status
     return skill,fsid
 
 def test_a_procedure_built_on_a_commitment_stays_out_of_others_bundles_and_recall(published):
@@ -95,3 +95,42 @@ def test_a_commitment_never_becomes_a_shared_source_by_adoption(brain):
     brain.schedule('the tray arrives','bring Sample A to the bench',principal='alice')
     fsid=brain.store.one("SELECT id FROM source WHERE kind='future'")['id']
     with pytest.raises(Conflict,match='not a legacy source'): brain.store.adopt_legacy_source(fsid,owner='bob')
+
+
+# P2-5: a source is revoked, deleted or revised by its owner (or a configured administrator); a hidden procedure is not
+# there for testing, approving or revoking either.
+from fastapi.testclient import TestClient
+from engram.cortex.api import create_app
+from .test_fix_luna_r7 import TA,TB
+TC='synthetic-test-operator-token-for-carol-0123'
+def h(token): return {'Authorization':'Bearer '+token}
+
+def owned_sources(brain,c):
+    sid=c.post('/memory/sources',json={'title':'Note','text':'The tray is on the bench.'},headers=h(TA)).json()['source_id']
+    brain.schedule('the bell rings','bring Sample A to the bench',principal='alice')
+    return sid,brain.store.one("SELECT id FROM source WHERE kind='future'")['id']
+
+def test_another_operators_source_cannot_be_revoked_deleted_or_revised(brain):
+    with TestClient(create_app(brain,tokens={TA:'alice',TB:'bob'},start_idle=False)) as c:
+        sid,fsid=owned_sources(brain,c)
+        for s in (sid,fsid):
+            assert c.post(f'/memory/sources/{s}/revoke',headers=h(TB)).status_code==403                     # was: revoked
+            assert c.delete(f'/memory/sources/{s}',headers=h(TB)).status_code==403                          # was: deleted
+        assert c.post('/memory/sources',json={'title':'Mine','text':'The tray is on shelf B.','supersedes':sid},headers=h(TB)).status_code==403
+        assert brain.store.source_state(sid)['status']=='accepted' and brain.store.source_state(fsid)['status']=='accepted'
+        assert c.post(f'/memory/sources/{sid}/revoke',headers=h(TA)).status_code==200                       # its owner may
+
+def test_a_configured_administrator_may_revoke_any_source(brain):
+    with TestClient(create_app(brain,tokens={TA:'alice',TC:'carol'},admins={'carol'},start_idle=False)) as c:
+        sid,fsid=owned_sources(brain,c)
+        assert c.post(f'/memory/sources/{sid}/revoke',headers=h(TC)).status_code==200
+        assert c.delete(f'/memory/sources/{fsid}',headers=h(TC)).status_code==200
+
+def test_a_hidden_procedure_cannot_be_tested_approved_or_revoked_by_another(brain):
+    skill,_=commitment_skill(brain,'TESTED')                                                   # awaiting approval
+    with TestClient(create_app(brain,tokens={TA:'alice',TB:'bob'},start_idle=False)) as c:
+        assert c.post(f"/skills/{skill['id']}/test",headers=h(TB)).status_code in (404,409)                 # was: tested
+        assert c.post(f"/skills/{skill['id']}/approve",json={'digest':skill['digest']},headers=h(TB)).status_code in (404,409)   # was: approved
+        assert c.post(f"/skills/{skill['id']}/revoke",headers=h(TB)).status_code in (404,409)               # was: revoked
+        assert brain.skills.get(skill['id'])['status']=='TESTED'
+        assert c.post(f"/skills/{skill['id']}/approve",json={'digest':skill['digest']},headers=h(TA)).status_code==200   # hers
