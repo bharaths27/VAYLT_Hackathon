@@ -7,6 +7,7 @@ from __future__ import annotations
 import collections
 import copy
 import json
+import math
 import threading
 import time
 from contextlib import contextmanager
@@ -205,6 +206,25 @@ class Dreamer:
         # Real model-call cap: at most N idle model calls per rolling window (default N =
         # policy.max_model_calls_per_dream), plus no repeat of an input already answered.
         self.model_window_s=model_window_s; self.model_calls_per_window=model_calls_per_window
+
+    @property
+    def model_window_s(self) -> float: return self._model_window_s
+
+    @model_window_s.setter
+    def model_window_s(self, value):
+        # A zero or NaN window counts no past call at all, so a cap would never bind: only a positive finite one.
+        if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0:
+            raise CortexError('the idle model-call window must be a positive, finite number of seconds')
+        self._model_window_s=float(value)
+
+    @property
+    def model_calls_per_window(self) -> int | None: return self._model_calls_per_window
+
+    @model_calls_per_window.setter
+    def model_calls_per_window(self, value):
+        if value is not None and (isinstance(value,bool) or not isinstance(value,int) or value<0):
+            raise CortexError('the idle model-call cap must be an integer of at least 0 (None: the policy cap)')
+        self._model_calls_per_window=value
 
     def _model_state(self) -> dict:
         """Vault-persisted model bookkeeping, so a restart neither resets the call cap nor forgets pending input:

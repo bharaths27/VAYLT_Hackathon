@@ -230,3 +230,25 @@ def test_an_idle_answer_interrupted_while_it_is_kept_stays_pending_and_is_asked_
     second=b.dreamer.cycle(force=True)
     assert stub.calls==2 and hypotheses()==1 and not second['model_pending'],second         # asked again, kept whole
     b.close()
+
+
+# P3-8: the idle model-call window is a positive finite number of seconds and the cap an integer >= 0, set any way.
+from engram.cortex.learning import Activity,Dreamer,Skills
+@pytest.mark.parametrize('window',[0,-1,float('nan'),float('inf'),'600',True,None])
+def test_an_idle_model_call_window_that_would_never_bind_is_refused(store,window):
+    with pytest.raises(CortexError,match='window'): Dreamer(store,Skills(store),Activity(),model_window_s=window)   # was: kept
+    d=Dreamer(store,Skills(store),Activity())
+    with pytest.raises(CortexError,match='window'): d.model_window_s=window
+    assert d.model_window_s==600
+
+@pytest.mark.parametrize('cap',[-1,1.5,'1',True])
+def test_an_idle_model_call_cap_that_is_no_count_is_refused(store,cap):
+    with pytest.raises(CortexError,match='cap'): Dreamer(store,Skills(store),Activity(),model_calls_per_window=cap)
+    d=Dreamer(store,Skills(store),Activity(),model_calls_per_window=1)
+    with pytest.raises(CortexError,match='cap'): d.model_calls_per_window=cap
+    assert d.model_calls_per_window==1
+
+def test_guard_valid_windows_and_caps_are_kept(store):
+    d=Dreamer(store,Skills(store),Activity(),model_window_s=0.5,model_calls_per_window=0)
+    assert (d.model_window_s,d.model_calls_per_window,d._model_cap())==(0.5,0,0)
+    d.model_calls_per_window=None;assert d._model_cap()==store.policy.max_model_calls_per_dream
