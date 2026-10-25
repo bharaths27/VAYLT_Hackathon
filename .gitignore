@@ -6,7 +6,10 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
-models/
+# Model weights at the repo root only. A bare "models/" also hid Verna's 3D rover
+# (console/frontend/public/models/) when her console was imported; console/.gitignore covers
+# the console's own weight files.
+/models/
 .DS_Store
 offline/
 wheels/
@@ -14,3 +17,9 @@ engram_robot/robot.env
 engram_robot/**/*.env
 engram_robot/voice/certs/
 engram_robot/robot_journal.jsonl
+# Brian's robot code lives in robot/engram_robot/: keep its secrets, certificates and journal out
+# of git wherever a copy sits (the root-relative patterns above only match engram_robot/ at the top).
+**/engram_robot/robot.env
+**/engram_robot/**/*.env
+**/engram_robot/voice/certs/
+**/robot_journal.jsonl
