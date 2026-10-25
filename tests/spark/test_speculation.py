@@ -77,6 +77,43 @@ def test_final_equal_to_prepared_text_reuses_the_prediction(fake, spawn, clock):
     assert len(fake.calls) == 1 and gate.stats.requests == 1 and gate.stats.reused == 1
 
 
+def test_a_below_threshold_partial_answer_is_asked_again_at_the_final(spawn, clock):
+    # Measured on the real model: "Look around." scored 0.47 as a partial and 0.63-0.66 as a final.
+    calls = []
+
+    def model(text, partial):
+        calls.append((text, partial))
+        return decision("look_around", confidence=0.47 if partial else 0.65)
+
+    gate = make_gate(model, spawn, clock)
+    gate.on_partial(1, 0, "Look around.")
+    spawn.run_all()
+    assert gate.prepared() is None                      # below threshold: nothing prepared
+    r = gate.on_final(1, 1, "Look around.")
+    assert r.action == "propose" and r.preset == "look_around" and not r.reused
+    assert calls == [("Look around.", True), ("Look around.", False)]   # exactly one extra call
+    assert gate.stats.reused == 0
+
+
+@pytest.mark.parametrize("partial_answer", [
+    decision(None, confidence=0.9),                          # nothing to do
+    decision("open_gripper", ready=0.2),                     # not ready yet
+    decision("open_gripper", directed=0.2),                  # not addressed to the robot
+], ids=["no preset", "not ready", "not directed"])
+def test_no_action_partial_answers_are_never_reused(spawn, clock, partial_answer):
+    calls = []
+
+    def model(text, partial):
+        calls.append(partial)
+        return partial_answer if partial else decision("open_gripper")
+
+    gate = make_gate(model, spawn, clock)
+    gate.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    assert gate.on_final(1, 1, "Open the claw").action == "propose"
+    assert calls == [True, False]
+
+
 def test_final_that_differs_is_classified_as_a_final(fake, spawn, clock):
     gate = make_gate(fake, spawn, clock)
     gate.on_partial(1, 0, "Open the")

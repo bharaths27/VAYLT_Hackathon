@@ -10,8 +10,10 @@ The SpeculationGate enforces these rules:
    expired. It is checked again, against a freshly read context, whenever it is used.
 3. At most ONE intent request is in flight. Newer partials overwrite a single pending slot
    (newest wins); there is no queue.
-4. on_final reuses a still-valid prediction whose text equals the final text, so the same
-   text is never sent twice; otherwise it classifies the final text.
+4. on_final reuses a still-valid, ACTIONABLE prediction whose text equals the final text, so
+   a ready preset costs no second request. Anything else (no prediction, a stale one, or a
+   partial answer below threshold or with nothing to do) is asked again as a final: the model
+   was told the speech was unfinished, and may well answer differently once it is not.
 5. A final that negates ("don't"), defers ("after calibration finishes") or corrects ("no,
    I mean") never becomes an immediate action. Negation and correction mean no action; a
    deferral becomes a "When <event>, <task>" commitment for the existing prospective path, or
@@ -277,6 +279,10 @@ class SpeculationGate:
             if not text:
                 return GateResult("none", utterance, revision, text, reason="I didn't catch anything.")
             pred = self._pred if self._pred and self._current(self._pred.key) else None
+            # Reuse only an ACTIONABLE answer. A partial answer below threshold (or with nothing to do) was
+            # given while the model was told the speech was unfinished; the final is asked again, once.
+            if pred and not self._actionable(pred.key.text, pred.decision):
+                pred = None
             if pred and self._clock() >= pred.key.expires_at:
                 self.stats.expired += 1
                 pred = None
