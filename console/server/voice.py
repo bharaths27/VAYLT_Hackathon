@@ -335,21 +335,26 @@ def whisper_server_endpoint() -> str | None:
 # fmt chunk of the one format whisper.cpp reads as-is: (format tag 1 = PCM, 1 channel, 16000 Hz,
 # 2-byte blocks, 16 bits per sample).
 _NATIVE_FMT = (1, 1, 16000, 2, 16)
+_EXTENSIBLE = 0xFFFE
+_PCM_SUBTYPE = bytes.fromhex("0100000000001000800000aa00389b71")  # KSDATAFORMAT_SUBTYPE_PCM
 
 
 def _native_data(path: Path) -> tuple[int, int, bool] | None:
-    """(offset, size, exact) of the audio in the data chunk if the file is in the format
-    whisper.cpp reads: a RIFF/WAVE file whose fmt chunk says PCM (tag 1), 16 bits per sample,
-    1 channel, 16000 Hz. Else None, and the clip goes through ffmpeg. The fmt chunk is read here
-    directly, with small bounded reads: the wave module only reports whole bytes per sample, so
-    12-bit audio in 2-byte samples would pass it. WAVE_FORMAT_EXTENSIBLE (and anything else) is
-    not native. Judged from the bytes, not the name.
+    """(offset, size, exact) of the audio in the data chunk if the file holds the audio
+    whisper.cpp reads: a RIFF/WAVE file whose fmt chunk says PCM, 16 bits per sample, 1 channel,
+    16000 Hz. Else None, and the clip goes through ffmpeg. The fmt chunk is read here directly,
+    with small bounded reads (at most 40 bytes of it): the wave module only reports whole bytes
+    per sample, so 12-bit audio in 2-byte samples would pass it. PCM means format tag 1, or
+    WAVE_FORMAT_EXTENSIBLE with cbSize >= 22, 16 valid bits and the PCM subtype GUID; any
+    other extensible layout (fewer valid bits, a float subtype, a short extension) is not
+    native. Judged from the bytes, not the name.
 
     size counts only whole samples actually in the file. exact is True only when the header
     says exactly that: the RIFF size is the file size - 8, the data chunk's declared size is
     that size, and the data chunk ends the file (nothing after it, so no second data chunk). A
     file that is not exact (a streaming size like 0xFFFFFFFF, a RIFF size that disagrees, odd or
-    trailing bytes) must not reach whisper as it is: a reader may trust the declared sizes."""
+    trailing bytes) must not reach whisper as it is: a reader may trust the declared sizes. An
+    extensible file is never exact either, so whisper always gets it as a plain tag-1 WAV."""
     try:
         with open(path, "rb") as f:
             file_size = os.fstat(f.fileno()).st_size
@@ -357,25 +362,31 @@ def _native_data(path: Path) -> tuple[int, int, bool] | None:
             if len(head) < 12 or head[:4] != b"RIFF" or head[8:] != b"WAVE":
                 return None
             riff_size = int.from_bytes(head[4:8], "little")
-            fmt = None
+            fmt, extensible = None, False
             for _ in range(64):  # a bounded walk over the chunks
                 chunk = f.read(8)
                 if len(chunk) < 8:
                     return None
                 cid, size = chunk[:4], int.from_bytes(chunk[4:], "little")
                 if cid == b"fmt ":
-                    body = f.read(16)
+                    body = f.read(min(size, 40))
                     if size < 16 or len(body) < 16:
                         return None
-                    tag, channels, rate, _byte_rate, align, bits = struct.unpack("<HHIIHH", body)
+                    tag, channels, rate, _byte_rate, align, bits = struct.unpack("<HHIIHH", body[:16])
+                    extensible = tag == _EXTENSIBLE
+                    if extensible:  # PCM only with the full extension, all 16 bits valid, PCM subtype
+                        cb_size, valid_bits = struct.unpack("<HH", body[16:20]) if len(body) == 40 else (0, 0)
+                        pcm = cb_size >= 22 and valid_bits == 16 and body[24:40] == _PCM_SUBTYPE
+                        tag = 1 if pcm else None
                     fmt = (tag, channels, rate, align, bits)
-                    f.seek(size - 16 + (size & 1), os.SEEK_CUR)
+                    f.seek(size - len(body) + (size & 1), os.SEEK_CUR)
                 elif cid == b"data":
                     if fmt != _NATIVE_FMT:  # also None: data before any fmt chunk
                         return None
                     offset = f.tell()
                     present = min(size, file_size - offset) // 2 * 2
-                    exact = riff_size == file_size - 8 and size == present and offset + present == file_size
+                    exact = (not extensible and riff_size == file_size - 8 and size == present
+                             and offset + present == file_size)
                     return offset, present, exact
                 else:
                     f.seek(size + (size & 1), os.SEEK_CUR)  # chunks are padded to even sizes

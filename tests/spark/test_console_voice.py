@@ -1215,8 +1215,16 @@ PLAIN_HEADER_1S = (b"RIFF" + struct.pack("<I", 36 + 32000) + b"WAVE" + b"fmt "
 PLAIN_1S = PLAIN_HEADER_1S + PCM_1S
 
 
-# WAVE_FORMAT_EXTENSIBLE: cbSize 22, 16 valid bits, front-centre, KSDATAFORMAT_SUBTYPE_PCM
-EXTENSIBLE = fmt(tag=0xFFFE, extra=struct.pack("<HHI", 22, 16, 4) + bytes.fromhex("0100000000001000800000aa00389b71"))
+PCM_GUID = bytes.fromhex("0100000000001000800000aa00389b71")  # KSDATAFORMAT_SUBTYPE_PCM
+FLOAT_GUID = bytes.fromhex("0300000000001000800000aa00389b71")  # KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+
+
+def extensible(valid_bits=16, subtype=PCM_GUID, cb_size=22):
+    """A WAVE_FORMAT_EXTENSIBLE fmt chunk for 16 kHz mono in 16-bit containers (front-centre)."""
+    return fmt(tag=0xFFFE, extra=struct.pack("<HHI", cb_size, valid_bits, 4) + subtype)
+
+
+EXTENSIBLE = extensible()  # cbSize 22, 16 valid bits, PCM subtype: native audio
 
 
 def test_12_bit_audio_in_2_byte_samples_is_converted(stt, tmp_path):
@@ -1233,17 +1241,65 @@ def test_12_bit_audio_in_2_byte_samples_is_converted(stt, tmp_path):
 
 
 @pytest.mark.parametrize("audio", [
-    riff(EXTENSIBLE, (b"data", PCM_1S)),  # extensible, even with 16 valid bits of PCM: ffmpeg's job
+    riff(extensible(valid_bits=12), (b"data", PCM_1S)),  # 12 valid bits in 16-bit containers
+    riff(extensible(subtype=FLOAT_GUID), (b"data", PCM_1S)),  # float, not PCM
+    riff(extensible(cb_size=0), (b"data", PCM_1S)),  # cbSize says there is no extension
+    riff(fmt(tag=0xFFFE, extra=b"\x00\x00"), (b"data", PCM_1S)),  # an 18-byte fmt chunk: none at all
     riff(fmt(tag=3, align=4, bits=32), (b"data", PCM_1S)),  # 32-bit float
     riff(fmt(align=4), (b"data", PCM_1S)),  # block size disagrees with 16-bit mono
     riff((b"data", PCM_1S), fmt()),  # data before any fmt chunk
     riff((b"fmt ", b"\x01\x00\x01\x00"), (b"data", PCM_1S)),  # fmt chunk too short
     riff(fmt()),  # no data chunk
     b"RIFX" + riff(fmt(), (b"data", PCM_1S))[4:],  # big-endian RIFF
-], ids=["extensible", "float", "block-align", "data-first", "short-fmt", "no-data", "rifx"])
+], ids=["extensible-12-valid-bits", "extensible-float-subtype", "extensible-cbsize-0", "extensible-short-fmt",
+        "float", "block-align", "data-first", "short-fmt", "no-data", "rifx"])
 def test_wavs_that_are_not_plain_16_bit_pcm_are_converted(stt, audio):
     assert run(voice.transcribe(audio, ".wav"))[0] == "pick up the beaker"
     assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw == CONVERTED
+
+
+@pytest.mark.parametrize("ffmpeg", ["installed", "absent"])
+def test_extensible_pcm_16_is_native_and_reaches_whisper_as_a_plain_wav(stt, tmp_path, ffmpeg):
+    if ffmpeg == "absent":
+        stt.installed.clear()
+    clip = riff(EXTENSIBLE, (b"data", PCM_1S))
+    path = tmp_path / "extensible.wav"
+    path.write_bytes(clip)
+    assert voice._native_data(path) == (68, 32000, False)  # native audio, never sent as it is
+    details = {}
+    assert run(voice.transcribe(clip, ".wav", details=details))[0] == "pick up the beaker"
+    assert details == {"conversion": "native-stripped"} and stt.tools() == ["whisper-cli"]  # no ffmpeg
+    assert stt.whisper_saw[:44] == PLAIN_HEADER_1S and stt.whisper_saw == PLAIN_1S  # tag 1, true sizes
+
+
+def test_the_fmt_chunk_is_read_bounded_whatever_size_it_declares(monkeypatch, tmp_path):
+    clip = riff(fmt(), (b"data", PCM_1S))
+    path = tmp_path / "huge-fmt.wav"
+    path.write_bytes(clip[:16] + struct.pack("<I", 0x7FFFFFF0) + clip[20:])  # fmt chunk "is" 2 GB
+    reads = []
+
+    class Watched:
+        def __init__(self, f):
+            self.f = f
+
+        def read(self, n=-1):
+            reads.append(n)
+            if not 0 < n <= 64 * 1024:
+                raise AssertionError(f"unbounded read of {n} bytes")
+            return self.f.read(n)
+
+        def __getattr__(self, name):
+            return getattr(self.f, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.f.__exit__(*exc)
+
+    monkeypatch.setattr(voice, "open", lambda *a, **k: Watched(open(*a, **k)), raising=False)
+    assert voice._native_data(path) is None  # its data chunk is never reached: not native
+    assert reads and max(reads) <= 40  # header-sized reads only
 
 
 def test_plain_16_bit_pcm_still_skips_ffmpeg_around_other_chunks(stt):
