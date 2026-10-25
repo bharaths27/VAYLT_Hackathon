@@ -9,7 +9,10 @@
 # Nothing is lost: the commit the Pi was on is kept as branch pre-cds-<stamp>; uncommitted work on the Pi is saved to a
 # branch pi-local-<stamp> AND a patch file in ~/cds-backup/<stamp>/ first; ignored files where the new branch has a
 # file (checkout would replace them) are copied to ~/cds-backup/<stamp>/ignored-files.tgz.
-# Other ignored files (.venv, console/.venv, console/models, console/certs, engram.db, ~/engram_robot) are never touched.
+# The venvs (.venv, console/.venv) get the branch's requirements; each one's package list is saved first
+# (~/cds-backup/<stamp>/brain-packages.txt, console-packages.txt), and the undo runs packages-undo.sh from there:
+# the old versions back, then whatever the update added removed.
+# Other ignored files (console/models, console/certs, engram.db, ~/engram_robot) are never touched.
 # Undo: the last line it prints says exactly how to go back (also kept in ~/cds-backup/<stamp>/UNDO.txt).
 set -euo pipefail
 HUB=${ENGRAM_HUB:-$HOME/engram_hub}
@@ -70,10 +73,24 @@ echo "cd $HUB && $undo" > "$BACKUP/UNDO.txt"
 git checkout -B "$BRANCH" "carter/$BRANCH"
 echo "switched to $BRANCH at $(git rev-parse --short HEAD)"
 
-# 4. Python packages (needs internet; skipped with a warning when offline, the old ones usually still work)
+# 4. Python packages (needs internet; skipped with a warning when offline, the old ones usually still work).
+#    Each venv's packages are listed first (pip freeze); the undo puts exactly that list back (packages-undo.sh).
+packages() { # venv, requirements file, name
+  local list=$BACKUP/$3-packages.txt fix=$BACKUP/packages-undo.sh
+  [ -x "$1/bin/pip" ] || { echo "WARNING: no $1; $3 packages not updated"; return 0; }
+  "$1/bin/pip" freeze > "$list" || { echo "WARNING: could not list the $3 packages; not updated"; return 0; }
+  if [ ! -f "$fix" ]; then   # the undo's last step: the old versions back, then remove what the update added
+    printf '#!/usr/bin/env bash\n# put the venvs back as they were before the update of %s\nset -e\ncd %q\n' "$STAMP" "$HUB" > "$fix"
+    undo="$undo && bash $fix"
+  fi
+  printf '%q/bin/pip install -q -r %q\n%q/bin/pip freeze | grep -vxFf %q | sed "s/[ =@].*//" | xargs -r %q/bin/pip uninstall -q -y\n' \
+    "$1" "$list" "$1" "$list" "$1" >> "$fix"
+  echo "cd $HUB && $undo" > "$BACKUP/UNDO.txt"   # before installing, so the undo is right even if pip stops halfway
+  "$1/bin/pip" install -q -r "$2" || echo "WARNING: $3 packages not updated"
+}
 if curl -fsI -m 5 -o /dev/null https://pypi.org/simple/pip/; then   # headers only; the full index is 48 MB
-  [ -x .venv/bin/pip ] && .venv/bin/pip install -q -r requirements.txt || echo "WARNING: brain packages not updated"
-  [ -x console/.venv/bin/pip ] && console/.venv/bin/pip install -q -r console/requirements.txt || echo "WARNING: console packages not updated"
+  packages .venv requirements.txt brain
+  packages console/.venv console/requirements.txt console
 else
   echo "WARNING: no internet; packages not updated (fine unless a service fails to start)"
 fi
