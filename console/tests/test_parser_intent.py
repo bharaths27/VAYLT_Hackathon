@@ -58,6 +58,29 @@ FUTURE = [
     "Open the claw at five o'clock.", "Open the claw at noon.", "Drive forward 10 cm by 5 pm.",
     "In 2 days, open the claw.", "In 3 hours, close the claw.", "In an hour, open the claw.",
     "Tomorrow, open the claw.", "Next week, bring the vial to zone B.", "At 5 pm, open the claw.",
+    # Review round 3: plural/singular units, vague quantities, and deferral words.
+    "Open the claw in a few moments.", "Open the claw in a couple of minutes.", "Open the claw in a moment.",
+    "Open the claw in a sec.", "Open the claw in 2 hrs.", "Open the claw in several days.",
+    "Open the claw in 30 secs.", "Open the claw afterwards.", "Open the claw after that.",
+    "Open the claw soon.", "Open the claw shortly.", "Open the claw eventually.",
+    "Open the claw before calibration.", "Open the claw until the vial arrives.",
+    # "then" makes a sequence: the console plans one action per command, so the rest would be dropped
+    # or run out of order ("close the claw then open it" planned only the close).
+    "Then open the claw.", "Close the claw, then open it.",
+    "Open the claw this week.", "Open the claw every day.", "Open the claw at that point.",
+    "Open the claw at the end of calibration.",
+    # Conditions and durations are the same class: the command would run now, not when or for as long as said.
+    "If the vial is on the bench, open the claw.", "Open the claw while the arm moves.",
+    "Open the claw during calibration.", "Open the claw every 5 minutes.", "Open the claw for 10 seconds.",
+    "Drive forward for 2 minutes.", "Open the claw for a minute.", "Open the claw around 5.",
+    "Open the claw within the hour.", "Open the claw at half past five.",
+]
+
+# Fail-closed: after in/at/by/on/within/next, a clause that is not recognizably a place asks too.
+FAIL_CLOSED = [
+    "Open the claw in a jiffy.", "Open the claw at once.", "Open the claw at 5.", "Open the claw at five.",
+    "Open the claw by then.", "Open the claw on my signal.", "Open the claw on cue.", "Open the claw in due course.",
+    "Open the claw in time.", "Open the claw next.", "Put the vial in a box.",
 ]
 
 # The leading "In N seconds/minutes, <task>" form schedules only a plan. Anything else the inner task
@@ -88,6 +111,20 @@ STILL_WORKS = [
     ("In 2 minutes, bring the red cup to zone B.", "prospective", "search_tag"),
     ("In five minutes, open the claw.", "prospective", "gripper_open"),
     ("Bring the cup next to the vial to zone B.", "plan", "search_tag"),
+    # Places after in/at/on/next are consumed by the grammar, not mistaken for time.
+    ("Put the red cup in zone A.", "plan", "search_tag"),  # "the cup" alone is not a known object here
+    ("Put the vial on the calibration bench.", "plan", "search_tag"),
+    ("Bring the vial to zone B in the bin.", "plan", "search_tag"),
+    ("Find the vial on the sample shelf.", "plan", "detect_tag"),
+    ("Look at the vial.", "plan", "observe"),
+    ("Look at tag 5.", "plan", "observe"),
+    ("What's in front of you?", "plan", "observe"),
+    ("Drive forward 4 in.", "plan", "drive_bounded"),  # "in" is the inch unit here
+    ("Turn left 90 degrees in place.", "plan", "turn_bounded"),
+    ("Drive forward by 10 cm.", "plan", "drive_bounded"),  # a distance after "by" is not a time
+    ("Turn around.", "plan", "turn_bounded"),
+    ("Turn around now.", "plan", "turn_bounded"),  # "turn around" is the turn primitive, not "around <time>"
+    ("Put the cup in zone A.", "clarify", None),  # asks which cup ("cup" alone is not in memory), not a deferral
     ("Remember that the vial must never leave zone B.", "rule", None),
     ("From now on, do not drive into zone A.", "rule", None),
 ]
@@ -106,7 +143,7 @@ def test_negated_command_is_refused_not_planned(text):
     assert not r.data.get("llm_eligible"), "the LLM fallback could plan the negated action"
 
 
-@pytest.mark.parametrize("text", FUTURE)
+@pytest.mark.parametrize("text", FUTURE + FAIL_CLOSED)
 def test_future_condition_is_not_run_now(text):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
@@ -123,6 +160,7 @@ def test_prospective_schedules_only_a_plan(text, kind):
 def test_ordinary_commands_still_parse(text, kind, first_op):
     r = parse(text, BUNDLE)
     assert r.kind == kind, (text, r.kind, r.reason, r.trace)
+    assert not any(s.startswith("deferral") for s in r.trace), r.trace
     if first_op:
         assert r.plan.steps[0].op == first_op
 
