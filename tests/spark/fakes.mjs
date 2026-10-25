@@ -10,17 +10,30 @@ export class FakeAudio {
     this.pauseCalls = 0;
     this.loadCalls = 0;
     this.srcRemoved = false;
-    this.onplaying = this.onended = this.onerror = null;
+    this.onplay = this.onplaying = this.onended = this.onerror = null;
+    this.pausedInOnset = null;
     this._settle = null;
   }
-  // play() stays pending until the test settles it. When it resolves the
-  // element starts sounding, even if pause() ran meanwhile (a late play()).
+  // play() stays pending until the test settles it.
   play() {
     return new Promise((resolve, reject) => {
       this._settle = { resolve, reject };
-    }).then(() => { this.paused = false; if (this.onplaying) this.onplaying(); });
+    });
   }
-  resolvePlay() { this._settle.resolve(); }
+  // The browser starts the element, even if pause() ran meanwhile (a late
+  // play()): it sounds, 'play' and 'playing' fire, then the play() promise
+  // resolves. pausedInOnset records whether it was paused synchronously inside
+  // those events, before any promise continuation could run.
+  // events=false: play() resolves with no fresh 'playing' event.
+  resolvePlay({ events = true } = {}) {
+    this.paused = false;
+    if (events) {
+      if (this.onplay) this.onplay();
+      if (this.onplaying) this.onplaying();
+      this.pausedInOnset = this.paused;
+    }
+    this._settle.resolve();
+  }
   rejectPlay(name = "NotAllowedError") { const e = new Error(name); e.name = name; this._settle.reject(e); }
   pause() { this.paused = true; this.pauseCalls++; }
   removeAttribute(name) { if (name === "src") { this.src = ""; this.srcRemoved = true; } }

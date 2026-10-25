@@ -11,7 +11,8 @@ const VOICE_SRC = readFileSync(new URL("console/web/js/voice.js", ROOT), "utf8")
 
 // autoStop=false: a recorder's stop() finishes only when the test calls flush(),
 // like a real MediaRecorder whose onstop fires later.
-function loadVoice({ autoStop = true } = {}) {
+// holdMic=true: getUserMedia() waits (a permission prompt) until mic.grant()/deny().
+function loadVoice({ autoStop = true, holdMic = false } = {}) {
   const h = makeController();
   const log = [];
   const recorders = [];
@@ -21,10 +22,28 @@ function loadVoice({ autoStop = true } = {}) {
   class FakeRecorder {
     static isTypeSupported(t) { return t === "audio/mp4"; }
     constructor(stream, opts) { this.mimeType = opts && opts.mimeType; this.id = recorders.length; recorders.push(this); }
-    start() { log.push("rec.start"); }
-    stop() { log.push("rec.stop"); if (autoStop) this.flush(); }
-    flush() { this.ondataavailable({ data: { size: 4000, from: this.id } }); this.onstop(); }
+    start() { log.push("rec.start"); this.live = true; }
+    stop() { log.push("rec.stop"); this.live = false; if (autoStop) this.flush(); }
+    flush() {
+      if (this.ondataavailable) this.ondataavailable({ data: { size: 4000, from: this.id } });
+      if (this.onstop) this.onstop();
+    }
   }
+  // grant()/deny() answer every request still waiting on the prompt.
+  const waiting = [];
+  const mic = {
+    asks: 0,
+    grant: () => waiting.splice(0).forEach((w) => w.resolve({})),
+    deny: () => waiting.splice(0).forEach((w) => {
+      const e = new Error("Permission denied"); e.name = "NotAllowedError"; w.reject(e);
+    }),
+  };
+  const getUserMedia = () => {
+    log.push("getUserMedia");
+    mic.asks++;
+    if (!holdMic) return Promise.resolve({});
+    return new Promise((resolve, reject) => waiting.push({ resolve, reject }));
+  };
   class FakeFormData {
     constructor() { this.fields = {}; }
     append(k, v) { this.fields[k] = v; }
@@ -32,7 +51,7 @@ function loadVoice({ autoStop = true } = {}) {
   const win = {
     SPEECH: h.ctl,
     isSecureContext: true,
-    navigator: { mediaDevices: { getUserMedia: async () => { log.push("getUserMedia"); return {}; } } },
+    navigator: { mediaDevices: { getUserMedia } },
     MediaRecorder: FakeRecorder,
     FX: { ctx: () => null },
     Blob: class { constructor(parts, o) { this.parts = parts; this.size = 4000; this.type = o.type; } },
@@ -44,7 +63,7 @@ function loadVoice({ autoStop = true } = {}) {
   };
   win.window = win;
   vm.runInNewContext(VOICE_SRC, win);
-  return { V: win.VOICE, h, log, recorders, stt };
+  return { V: win.VOICE, h, log, recorders, stt, mic };
 }
 
 test("push-to-talk start silences the robot before the mic opens", async () => {
@@ -75,6 +94,63 @@ test("speech is held while the user talks, then plays in the current turn", asyn
   h.audios[0].resolvePlay();
   await tick();
   assert.equal(h.audios[0].paused, false);
+});
+
+const liveCount = (recorders) => recorders.filter((r) => r.live).length;
+
+test("a release during the mic permission prompt is latched: nothing records", async () => {
+  const { V, h, recorders, mic } = loadVoice({ holdMic: true });
+  const started = V.startRec(null);
+  assert.equal(V.listening, true);
+  V.cancelStart();                               // app.js micUp: released while the mic was opening
+  assert.equal(V.listening, false);
+  mic.grant();                                   // permission resolves afterwards
+  assert.equal(await started, false);
+  assert.equal(recorders.length, 0, "no recorder ever opened");
+  assert.equal(await V.stopRec(), null);
+  V.say("hello");                                // not stuck listening
+  assert.equal(h.fetch.calls.length, 1);
+});
+
+test("a second press during the prompt replaces the first; one recorder, one mic request", async () => {
+  const { V, recorders, mic } = loadVoice({ holdMic: true });
+  const first = V.startRec(null);                // press A, prompt showing
+  const second = V.startRec(null);               // press B before it resolves
+  const turnB = V.turn();
+  mic.grant();
+  assert.equal(await first, false, "A never records");
+  assert.equal(await second, true);
+  assert.equal(recorders.length, 1);
+  assert.equal(liveCount(recorders), 1);
+  assert.equal(mic.asks, 1, "one permission request");
+  const b = await V.stopRec();
+  assert.equal(b.turn, turnB);
+  assert.equal(V.listening, false);
+});
+
+test("a press while a recorder is still live drops the old recorder first", async () => {
+  const { V, recorders } = loadVoice();
+  await V.startRec(null);                        // A records; its release was lost
+  await V.startRec(null);                        // press B
+  const turnB = V.turn();
+  assert.equal(recorders.length, 2);
+  assert.equal(recorders[0].live, false, "A's recorder was stopped");
+  assert.equal(liveCount(recorders), 1);
+  const b = await V.stopRec();
+  assert.equal(b.turn, turnB);
+  assert.deepEqual([...b.blob.parts].map((p) => p.from), [1], "only B's audio");
+});
+
+test("a denied mic for the current press throws and frees the mic for the next press", async () => {
+  const { V, mic } = loadVoice({ holdMic: true });
+  const started = V.startRec(null);
+  mic.deny();
+  await assert.rejects(started, /Permission denied/);
+  assert.equal(V.listening, false);
+  const again = V.startRec(null);                // the next press asks again
+  assert.equal(mic.asks, 2);
+  mic.grant();
+  assert.equal(await again, true);
 });
 
 // Stands in for app.js runCommand: POST /commands tracked with the given turn.

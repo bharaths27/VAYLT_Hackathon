@@ -68,21 +68,52 @@
   // rec = { mr, chunks, turn } for the recording in progress. Each recording
   // keeps its own chunks and turn, so a new press while the last recorder is
   // still stopping cannot mix the two up.
-  let rec = null, stream = null, analyser = null, raf = 0;
+  // opening = the press whose mic is still opening (the permission prompt can
+  // take seconds). Only that press may start a recorder.
+  let rec = null, opening = null, streamP = null, analyser = null, raf = 0;
 
+  function openStream() {
+    if (!streamP) {
+      streamP = navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      streamP.catch(() => { streamP = null; }); // the next press asks again
+    }
+    return streamP;
+  }
+  // Drop any recorder that is open or opening: never two at once.
+  function discard() {
+    opening = null;
+    cancelAnimationFrame(raf);
+    if (!rec) return;
+    const r = rec;
+    rec = null;
+    r.mr.ondataavailable = r.mr.onstop = null;
+    try { r.mr.stop(); } catch (e) {}
+  }
+
+  // Resolves true once recording, false if the press was released or replaced
+  // by a newer press while the mic was opening (then nothing records).
   V.startRec = async function (waveCanvas) {
     if (!V.micAvailable()) throw new Error(window.isSecureContext ? "MediaRecorder not supported" : "mic needs HTTPS (trusted cert)");
+    discard();
     const turn = V.newTurn();
+    const me = { turn };
+    opening = me;
     V.listening = true;
+    let stream;
     try {
-      stream = stream || await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      stream = await openStream();
+      if (opening !== me) return false; // released or replaced during the prompt
       const type = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find(t => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || "";
       const mr = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
       const chunks = [];
       mr.ondataavailable = e => e.data.size && chunks.push(e.data);
       mr.start();
       rec = { mr, chunks, turn };
-    } catch (err) { V.listening = false; throw err; }
+      opening = null;
+    } catch (err) {
+      if (opening !== me) return false; // a newer press owns the mic and its errors
+      opening = null; V.listening = false; throw err;
+    }
     const ctx = FX.ctx();
     if (ctx && waveCanvas) {
       const src = ctx.createMediaStreamSource(stream);
@@ -90,6 +121,13 @@
       src.connect(analyser);
       drawWave(waveCanvas);
     }
+    return true;
+  };
+  // Release before the mic opened: latch it, so the opening press never records.
+  V.cancelStart = function () {
+    if (!opening) return;
+    opening = null;
+    V.listening = false;
   };
   // Resolves { blob, ext, turn }: turn is the one this recording started.
   V.stopRec = function () {

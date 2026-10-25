@@ -783,12 +783,17 @@
   async function micDown(e) {
     e.preventDefault();
     if (!VOICE.micAvailable()) { FX.toast(window.isSecureContext ? "Recording not supported here. Type instead." : "Mic needs HTTPS with the ENGRAM cert trusted. Typing still works.", "amber"); return; }
-    // startRec silences the robot (new speech turn) before the mic opens.
-    try { await VOICE.startRec($("#wave")); recOn = true; mic.classList.add("rec"); FX.play("rec"); $("#cmd-hint").textContent = "listening… release to send"; }
+    // startRec silences the robot (new speech turn) and drops any older recorder
+    // before the mic opens. It resolves false if released or replaced meanwhile.
+    recOn = false; mic.classList.remove("rec");
+    try {
+      if (!(await VOICE.startRec($("#wave")))) return;
+      recOn = true; mic.classList.add("rec"); FX.play("rec"); $("#cmd-hint").textContent = "listening… release to send";
+    }
     catch (err) { FX.toast("Mic: " + err.message + ". Typing still works.", "amber"); }
   }
   async function micUp(e) {
-    if (!recOn) return;
+    if (!recOn) { VOICE.cancelStart(); return; } // released while the mic was still opening
     e.preventDefault();
     recOn = false; mic.classList.remove("rec"); FX.play("blip");
     $("#cmd-hint").textContent = "transcribing locally…";

@@ -60,18 +60,42 @@ test("newTurn aborts every in-flight /tts fetch from older turns", async () => {
   assert.equal(h.audios.length, 0);
 });
 
-test("a late play() from an old turn neither keeps nor restarts audio", async () => {
+test("a late play() from an old turn is paused in the very event it starts", async () => {
   const h = makeController();
   const e1 = h.ctl.newTurn();
   const done = h.ctl.playBlob(e1, { fakeBlob: "old" });
   const old = h.audios[0];
   h.ctl.newTurn();
   assert.equal(old.paused, true);
-  old.resolvePlay(); // the browser starts it after the pause
+  old.resolvePlay(); // the browser starts it after the pause: 'playing' fires
+  assert.equal(old.pausedInOnset, true, "paused synchronously at onset, not a tick later");
   await tick();
-  assert.equal(old.paused, true, "late play() was silenced again");
+  assert.equal(old.paused, true, "late play() was silenced");
   assert.equal(old.srcRemoved, true);
   assert.equal(await done, "stale");
+});
+
+test("a late play() that resolves with no 'playing' event is still silenced", async () => {
+  const h = makeController();
+  const e1 = h.ctl.newTurn();
+  h.ctl.playBlob(e1, { fakeBlob: "old" });
+  const old = h.audios[0];
+  h.ctl.newTurn();
+  old.resolvePlay({ events: false });
+  await tick();
+  assert.equal(old.paused, true);
+});
+
+test("an audio that ended normally is paused if it ever starts again", async () => {
+  const h = makeController();
+  const e = h.ctl.newTurn();
+  const { a, done } = await playing(h, e);
+  assert.equal(a.pausedInOnset, false, "current-turn audio is not paused at onset");
+  a.finishPlaying();
+  assert.equal(await done, "ended");
+  a.play();
+  a.resolvePlay();
+  assert.equal(a.pausedInOnset, true);
 });
 
 test("a late play() from an old turn does not cut into the current turn's audio", async () => {

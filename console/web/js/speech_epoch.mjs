@@ -69,18 +69,28 @@ export function createSpeechController(deps = {}) {
       function finish(outcome) {
         if (settled) return;
         settled = true;
-        audio.onplaying = audio.onended = audio.onerror = null;
+        audio.onended = audio.onerror = null; // the onset guard below stays
         if (playing === me) playing = null;
         try { objectUrls.revoke(src); } catch (err) { /* ignore */ }
         resolve(outcome);
       }
-      audio.onplaying = () => { started = true; };
+      // Onset guard, kept on the element for good: if it ever starts after its
+      // turn ended (a late play()), it is paused in that same event, before
+      // any promise continuation could run.
+      const onset = () => {
+        if (alive(e, g0) && playing === me) return true;
+        halt(audio);
+        return false;
+      };
+      audio.onplay = onset;
+      audio.onplaying = () => { if (onset()) started = true; };
       audio.onended = () => finish(alive(e, g0) ? "ended" : "stale");
       audio.onerror = () => { halt(audio); finish(!alive(e, g0) ? "stale" : started ? "error" : "failed"); };
       let p;
       try { p = audio.play(); } catch (err) { p = Promise.reject(err); }
       Promise.resolve(p).then(() => {
-        // play() can settle after the turn moved on; never let it keep sounding.
+        // play() can settle after the turn moved on (also without a fresh
+        // 'playing' event); never let it keep sounding.
         if (!alive(e, g0) || playing !== me) { halt(audio); finish("stale"); return; }
         started = true;
       }, () => {
