@@ -60,6 +60,15 @@ class Brain:
         self.store.close()
 
     def recover(self):
+        # An execution the restart interrupted may still be moving on the controller (the latch blocks new approvals, not
+        # that motion), and a stop latched before the restart must hold on this adapter too. So STOP goes to the adapter
+        # first, before any store work, and is confirmed; the latch stays until an operator clears it (clear_stop).
+        interrupted=self.store.rows("SELECT id FROM episode WHERE outcome='running' AND id IN (SELECT id FROM cx_episode)")
+        stopped=None
+        if interrupted or self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"):
+            self._stopped.set()
+            try: self.robot.stop(); stopped=bool(self.robot.state().get('stopped'))
+            except Exception: stopped=False
         with self.store.tx():
             self._recoverable_preparing={r['id'] for r in self.store.rows("SELECT id FROM episode WHERE outcome='preparing' AND id IN (SELECT id FROM cx_episode)")}
             running=self.store.rows("SELECT id FROM episode WHERE outcome='running' AND id IN (SELECT id FROM cx_episode)")
@@ -74,6 +83,9 @@ class Brain:
             # its commitment, an expiry or invalidation an older version left unreconciled too.
             for r in self.store.rows(f"SELECT id,outcome FROM episode WHERE outcome IN ({','.join('?'*len(TASK_STATE))})",tuple(TASK_STATE)):
                 self.store.finish_task(r['id'],r['outcome'])
+        if stopped is not None:
+            self.journal(None,'stop',{},'confirmed' if stopped else 'requested',
+                         'on restart: '+('the adapter confirmed it' if stopped else 'the adapter did not confirm it; send STOP again'))
 
     def _expire(self):
         """Proposals past their approval window expire, each one's commitment with it (Store.settle)."""
