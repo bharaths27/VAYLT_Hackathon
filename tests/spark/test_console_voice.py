@@ -4,6 +4,7 @@ Hermetic: ffmpeg, whisper-cli and piper are fakes; the whisper.cpp server is a s
 on 127.0.0.1 inside the test. WAV clips are made here with the wave module.
 """
 
+import array
 import asyncio
 import gc
 import io
@@ -616,25 +617,86 @@ def test_cancel_and_resubmit_cannot_get_past_the_limits():
     assert (q.jobs, q.bytes) == (0, 0)
 
 
-def test_a_failed_job_pins_nothing_once_its_caller_is_done():
-    q = voice._SpeechQueue("test", lambda: 1)
-    dropped = threading.Event()
+class JobFailed(RuntimeError):
+    pass
 
-    def job(c):
-        raise RuntimeError("whisper fell over")  # its traceback holds this frame, and c
+
+def _with_gc_off(fn):
+    """Run fn with the cyclic garbage collector off: anything freed in here was freed by
+    reference counting alone, not by a later GC pass."""
+    was_on = gc.isenabled()
+    gc.disable()
+    try:
+        return fn()
+    finally:
+        if was_on:
+            gc.enable()
+
+
+def _freed_soon(freed, seconds=1.0):
+    deadline = time.monotonic() + seconds
+    while not freed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return bool(freed)
+
+
+def _fail_with(clip):
+    raise ValueError("bad sample")  # this frame, in a traceback, holds the clip
+
+
+@pytest.mark.parametrize("chained", ["plain", "context", "cause"])
+def test_a_failed_job_lets_go_of_its_audio_without_waiting_for_gc(chained):
+    q = voice._SpeechQueue("test", lambda: 1)
+    freed = []
+
+    def job(clip):  # this frame, in the traceback, holds the clip
+        if chained == "plain":
+            raise JobFailed("whisper fell over")
+        try:
+            _fail_with(clip)
+        except ValueError as inner:  # the inner error's traceback holds the clip too
+            if chained == "cause":
+                raise JobFailed("whisper fell over") from inner
+            raise JobFailed("whisper fell over")
+
+    def clip():
+        c = _Clip(1)
+        weakref.finalize(c, freed.append, True)
+        return c
 
     async def scenario():
-        c = _Clip(1)
-        weakref.finalize(c, dropped.set)
-        task = asyncio.ensure_future(q.run(job, c))
-        del c
-        with pytest.raises(RuntimeError):
-            await task
+        try:
+            await q.run(job, clip())
+        except JobFailed as e:
+            return type(e), str(e), list(getattr(e, "__notes__", [])), bool(freed)
 
-    run(scenario())
-    gc.collect()
-    assert dropped.is_set()  # the idle worker does not keep the failed job (or its audio)
+    (kind, message, notes, freed_on_arrival), freed_after = _with_gc_off(lambda: (run(scenario()), _freed_soon(freed)))
+    assert freed_on_arrival and freed_after  # gone by the time the caller sees the error
+    assert (kind, message) == (JobFailed, "whisper fell over")  # the caller sees the same error
+    if sys.version_info >= (3, 11):
+        assert any("in job" in note for note in notes)  # and where it failed, as text
     assert (q.jobs, q.bytes) == (0, 0)
+
+
+def test_a_failed_stt_job_lets_go_of_the_upload_without_waiting_for_gc(stt):
+    stt.time_out_on = {1}  # whisper-cli times out
+    freed = []
+
+    def upload():  # array, unlike bytes, can be watched with a weakref
+        audio = array.array("B", wav_bytes())
+        weakref.finalize(audio, freed.append, True)
+        return audio
+
+    async def scenario():
+        try:
+            await voice.transcribe(upload(), ".wav")
+        except subprocess.TimeoutExpired as e:
+            return type(e), str(e)
+
+    outcome, freed_after = _with_gc_off(lambda: (run(scenario()), _freed_soon(freed)))
+    assert outcome == (subprocess.TimeoutExpired, "Command '" + str(stt.calls[0][1]) + "' timed out after 40 seconds")
+    assert freed_after  # nothing in the queue, its worker or the failed job keeps the upload alive
+    assert (voice._STT.jobs, voice._STT.bytes) == (0, 0)
 
 
 def test_cancelled_waiting_stt_request_gives_back_its_slot_and_never_runs(stt, monkeypatch):

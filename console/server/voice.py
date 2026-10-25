@@ -20,6 +20,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import traceback
 import wave
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -29,6 +30,26 @@ from . import config
 
 class VoiceBusy(RuntimeError):
     """A speech queue is full. Say so; the iPad falls back to typed commands / its own voice."""
+
+
+def _detached(error: BaseException) -> BaseException:
+    """The same exception object (type and message unchanged) with the tracebacks of it and of
+    its whole __cause__ / __context__ chain cut loose. A failed job's frames hold its audio;
+    left attached they would keep it alive, in a reference cycle, until the next cyclic GC,
+    outside the queue's byte limit. Where it failed is kept as text, in a note."""
+    seen, chain = set(), [error]
+    while chain:
+        e = chain.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        tb = e.__traceback__
+        if tb is not None:
+            if hasattr(e, "add_note"):  # Python 3.11+
+                e.add_note("in the speech worker:\n" + "".join(traceback.format_tb(tb)).rstrip())
+            e.__traceback__ = None
+        chain += [e.__cause__, e.__context__]
+    return error
 
 
 class _Job:
@@ -75,7 +96,13 @@ class _SpeechQueue:
             self._waiting.append(_Job(future, fn, args, size))
             self._cond.notify()
         del fn, args  # the job holds them now, and lets go of them when it gives its slot back
-        return await asyncio.wrap_future(future)
+        try:
+            return await asyncio.wrap_future(future)
+        finally:
+            # A failure re-raised here carries this frame (and the callers' frames, which hold
+            # the audio) in its traceback; the future holds that same exception. Drop the
+            # frame's reference to the future so the two do not form a cycle.
+            del future
 
     def _drop_if_cancelled(self, future) -> None:
         """A caller gave up. If its job is still waiting, take it out of the line (dropping its
@@ -111,7 +138,7 @@ class _SpeechQueue:
             try:
                 ok, value = True, job.fn(*job.args)
             except BaseException as e:  # noqa: BLE001 - handed to the caller
-                value = e
+                value = _detached(e)  # its frames hold the audio: let them go now, not at GC time
         with self._cond:
             self._release(job)
         if started:
