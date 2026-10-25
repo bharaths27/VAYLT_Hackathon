@@ -14,7 +14,7 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
-from .planning import CAPS,PHYSICAL,RECALL,Compiler,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,PHYSICAL,RECALL,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
@@ -35,11 +35,11 @@ class Brain:
         self.dreamer=Dreamer(store,self.skills,self.activity,qwen,self.intent)
         self._recoverable_preparing=set(); self._effect_lock=threading.Lock(); self._stopped=threading.Event(); self._file_lock=None
         self.mode='SIMULATED' if robot.state().get('adapter')=='mock' else 'PHYSICAL'
-        store.runtime_mode=self.mode
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
         if self.mode=='PHYSICAL' and synthetic_seed_present(store):
             raise Denied('this vault contains synthetic seed data (scripts/cortex_seed.py); a physical runtime must start on a separate, unseeded vault (set CORTEX_DB to a new file)')
+        store.runtime_mode=self.mode   # only a runtime that actually starts owns the vault's mode (load_seed checks it)
         if acquire_lock and store.path!=':memory:' and store.file_lock is None:
             self._file_lock=vault_lock.acquire(store.path)
         self.recover()
@@ -81,13 +81,19 @@ class Brain:
             if low in {'stop','stop now','halt','emergency stop'}: return {'kind':'stop',**self.stop()}
             # Cheap deterministic controls/recall precede optional cloud classification.
             if RECALL.search(request):
-                return self.store.recall(request)
+                return self.store.recall(request,principal=principal)
             if low.startswith('remember '):
                 body=re.sub(r'^remember\s+(?:that\s+)?','',request,flags=re.I)
                 return self.store.teach('Instruction from '+principal,body,owner=principal,kind='spoken',cloud_ok=cloud_allowed)
             match=WHEN.match(request)
             if match and not request.rstrip().endswith('?'):
                 return self.schedule(match[1],match[2],principal=principal)
+            # Any other question asks memory ("what do you see" stays an observe proposal, "can you ..." an instruction).
+            if asks_memory(request):
+                answer=self.store.recall(request,principal=principal)
+                if not asks_memory(request.rstrip().rstrip('?')):   # only the "?" made it a question: keep the instruction hint
+                    answer['reply']='Answered as a question, so nothing was proposed; to have the robot act, say it without the question mark. '+answer['reply']
+                return answer
             # Advisory interpretation cannot remove qualifiers or alter the original request.
             advice=self.intent.route(request,disclosure_allowed=bool(cloud_allowed and self.store.policy.cloud_enabled))
             self.store.decision('route',advice.get('provider','local'),advice.get('model'),advice['status']=='ok',advice['status'])
@@ -122,22 +128,24 @@ class Brain:
                 self.store.conn.execute('INSERT INTO episode(id,goal,request,outcome,started_at) VALUES(?,?,?,?,?)',
                                         (ep,canonical(goal.to_dict()),request,'preparing',t))
                 self.store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',
-                    (ep,self.mode,canonical(goal.to_dict()),basis,self.store.policy.fingerprint(),canonical(self.compiler.fixture()),key,ih,t+self.store.policy.approval_ttl_s,principal))
+                    (ep,self.mode,canonical(goal.to_dict()),basis,self.store.policy.fingerprint(),canonical(self._fixture()),key,ih,t+self.store.policy.approval_ttl_s,principal))
             else:
                 self.store.conn.execute('UPDATE cx_episode SET basis_hash=?,initial_json=?,expires_at=? WHERE id=?',
-                    (basis,canonical(self.compiler.fixture()),t+self.store.policy.approval_ttl_s,ep))
+                    (basis,canonical(self._fixture()),t+self.store.policy.approval_ttl_s,ep))
         with self.activity.foreground():
             try:
                 # A command is an episode, not a source: it is never recalled as knowledge.
                 refs=self.skills.provenance(goal,ep,extra_refs)
-                bundle=self.store.bundle(request,goal)
-                fixture=self.compiler.fixture()
+                bundle=self.store.bundle(request,goal,principal=principal)
+                fixture=self._fixture()
                 # Optional relevance advice ranks only explicitly cloud-permitted evidence.
                 shareable=[e for e in bundle['evidence'] if e.get('cloud_ok')]
                 if shareable:
                     self._advisor('relevance',{'request':request,'evidence':[{'id':e.get('id',e.get('chunk_id')),'text':e['text']} for e in shareable[:5]]},
                                   {'sufficient':'Does the supplied evidence directly support this request without missing a material condition?'},cloud_allowed)
                 skill=self.skills.find(goal)
+                # A stored procedure is reused only where every step still makes progress; otherwise compose afresh.
+                if skill and not verify(goal,skill['definition']['steps'],fixture,self.store.related_rules(goal),self.store.policy).ok: skill=None
                 if skill and self.store.cloud_eligible(skill['definition']['refs']):
                     a=self._advisor('skill_selection',{'request':request,'goal':goal.to_dict(),'skill':skill['definition']},
                         {'fits':'Does the skill achieve exactly the specified task without additional effects?'},cloud_allowed)
@@ -199,6 +207,12 @@ class Brain:
                 if isinstance(e,CortexError): raise
                 raise CortexError('planning failed: '+type(e).__name__) from None
 
+    def _fixture(self) -> dict:
+        """The verification world: current observations plus what the adapter reports in the claw (absent = unknown)."""
+        f=self.compiler.fixture(); st=self.robot.state()
+        if 'holding' in st: f.update(holding=st['holding'],holding_known=True)
+        return f
+
     def operation(self,ep: str) -> dict:
         r=self.store.one('SELECT e.*,c.mode,c.owner,c.expires_at FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.id=?',(ep,))
         if not r: raise Missing('operation not found')
@@ -248,7 +262,7 @@ class Brain:
                     if plan['basis']!=self.store.basis(goal) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
                         raise Stale('rule, binding, source or policy changed after proposal')
                     if self.store.prohibitions(set(goal.targets)|{r['object'] for r in self.store.related_rules(goal)}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
-                    v=verify(goal,plan['steps'],self.compiler.fixture(),self.store.related_rules(goal),self.store.policy)
+                    v=verify(goal,plan['steps'],self._fixture(),self.store.related_rules(goal),self.store.policy)
                     if not v.ok: raise Denied('; '.join(v.errors))
                     claimed=self.store.conn.execute("UPDATE episode SET outcome='running' WHERE id=? AND outcome='proposed'",(ep,)).rowcount
                     if claimed!=1: raise Conflict('operation already claimed')
@@ -275,6 +289,10 @@ class Brain:
                             if not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
                                 raise Missing('prerequisite not currently observed at required station')
                 self.journal(ep,s['op'],s['args'],'pending',step=i)
+                # STOP interlock: the last check sits immediately before dispatch (no validation or I/O in between),
+                # and the adapter refuses motion once stop() reached it, so a STOP in this gap cannot dispatch the step.
+                if self._stopped.is_set():
+                    self.journal(ep,s['op'],s['args'],'not_dispatched','stop arrived before dispatch',i); outcome='aborted'; reason='stop requested'; break
                 moved=moved or s['op'] in PHYSICAL
                 try: result=self.robot.execute(s['op'],s['args'])
                 except Exception:

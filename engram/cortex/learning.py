@@ -59,10 +59,17 @@ class Skills:
         # Validate on multiple controlled arrangements, not merely its authored example.
         variants=[f]
         zones=sorted(self.store.zones())
+        # Each variant starts every object the plan handles away from where the plan puts it: a state that needs
+        # the procedure, never one that already satisfies it (where handling it again is a no-progress effect).
+        moves,cur={},None
+        for st in d['steps']:
+            if st['op']=='pick_tagged_object': cur=st['args']['object_id']
+            elif st['op']=='place_at_zone' and cur: moves.setdefault(cur,set()).add(st['args']['zone']); cur=None
         for shift in (0,1):
             variant=copy.deepcopy(f)
             for i,oid in enumerate(sorted(variant['objects'])):
-                variant['positions'][oid]=zones[(i+shift)%len(zones)]
+                ring=[zones[(i+shift+k)%len(zones)] for k in range(len(zones))]
+                variant['positions'][oid]=next((z for z in ring if z not in moves.get(oid,())),ring[0])
             variants.append(variant)
         results=[]
         for v in variants:
@@ -149,7 +156,7 @@ class Dreamer:
         # Real model-call cap: at most N idle model calls per rolling window (default N =
         # policy.max_model_calls_per_dream), plus no repeat of an input already answered.
         self.model_window_s=model_window_s; self.model_calls_per_window=model_calls_per_window
-        self._model_calls=collections.deque(); self._model_answered=None
+        self._model_calls=collections.deque(); self._model_answered=None; self.monotonic=time.monotonic
 
     def start(self, interval_s: float=5):
         if self._thread and self._thread.is_alive(): return
@@ -174,7 +181,7 @@ class Dreamer:
 
     def _model_budget(self) -> bool:
         cap=self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
-        now=time.monotonic()
+        now=self.monotonic()
         while self._model_calls and now-self._model_calls[0]>=self.model_window_s: self._model_calls.popleft()
         return cap>0 and len(self._model_calls)<cap
 
@@ -300,7 +307,7 @@ class Dreamer:
                 bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],'pending_commitments':self.store.rows("SELECT id,trigger,request,status FROM prospective_task WHERE status IN ('waiting','fired','unknown') LIMIT 3"),'approved_skills':self.store.rows("SELECT v.name,v.status FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' LIMIT 3"),'declared_knowledge':declared,'source_passages':recent_sources,'observations':[{'id':o['id'],'statement':o['statement'],'fresh':o['fresh']} for o in objects[:4]]}
                 asked=digest(bundle)
                 if refs and live<self.LIVE_CAP and asked!=self._model_answered:
-                    q=None; self._model_calls.append(time.monotonic())
+                    q=None; self._model_calls.append(self.monotonic())
                     try: q=self.qwen.complete('dream',bundle)
                     except CortexError as e: errors.append(type(e).__name__)
                     if q and not interrupted():

@@ -254,14 +254,17 @@ class Store:
                 raise Conflict('self-dependent rule')
             checked.append({**r, 'rule_key': r.get('rule_key') or f"{r['subject']}::requires::{r['prerequisite']}"})
         forbidden, safety = list(prohibitions or []), []
+        # Only entities a reviewer structured explicitly (the rules/prohibitions arguments) clear a safety sentence about them.
+        structured = {x for r in (rules or []) if isinstance(r, dict) for x in (r.get('subject'), r.get('prerequisite'), r.get('required_zone'))} | set(forbidden)
         for sent in re.split(r'[.\n]', body):
             sent = sent.replace(chr(0x2019), "'")
             if PROHIBIT_RE.search(sent):
                 forbidden.extend(self.resolve_objects(sent))
-            # Safety wording neither template captured, scoped to what the sentence (else the source) names.
-            if rules is None and SAFETY_RE.search(PROHIBIT_RE.sub(' ', RULE_RE.sub(' ', sent))):
+            # Safety wording neither template captured, scoped to what the sentence (else the source) names; scanned
+            # whether or not structured rules were supplied, cleared only when the reviewer structured all it names.
+            if SAFETY_RE.search(PROHIBIT_RE.sub(' ', RULE_RE.sub(' ', sent))):
                 named = self.named(sent) or self.named(body)
-                if named: safety.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], named))
+                if named and not set(named) <= structured: safety.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], named))
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
@@ -471,7 +474,7 @@ class Store:
                          "JOIN cx_source x ON x.source_id=s.id WHERE source_chunk_fts MATCH ? AND x.workspace=? AND x.status='accepted' ORDER BY score,c.id LIMIT ?",
                          (q, self.workspace, min(max(int(limit),1),20)))
 
-    def bundle(self, request: str, goal: Goal | None = None) -> dict:
+    def bundle(self, request: str, goal: Goal | None = None, *, principal: str | None = None) -> dict:
         rules = self.related_rules(goal) if goal else []
         ids = set(goal.targets if goal else self.resolve_objects(request)) | {r['object'] for r in rules}
         objects = [o for o in self.objects() if o['id'] in ids]
@@ -506,8 +509,8 @@ class Store:
         q=' OR '.join('"'+w+'"' for w in words)
         episodes=[]
         if q:
-            episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM cx_episode_fts f JOIN episode e ON e.id=f.episode_id JOIN cx_episode c ON c.id=e.id WHERE cx_episode_fts MATCH ? ORDER BY bm25(cx_episode_fts) LIMIT 3',(q,))
-        prospective=self.rows("SELECT id,request,trigger,status FROM prospective_task WHERE status IN ('waiting','fired','unknown') ORDER BY created_at DESC LIMIT 3")
+            episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM cx_episode_fts f JOIN episode e ON e.id=f.episode_id JOIN cx_episode c ON c.id=e.id WHERE cx_episode_fts MATCH ? AND (? IS NULL OR c.owner=?) ORDER BY bm25(cx_episode_fts) LIMIT 3',(q,principal,principal))
+        prospective=self.rows("SELECT p.id,p.request,p.trigger,p.status FROM prospective_task p LEFT JOIN cx_commitment c ON c.id=p.id WHERE p.status IN ('waiting','fired','unknown') AND (? IS NULL OR c.owner=?) ORDER BY p.created_at DESC LIMIT 3",(principal,principal))
         approved=self.rows("SELECT v.id,v.name,v.digest FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' AND c.goal_key=? LIMIT 3",(goal.key() if goal else '',))
         related_derived=[]
         for d in self.derived()[-32:]:
@@ -641,18 +644,19 @@ class Store:
             self.conn.execute('INSERT INTO cx_manifest VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,created_at=excluded.created_at',
                               (name,kind,canonical(payload),self.clock()))
 
-    def episodes_about(self, ids: set[str], limit: int = 8) -> list[dict]:
-        """Newest episodes naming any of these objects, searched over the whole history BEFORE limiting."""
+    def episodes_about(self, ids: set[str], limit: int = 8, *, principal: str | None = None) -> list[dict]:
+        """Newest episodes naming any of these objects (the principal's own when given), searched BEFORE limiting."""
         names = [' '+normalize(n)+' ' for o in self.objects() if o['id'] in ids for n in [o['id'], o['name']]+o['aliases']]
         out = []
         with self.lock:
-            for r in self.conn.execute('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id ORDER BY e.started_at DESC'):
+            for r in self.conn.execute('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id WHERE (? IS NULL OR c.owner=?) ORDER BY e.started_at DESC',(principal,principal)):
                 p = ' '+normalize(r['request'])+' '
                 if any(n in p for n in names): out.append(dict(r))
                 if len(out) >= limit: break
         return out
 
-    def recall(self, question: str, kinds: list[str] | None = None) -> dict:
+    def recall(self, question: str, kinds: list[str] | None = None, *, principal: str | None = None) -> dict:
+        # With a principal, episodes and commitments are that owner's only: another operator's requests stay private.
         allowed={'semantic','episodic','procedural','external','parametric','prospective','working'}
         chosen=set(kinds or allowed)
         if not chosen <= allowed: raise CortexError('unknown memory kind')
@@ -663,12 +667,12 @@ class Store:
             result['memories']['external']=self.search(question)
             result['evidence']=[x['chunk_id'] for x in result['memories']['external']]
         if 'episodic' in chosen:
-            result['memories']['episodic']=self.rows('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id ORDER BY e.started_at DESC LIMIT 8')
+            result['memories']['episodic']=self.rows('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id WHERE (? IS NULL OR c.owner=?) ORDER BY e.started_at DESC LIMIT 8',(principal,principal))
         if 'procedural' in chosen:
             self.invalidate()
             result['memories']['procedural']=self.rows("SELECT v.id,v.name,v.version,v.status FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' ORDER BY v.approved_at DESC LIMIT 10")
         if 'prospective' in chosen:
-            result['memories']['prospective']=self.rows("SELECT id,trigger,request,status,proposal_id FROM prospective_task WHERE status NOT IN ('done','cancelled') ORDER BY created_at DESC LIMIT 10")
+            result['memories']['prospective']=self.rows("SELECT p.id,p.trigger,p.request,p.status,p.proposal_id FROM prospective_task p LEFT JOIN cx_commitment c ON c.id=p.id WHERE p.status NOT IN ('done','cancelled') AND (? IS NULL OR c.owner=?) ORDER BY p.created_at DESC LIMIT 10",(principal,principal))
         if 'parametric' in chosen:
             result['memories']['parametric']=[{**r,'payload':json.loads(r.pop('payload_json'))} for r in self.rows('SELECT * FROM cx_manifest')]
         if 'working' in chosen:
@@ -681,7 +685,7 @@ class Store:
         hits=result['memories'].get('external',[])
         episodes=result['memories'].get('episodic',[])
         if ids and 'episodic' in chosen:
-            episodes=self.episodes_about(ids)
+            episodes=self.episodes_about(ids,principal=principal)
         if re.search(r'\b(what happened|what did you|last time|previous run)\b',low):
             if episodes:
                 e=episodes[0]
@@ -691,7 +695,8 @@ class Store:
         elif re.search(r'\b(pending|what is next|what needs to happen|waiting)\b',low):
             tasks=result['memories'].get('prospective',[])
             result['reply']='; '.join(f"{t['request']}: {t['status']} (trigger: {t['trigger']})" for t in tasks[:3]) or 'No open commitments in the returned scope.'
-        elif 'where' in low and ids:
+        elif 'where' in low and ids and all(o['fresh'] for o in self.objects() if o['id'] in ids):
+            # Object state answers a location only while CURRENT; unobserved or stale state falls through to the evidence.
             result['reply']='; '.join(o['statement'] for o in self.objects() if o['id'] in ids)
         elif hits:
             result['reply']='Source says: '+hits[0]['text'][:600]

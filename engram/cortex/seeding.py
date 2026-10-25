@@ -17,6 +17,8 @@ def load_seed(store,seed:dict,*,principal:str,runtime_mode:str='SIMULATED')->dic
     if set(seed)!={'format','id','version','evidence_class','sources'} or seed['format']!='cortex-reviewed-seed-v1':raise CortexError('unsupported seed contract')
     sid=text(seed['id'],'seed id',80);text(seed['version'],'seed version',40)
     if seed['evidence_class']!='SIMULATED' or runtime_mode!='SIMULATED':raise Denied('this bootstrap loader is for explicitly simulated review data only')
+    # The vault's actual runtime decides, not the caller's word: never seed a store a PHYSICAL brain is running on.
+    if getattr(store,'runtime_mode','SIMULATED')!='SIMULATED':raise Denied('this vault belongs to a PHYSICAL runtime; synthetic seed data is refused')
     if not isinstance(seed['sources'],list) or len(seed['sources'])>16:raise CortexError('seed source budget exceeded')
     fingerprint=digest(seed);key='cortex_seed:'+sid
     with store.tx():

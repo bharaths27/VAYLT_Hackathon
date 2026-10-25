@@ -4,7 +4,7 @@ Location references preserve their ORIGINAL timestamp. A cached observation is n
 re-stamped as a fresh camera observation. E_UNVERIFIED remains unknown.
 """
 from __future__ import annotations
-import os
+import os,threading
 from types import SimpleNamespace
 from .types import Denied,Missing
 from .models import validate_loopback
@@ -18,11 +18,14 @@ class MemoryView:
         return SimpleNamespace(tag_id=o['tag'],last_zone=o['last_zone'],stale=not o['fresh'],name=o['name'])
 
 class GuardedUpstream:
-    def __init__(self,upstream,store):self.upstream,self.store=upstream,store
+    def __init__(self,upstream,store):self.upstream,self.store=upstream,store;self._stopped=threading.Event()
     def state(self):return self.upstream.state()
-    def stop(self):self.upstream.stop()
-    def reset_stop(self):self.upstream.reset_stop()
+    # Adapter-side half of the STOP interlock: once stop() reached the adapter, motion is refused until reset_stop().
+    def stop(self):self._stopped.set();self.upstream.stop()
+    def reset_stop(self):self.upstream.reset_stop();self._stopped.clear()
     def execute(self,op,args):
+        from .planning import PHYSICAL
+        if op in PHYSICAL and self._stopped.is_set():return Result('rejected','stop latched at the adapter; motion refused until the stop is cleared')
         if op=='locate_tag':
             o=next((x for x in self.store.objects() if x['id']==args['object_id']),None)
             if not o or not o['fresh'] or not o['last_observation_id']:return Result('failed','no current source-grounded location')
