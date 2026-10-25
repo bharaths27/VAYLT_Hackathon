@@ -90,14 +90,21 @@ class Turn(Input):
 MAX_BODY=300000
 SAFE_METHODS={'GET','HEAD','OPTIONS'}
 SWEEP_S,SWEEP_MAX_S,REPEAT_S=1.0,60.0,600.0
+SHUTDOWN_WAIT_S=30.0   # how long shutdown waits for a sweep in flight; past it the store is left open, never closed under it
 log=logging.getLogger('engram.cortex.api')
 
-async def sweep_forever(b:Brain):
+async def sweep_forever(b:Brain,stopping:asyncio.Event|None=None):
     """Timed-task scheduler that never dies. Any failure (clock rollback, 'database is locked')
     is logged, retried with exponential backoff SWEEP_S..SWEEP_MAX_S, and recorded as a decision
-    once per REPEAT_S while the same failure repeats. Due tasks only ever become proposals."""
+    once per REPEAT_S while the same failure repeats. Due tasks only ever become proposals.
+    It stops cooperatively: `stopping` ends the loop between sweeps, never inside one (a sweep runs
+    in a worker thread that cancelling the await would leave running)."""
+    stopping=stopping or asyncio.Event()
+    async def pause(seconds):
+        try:await asyncio.wait_for(stopping.wait(),seconds)
+        except TimeoutError:pass
     delay,last,noted=SWEEP_S,None,0.0
-    while True:
+    while not stopping.is_set():
         try:await asyncio.to_thread(b.sweep_due);delay,last=SWEEP_S,None
         except Exception as e:
             code=e.code if isinstance(e,CortexError) else type(e).__name__
@@ -105,11 +112,15 @@ async def sweep_forever(b:Brain):
             if code!=last or time.monotonic()-noted>=REPEAT_S:
                 try:await asyncio.to_thread(b.store.decision,'clock_sweep','local',None,False,code);last,noted=code,time.monotonic()
                 except Exception:log.exception('could not record the sweep failure')
-            await asyncio.sleep(delay);delay=min(delay*2,SWEEP_MAX_S);continue
-        await asyncio.sleep(delay)
+            await pause(delay);delay=min(delay*2,SWEEP_MAX_S);continue
+        await pause(delay)
 
-async def stop_task(task):
-    task.cancel();await asyncio.gather(task,return_exceptions=True)
+async def stop_sweeping(task,stopping)->bool:
+    """Ask the sweeper to stop and wait for it, a sweep in flight included (up to SHUTDOWN_WAIT_S): True once it ended."""
+    stopping.set()
+    try:await asyncio.wait_for(asyncio.shield(task),SHUTDOWN_WAIT_S)
+    except TimeoutError:log.error('a timed-task sweep is still running after %.0f s',SHUTDOWN_WAIT_S);return False
+    return True
 
 class Guard:
     """Outermost pure-ASGI gate. A cross-site mutation, or one without a credential of its route's role (a sensor
@@ -212,11 +223,19 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @asynccontextmanager
     async def lifespan(app):
         async with AsyncExitStack() as cleanup: # every registered step runs at shutdown, even if one raises
-            if not supplied:cleanup.callback(b.close)
+            sweeper=[]
+            def close_brain():
+                # Never under a sweep still running in its worker thread (stop_sweeping gave up waiting): the store
+                # stays open for it, and the process exit releases the vault.
+                if sweeper and not sweeper[0].done():log.error('the store is left open: a timed-task sweep still uses it');return
+                b.close()
+            if not supplied:cleanup.callback(close_brain)
             cleanup.callback(b.dreamer.stop)
             # Reconcile durable wakes into proposals only; never resume a physical effect.
             await asyncio.to_thread(b.reconcile_wakes)
-            if b.store.policy.clock_trusted:cleanup.push_async_callback(stop_task,asyncio.create_task(sweep_forever(b)))
+            if b.store.policy.clock_trusted:
+                stopping=asyncio.Event();sweeper.append(asyncio.create_task(sweep_forever(b,stopping)))
+                cleanup.push_async_callback(stop_sweeping,sweeper[0],stopping)
             if enable_idle:b.dreamer.start()
             if hub:hub.start();cleanup.callback(hub.stop)
             yield

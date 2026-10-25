@@ -96,3 +96,35 @@ def test_guard_a_requests_own_episode_is_never_among_its_related_episodes(store)
             store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',(ep,'SIMULATED','{}','','','{}',None,'',0,'op'))
     related=store.bundle('Bring Sample B to bench',Goal('fetch',('sample_b',),'bench'),principal='op',episode='ep_now')['related_episodes']
     assert [e['id'] for e in related]==['ep_old']
+
+
+# P2-3: shutdown is cooperative. It signals the timed-task sweeper and waits for a sweep in flight in its worker thread,
+# then closes the store; cancelling the await would leave that sweep running against a closed store.
+def owned_app(arena,clock,monkeypatch):
+    """An app that owns its brain (it closes it at shutdown), whose sweep blocks until released."""
+    s=Store(clock=clock,policy=Policy(clock_trusted=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    entered,release,after=threading.Event(),threading.Event(),[]
+    def blocked():
+        entered.set();release.wait(5)
+        try:b.store.one('SELECT 1');after.append('open')
+        except Exception as e:after.append(type(e).__name__)
+        return []
+    b.sweep_due=blocked;monkeypatch.setattr(api,'_configured_brain',lambda:b)
+    client=TestClient(create_app(tokens={TA:'alice'},start_idle=False));client.__enter__();assert entered.wait(5)
+    return b,client,release,after
+
+def test_shutdown_waits_for_a_sweep_in_flight_before_closing_the_store(arena,clock,monkeypatch):
+    b,client,release,after=owned_app(arena,clock,monkeypatch)
+    closing=threading.Thread(target=client.__exit__,args=(None,None,None),daemon=True);closing.start()
+    time.sleep(.3);waited=closing.is_alive()
+    release.set();closing.join(10)
+    assert waited and after==['open'],(waited,after)                  # was: shut down at once; the sweep then hit a closed store
+    with pytest.raises(Exception):b.store.one('SELECT 1')            # closed once the sweep was done
+
+def test_guard_a_sweep_that_outlasts_the_shutdown_wait_leaves_the_store_open(arena,clock,monkeypatch):
+    monkeypatch.setattr(api,'SHUTDOWN_WAIT_S',.2,raising=False)
+    b,client,release,after=owned_app(arena,clock,monkeypatch)
+    threading.Timer(.6,release.set).start()                           # it ends after the shutdown gave up waiting for it
+    client.__exit__(None,None,None)
+    assert after==['open'] and b.store.one('SELECT 1')                # it ran on an open store, and the app left that open
+    b.close()
