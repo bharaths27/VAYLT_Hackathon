@@ -14,7 +14,7 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
-from .planning import CAPS,PHYSICAL,RECALL,Compiler,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,PHYSICAL,RECALL,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
@@ -88,6 +88,12 @@ class Brain:
             match=WHEN.match(request)
             if match and not request.rstrip().endswith('?'):
                 return self.schedule(match[1],match[2],principal=principal)
+            # Any other question asks memory ("what do you see" stays an observe proposal, "can you ..." an instruction).
+            if asks_memory(request):
+                answer=self.store.recall(request)
+                if not asks_memory(request.rstrip().rstrip('?')):   # only the "?" made it a question: keep the instruction hint
+                    answer['reply']='Answered as a question, so nothing was proposed; to have the robot act, say it without the question mark. '+answer['reply']
+                return answer
             # Advisory interpretation cannot remove qualifiers or alter the original request.
             advice=self.intent.route(request,disclosure_allowed=bool(cloud_allowed and self.store.policy.cloud_enabled))
             self.store.decision('route',advice.get('provider','local'),advice.get('model'),advice['status']=='ok',advice['status'])

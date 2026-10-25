@@ -74,8 +74,15 @@ def test_clarification_names_what_was_not_guessed(store,request_text,named):
 def test_eval_table_is_large_enough_and_balanced():
     assert len(TABLE)>=25 and sum(e is REFUSE for _,e in TABLE)>=20 and sum(e is not REFUSE for _,e in TABLE)>=10
 
+# On the command path a question is answered from memory (needle benchmark), still with nothing proposed; when only
+# the "?" made it a question, the answer keeps the hint to say it as an instruction.
+ANSWERED={'Should I bring Sample A to the bench?':False,'Can I move the tray to shelf B':False,'Bring Sample A to the bench?':True,'Open the claw?':True}
+
 @pytest.mark.parametrize('request_text',[r for r,e in TABLE if e is REFUSE])
 def test_refused_request_creates_no_proposal_and_explains(brain,request_text):
     out=brain.command(request_text,principal='carther')
-    assert out['status']=='refused' and out['reason'] and out.get('kind')!='scheduled'
+    if request_text in ANSWERED:
+        assert out['kind']=='answer' and out['reply'] and ('without the question mark' in out['reply'])==ANSWERED[request_text]
+    else:
+        assert out['status']=='refused' and out['reason'] and out.get('kind')!='scheduled'
     assert brain.store.one('SELECT COUNT(*) n FROM episode')['n']==0 and not brain.robot.calls

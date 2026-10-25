@@ -36,6 +36,19 @@ def goal_ops(goal: dict | Goal | None) -> tuple[str, ...]:
 
 # Grammar: refuse by default. Anything below means the utterance says more than "move X to Y".
 QUESTION = re.compile(r"\?\s*$|^\s*(?:should|shall|do|does|did|is|are|was|were|am|may|might|must|what|why|how|which|who|whose|whether|where|when|(?:can|could|would|will)\s+(?:i|we)\b)\b", re.I)
+# Routing, not refusal: a question Brain.command answers from memory. A question mark or a question opener counts,
+# except a polite request ("can/could/would/will you ...", "please ..."), the "what do you see" observation, a
+# "do not ..." instruction, and a bare "when <event> <action>" commitment ("when" counts only before an auxiliary).
+OBSERVE = {'look around','observe','what do you see'}
+POLITE = re.compile(r"^\s*(?:(?:can|could|would|will)\s+you|please)\b", re.I)
+ASKS = re.compile(r"\?\s*$|^\s*(?:what|where|which|who|whom|whose|whether|why|how|is|are|was|were|am|(?:do|does|did)\s+(?!not\b)|"
+                  r"can|could|should|shall|would|will|may|might|must|when\s+(?:is|are|was|were|do|does|did|will|would|can|could|should|shall|has|have|had))\b", re.I)
+
+
+def asks_memory(request: str) -> bool:
+    """A question for memory, not an instruction: parse_goal refuses every question shape, so routing loses nothing."""
+    t=request.replace(chr(0x2019),"'")
+    return bool(RECALL.search(t)) or (bool(ASKS.search(t)) and not POLITE.search(t) and normalize(t) not in OBSERVE)
 HEDGES = (
     (re.compile(r"\b(?:not|no|nor|except|excluding|apart from|other than|without|instead|rather|alone|leave|but)\b", re.I), 'an exclusion or correction ("not", "except", "without", "leave ... alone", "instead")'),
     (re.compile(r"\b(?:off|away|out|from)\b", re.I), 'a source location ("off", "away from", "out of", "from"); name only the destination'),
@@ -78,7 +91,7 @@ def _uncovered(low: str, store: Store) -> list[str]:
 def parse_goal(request: str, store: Store) -> Goal:
     if safety_reason(request): raise Missing(safety_reason(request))
     low=normalize(request)
-    if low in {'look around','observe','what do you see'}:
+    if low in OBSERVE:
         return Goal('primitive',primitive='observe')
     if QUESTION.search(request): raise Missing(ambiguity_reason(request))
     primitive = {'open the claw':'gripper_open','open claw':'gripper_open','open the gripper':'gripper_open',
