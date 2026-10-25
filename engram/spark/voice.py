@@ -312,9 +312,19 @@ class SpeculationGate:
             if decision is None:
                 return GateResult("clarify", utterance, revision, text,
                                   reason="I could not work out what you meant. Please say it again.")
-        if bundle is None and self._actionable(text, decision):
+        # After every wait (the model above, the prefetch below), go on only if nothing moved on meanwhile:
+        # a final that a stop, a newer utterance or new memory has already voided prefetches nothing.
+        void = self._void_final(key, utterance, revision, text)
+        if void is None and bundle is None and self._actionable(text, decision):
             bundle = self._fetch_bundle(decision)
-        # Last check, after every wait (the model, the prefetch): act only if nothing moved on meanwhile.
+            void = self._void_final(key, utterance, revision, text)
+        return void if void is not None else self._decide(key, decision, bundle, reused=reused)
+
+    # ---- internals (lock held unless noted) ------------------------------------
+
+    def _void_final(self, key: Key, utterance: int, revision: int, text: str) -> GateResult | None:
+        """Why a final must not go on after a wait, or None if it may. Reads the context first: caller's
+        thread only, lock NOT held."""
         ctx = self._context()
         with self._cv:
             self._ctx_now = ctx
@@ -328,9 +338,7 @@ class SpeculationGate:
                 self.stats.expired += 1
                 return GateResult("clarify", utterance, revision, text,
                                   reason="That took too long to work out. Please say it again.")
-            return self._decide(key, decision, bundle, reused=reused)
-
-    # ---- internals (lock held unless noted) ------------------------------------
+            return None
 
     def _read_context(self) -> None:
         """Caller's thread only, lock NOT held."""

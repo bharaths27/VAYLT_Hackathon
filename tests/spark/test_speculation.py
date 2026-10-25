@@ -500,6 +500,26 @@ def test_stop_during_the_finals_prefetch_discards_the_final(spawn, clock, partia
     assert len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("meanwhile,action", [("stop", "ignored"), ("newer utterance", "none")])
+def test_a_final_voided_while_the_model_answers_prefetches_nothing(spawn, clock, meanwhile, action):
+    fetched = []
+    fake = FakeIntent()
+    fake.hold()
+    gate = SpeculationGate(fake, prefetch=lambda request: fetched.append(request) or {"goal": request},
+                           clock=clock, spawn=spawn)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 0, "Open the claw")))
+    t.start()
+    assert fake.entered.acquire(timeout=5)               # the final is waiting for the model's answer
+    if meanwhile == "stop":
+        assert gate.on_partial(1, 1, "stop").action == "stop"
+    else:
+        assert gate.on_partial(2, 0, "Close the claw").action == "queued"   # the next utterance begins
+    fake.release.set()                                   # an answer that would be actionable arrives
+    t.join(5)
+    assert out["r"].action == action and fetched == []   # voided, and nothing was prefetched for it
+
+
 @pytest.mark.parametrize("partial_first", [True, False], ids=["reused prediction", "fresh final"])
 @pytest.mark.parametrize("advance,expected", [(0.0, "propose"), (2.5, "clarify")], ids=["in time", "expired"])
 def test_a_prediction_that_expires_during_the_prefetch_is_not_acted_on(spawn, clock, partial_first, advance,

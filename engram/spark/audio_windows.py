@@ -354,7 +354,8 @@ class LiveTranscriber:
     asks for a repeat (VoiceIntegration.finish_live does) and nothing is proposed.
 
     A transcriber serves the utterance the window holds when it is made; call finish() once the
-    audio producer has delivered all of it.
+    audio producer has delivered all of it. It has at most one partial worker: start() it once, or
+    not at all, before finish().
     """
 
     def __init__(self, client: WhisperServerClient, window: PcmWindow, min_audio_s: float = 0.5,
@@ -375,8 +376,13 @@ class LiveTranscriber:
         self.partials = 0       # partial requests started
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._loop, name="spark-partial-stt", daemon=True)
-        self._thread.start()
+        """Start the one partial worker. Single use: a second start(), or one after finish(), raises
+        RuntimeError, so there is never a worker that finish() does not cancel and join."""
+        with self._lock:
+            if self._thread is not None or self._ended.is_set():
+                raise RuntimeError("a LiveTranscriber starts once, before finish(); make a new one per utterance")
+            self._thread = threading.Thread(target=self._loop, name="spark-partial-stt", daemon=True)
+            self._thread.start()
 
     def poll(self) -> tuple[int, str] | None:
         """The newest partial (revision, text) not taken yet, or None. Never one after finish(), and
@@ -393,8 +399,8 @@ class LiveTranscriber:
         window moved on to another utterance, or if audio for this one was refused while the final
         was being made. Never returns a transcript of part of an utterance."""
         with self._lock:
-            self._ended.set()      # from now on: no new partial, and poll() hands out nothing
-            token = self._token
+            self._ended.set()      # from now on: no new partial or worker, and poll() hands out nothing
+            token, worker = self._token, self._thread
         if token is not None:
             token.cancel()
         try:
@@ -404,8 +410,8 @@ class LiveTranscriber:
                 raise AudioOverflow("audio for this utterance arrived while its final was made; it must be said again")
             return text
         finally:
-            if self._thread is not None:
-                self._thread.join(join_s)
+            if worker is not None:
+                worker.join(join_s)
 
     def _loop(self) -> None:
         heard = 0.0

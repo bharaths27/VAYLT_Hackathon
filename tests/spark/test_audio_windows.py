@@ -325,17 +325,25 @@ class _FakeWhisper:
         self.calls = []
         self.release = threading.Event()
         self.started = threading.Semaphore(0)
+        self.active = 0                                         # partial calls that have not returned
+        self._lock = threading.Lock()
 
     def transcribe(self, wav, cancel=None):
         if cancel is None:
             self.calls.append("final")
             return "[BLANK_AUDIO] Open the claw."
         self.calls.append("partial")
+        with self._lock:
+            self.active += 1
         self.started.release()
-        while not self.release.wait(0.005):
-            if cancel.cancelled:
-                raise Cancelled("cancelled")
-        return " Open the claw (wind) "
+        try:
+            while not self.release.wait(0.005):
+                if cancel.cancelled:
+                    raise Cancelled("cancelled")
+            return " Open the claw (wind) "
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 def test_partials_are_handed_out_by_poll_one_newest_at_a_time():
@@ -398,6 +406,30 @@ def test_no_partial_starts_after_end_of_speech_even_when_none_was_in_flight():
         _speech(window, 1.0)                                    # new audio after the end of speech: refused
     time.sleep(0.15)
     assert fake.calls.count('partial') == 1 and tr.cancelled == 0
+
+
+def test_a_second_start_makes_no_second_worker():
+    fake, window = _FakeWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.started.acquire(timeout=2)                      # its one worker's partial is in flight, held
+    with pytest.raises(RuntimeError, match="once"):
+        tr.start()
+    assert not fake.started.acquire(timeout=0.2)                # no second worker sent a partial
+    assert tr.finish() == "Open the claw." and tr.partials == 1 and tr.cancelled == 1
+    assert fake.active == 0 and fake.calls == ["partial", "final"]   # nothing still holds the server
+
+
+def test_start_after_finish_is_refused():
+    fake, window = _FakeWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    assert tr.finish() == "Open the claw."                      # a final with no partials is fine
+    with pytest.raises(RuntimeError, match="once"):
+        tr.start()                                              # but the utterance is over
+    time.sleep(0.1)
+    assert fake.calls == ["final"] and tr.partials == 0
 
 
 # ---- whisper's noise tags: only known markers are dropped --------------------------------------------------------
