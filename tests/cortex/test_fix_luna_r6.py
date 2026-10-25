@@ -66,6 +66,17 @@ def test_deleting_a_fired_commitment_removes_its_wake_text(tmp_path,arena,clock)
     b.close()
 
 
+def test_deleting_a_commitment_whose_wake_failed_removes_the_error_text(tmp_path,arena,clock):
+    s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    t=b.schedule('the tray arrives','bring Sample A to the bench zqxword',principal='carther')      # cannot be parsed at wake
+    assert 'zqxword' in b.trigger('the tray arrives',event_id='ev1',principal='carther')[0]['error']
+    assert 'zqxword' in s.one('SELECT error FROM cx_wake')['error']
+    s.revoke_source(s.one('SELECT source_id FROM prospective_task WHERE id=?',(t['task_id'],))['source_id'],delete=True)
+    for (name,) in [tuple(r.values()) for r in s.rows("SELECT name FROM sqlite_master WHERE type='table'")]:
+        for row in s.rows(f'SELECT * FROM "{name}"'): assert 'zqxword' not in json.dumps(row,default=str).lower(),(name,row)
+    b.close()
+
+
 # P2-4: one vault file has one name; a hard-linked vault is refused, under either name.
 def test_a_hard_linked_vault_is_refused(tmp_path):
     a=tmp_path/'v.db';Store(a).close();alias=tmp_path/'alias.db'
