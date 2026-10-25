@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .learning import Activity,Dreamer,Skills
-from .models import IntentAdvisor,QwenClient,ModelUnavailable
+from .models import IntentAdvisor,QwenClient,ModelUnavailable,model_context,prompt_refs
 from .planning import CAPS,CLAW,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import TASK_STATE,Store
 from .seeding import synthetic_seed_present
@@ -249,7 +249,9 @@ class Brain:
         self.store.decision('plan','llama.cpp',out.model,True,'verified')
         self.store.manifest('last_qwen_request','parametric',{'contract_sha256':out.contract_hash,'prompt_sha256':out.prompt_hash,
             'input_tokens':out.input_tokens,'model':out.model,'elapsed_ms':out.elapsed_ms,'response_accepted':True})
-        plan['refs']=sorted(set(plan['refs']+out.refs))
+        # The plan rests on everything the model was shown, cited or not: every source, rule, derived memory and episode
+        # in the exact context it was given (as QwenClient builds it), whatever the model's own citations.
+        plan['refs']=sorted(set(plan['refs'])|set(out.refs)|set(prompt_refs(model_context(bundle))))
         return plan,''
 
     def _fixture(self) -> dict:

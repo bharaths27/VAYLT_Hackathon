@@ -130,3 +130,24 @@ def test_a_prerequisite_no_longer_observed_at_dispatch_stops_the_close(brain,clo
     brain.operation=ageing
     assert approve(brain,p)['status']=='aborted'                                            # was: closed on a stale observation
     assert not [c for c in brain.robot.calls if c[0]=='gripper_close']
+
+
+# P2-3: a model plan rests on every source-backed input of the exact context it was shown, even one it did not cite:
+# revoking that source withdraws the proposal and the recipe built from it.
+from engram.cortex.models import ModelResult
+class Planner:
+    """A local model asked first that plans from its context and cites nothing of it."""
+    planning_order='model_first'
+    def __init__(self,steps): self.steps=steps
+    def manifest(self): return {}
+    def complete(self,purpose,bundle,**kw): return ModelResult({'steps':self.steps},'stub','m',0,'h',1,'p')
+
+def test_a_source_retrieved_for_a_model_plan_backs_it_even_uncited(store,arena):
+    note=store.teach('Note','Sample A is kept in the cold room.',owner='carther')['source_id']
+    steps=[{'op':'locate_tag','args':{'object_id':'sample_a'}},{'op':'pick_tagged_object','args':{'object_id':'sample_a'}},{'op':'place_at_zone','args':{'zone':'bench'}}]
+    b=Brain(store,FakeRobot(arena),qwen=Planner(steps));p=b.command('Bring Sample A to the bench.',principal='carther')
+    assert p['source']=='model' and any(e.get('source_id')==note for e in p['memory']['evidence'])   # retrieved, uncited
+    assert 'source:'+note in p['plan']['refs']                                                     # was: missing
+    store.revoke_source(note)
+    assert b.operation(p['operation_id'])['status']=='invalidated'                                # was: still proposed
+    assert store.derived(p['derived_memory_id'])['status']=='STALE'
