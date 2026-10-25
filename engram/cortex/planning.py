@@ -35,6 +35,8 @@ PHYSICAL = set(CAPS) - {'stop','observe','locate_tag','speak'}
 NAVIGATION = {'go_to_zone','drive_bounded','turn_bounded','approach_tag'}
 # Ops that act on whatever the claw holds.
 CLAW = {'gripper_open','gripper_close'}
+# Ops whose effect depends on what the claw holds: they carry it, need it empty, put it down or grip or release it.
+CLAW_BOUND = NAVIGATION | {'pick_tagged_object','place_at_zone'} | CLAW
 # The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table). A control op
 # (CONTROL_OPS) is none of them: a primitive goal naming one allows no step at all.
 GOAL_OPS = {'fetch':('observe','locate_tag','pick_tagged_object','place_at_zone'),'goto':('go_to_zone',),'inspect':('observe','locate_tag')}

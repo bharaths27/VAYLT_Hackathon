@@ -14,13 +14,14 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable,model_context,prompt_refs
-from .planning import CAPS,CLAW,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,CLAW,CLAW_BOUND,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import TASK_STATE,Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
 from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,digest,normalize,text,uid
 
 WHEN=re.compile(r'^\s*(?:when|once|after|as soon as)\s+(.+?),\s*(?:then\s+)?(.+)$',re.I)
+UNREPORTED=object()   # a claw state the adapter did not report: unknown, never equal to any report
 # The system events every operator sees (/events): they carry no operator's details. Any other event with no operation
 # is the operator's who caused it (journal(owner=...)), and one with neither (an older version's) is nobody's.
 PUBLIC_EVENTS=('stop','clock_jump')
@@ -335,7 +336,8 @@ class Brain:
                     if claimed!=1: raise Conflict('operation already claimed')
                     now=self.store.clock()
                     self.store.conn.execute('INSERT INTO approval VALUES(?,?,?,?,?,?,?,?)',(uid('apv'),'plan',ep,actual,principal,now,r['expires_at'],now))
-                return self._execute(ep,goal,plan)
+                # What the claw held when this was approved, empty included (unreported: never matches a live report).
+                return self._execute(ep,goal,plan,claw=world['holding'] if world.get('holding_known') else UNREPORTED)
         finally: self._effect_lock.release()
 
     def _prerequisites_observed(self,goal: Goal,oid: str,held: frozenset) -> None:
@@ -360,9 +362,10 @@ class Brain:
                 return 'procedure was revoked or changed'
         return None
 
-    def _execute(self,ep: str,goal: Goal,plan: dict) -> dict:
+    def _execute(self,ep: str,goal: Goal,plan: dict,*,claw) -> dict:
         steps=[]; outcome='success'; reason=None; seen=set(); tags={o['tag']:o['id'] for o in self.store.objects()}; moved=False
         op=self.operation(ep); held=frozenset(plan.get('held',[]))
+        expected=claw       # what the claw must hold before the next step: as approved, then after the plan's own effects
         try:
             for i,s in enumerate(plan['steps']):
                 # From its first check through its dispatch a step holds the vault's authority: a revocation, a new
@@ -380,8 +383,14 @@ class Brain:
                         if oid not in seen: raise Missing('no fresh in-operation observation for pickup')
                         self._prerequisites_observed(goal,oid,held)
                     elif s['op'] in CLAW and held:
-                        if Compiler.held(goal,self._fixture())!=held: raise Stale('the claw holds something else than when this was approved')
                         for oid in held: self._prerequisites_observed(goal,oid,held)
+                    # A step that carries, needs, puts down or grips what the claw holds dispatches only while the claw
+                    # holds exactly what the plan expects (empty included): one loaded or swapped since never travels,
+                    # is never picked over, put down or closed on unchecked.
+                    if s['op'] in CLAW_BOUND:
+                        live=self.robot.state()
+                        if 'holding' not in live or live['holding']!=expected:
+                            raise Stale('the claw does not hold what this step expects (as approved, or as the plan left it)')
                     self.journal(ep,s['op'],s['args'],'pending',step=i)
                     # The recipe or skill behind this plan must still back it at every step: a revocation mid-run stops it.
                     changed=self._provenance_changed(op,plan)
@@ -408,6 +417,8 @@ class Brain:
                 self.journal(ep,s['op'],s['args'],'reported_done' if reported=='done' else reported,getattr(result,'detail',''),i)
                 steps.append({**s,'status':reported,'detail':getattr(result,'detail','')})
                 if reported!='done': outcome='unknown' if reported not in {'failed','rejected'} else 'failed'; reason='adapter outcome: '+reported; break
+                if s['op']=='pick_tagged_object': expected=s['args']['object_id']
+                elif s['op'] in ('place_at_zone','gripper_open'): expected=None
             if outcome=='success':
                 if self.mode=='SIMULATED':
                     state=self.robot.state()
