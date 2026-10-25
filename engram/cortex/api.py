@@ -200,7 +200,8 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     keys=tokens if tokens is not None else {env_token():os.environ.get('CORTEX_OPERATOR','operator')}
     if not keys or any(len(k)<32 or not v.strip() for k,v in keys.items()):
         raise Denied('configure a random server-side CORTEX_API_TOKEN of at least 32 characters')
-    skeys=sensor_tokens or ({os.environ['CORTEX_SENSOR_TOKEN']:'sensor:camera'} if os.environ.get('CORTEX_SENSOR_TOKEN') else {})
+    # An explicit set, even an empty one (sensors disabled), is the caller's; only an absent one falls back to the environment.
+    skeys=sensor_tokens if sensor_tokens is not None else ({os.environ['CORTEX_SENSOR_TOKEN']:'sensor:camera'} if os.environ.get('CORTEX_SENSOR_TOKEN') else {})
     if any(len(k)<32 or not v.startswith('sensor:') or k in keys for k,v in skeys.items()):
         raise Denied('sensor credentials must be distinct, scoped and at least 32 characters')
     b=brain or _configured_brain()

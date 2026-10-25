@@ -206,3 +206,17 @@ def test_guard_an_idle_answer_is_never_kept_from_inside_a_transaction(arena,cloc
     with b.store.tx():
         with pytest.raises(RuntimeError,match='lock order'): b.dreamer._keep(None,'x',[],[],[],0)
     b.close()
+
+
+# P2-7: an explicit empty set of sensor credentials disables sensors; only an absent set falls back to the environment.
+SENSOR='synthetic-test-sensor-token-for-the-camera-0123'
+PACKET={'object_id':'sample_a','zone':'bench','captured_at':1700000000.0,'boot_id':'boot-1','sequence':1,'frame_id':'f-1','calibration_id':'cal-1'}
+
+def test_an_explicit_empty_sensor_credential_set_refuses_the_environment_token(brain,monkeypatch):
+    monkeypatch.setenv('CORTEX_SENSOR_TOKEN',SENSOR)
+    with TestClient(create_app(brain,tokens={TA:'alice'},sensor_tokens={},start_idle=False)) as c:
+        r=c.post('/observations/sensor',json=PACKET,headers=h(SENSOR))
+        assert r.status_code==401,r.text                                                     # was: a trusted observation
+    assert not brain.store.one('SELECT 1 FROM observation')
+    with TestClient(create_app(brain,tokens={TA:'alice'},start_idle=False)) as c:              # control: absent, the environment's
+        assert c.post('/observations/sensor',json=PACKET,headers=h(SENSOR)).status_code==200
