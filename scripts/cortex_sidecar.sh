@@ -114,6 +114,7 @@ refuse_unsafe_config() {
     for brain in "$REPO/engram.db" "${ENGRAM_DB:-}"; do
         [ -z "$brain" ] || [ "$(same_file "$DB" "$brain")" = different ] || die "refusing CORTEX_DB=$DB: it is the same file as the old brain's database $brain"
     done
+    # "$state/" against "$repo"/*: the repository root itself matches too (the * may be empty).
     case $state/ in
         "$repo"/*) die "refusing CORTEX_STATE_DIR=$STATE (resolves to $state): the token must live outside the repository" ;;
     esac
@@ -122,9 +123,21 @@ refuse_unsafe_config() {
     [ -f "$ARENA" ] || die "lab arena not found at $ARENA"
 }
 
+# One start at a time: an atomic mkdir in the state directory. A lock whose recorded starter is dead is reclaimed;
+# one without a recorded starter yet is another start in progress.
+start_lock() {
+    lock=$STATE/start.lock
+    if ! mkdir "$lock" 2>/dev/null; then
+        holder=$(cat "$lock/pid" 2>/dev/null || true)
+        { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } || die "another start is in progress (remove $lock if none is)"
+        rm -rf "$lock"; mkdir "$lock" 2>/dev/null || die "another start is in progress"
+    fi
+    LOCKED=$lock; echo $$ > "$lock/pid"
+    trap 'rm -rf "$LOCKED"' EXIT
+}
+
 start() {
     refuse_unsafe_config
-    if running; then echo "cortex-sidecar: already running (pid $(cat "$PID_FILE")) at $(url)"; return 0; fi
     py=$(python_bin)
     # A dedicated state directory: created here with mode 700, or an existing one that already is exactly that.
     if [ -e "$STATE" ] || [ -L "$STATE" ]; then
@@ -132,6 +145,8 @@ start() {
     else
         (umask 077 && mkdir -p -- "$STATE") || die "could not create $STATE"
     fi
+    start_lock
+    if running; then echo "cortex-sidecar: already running (pid $(cat "$PID_FILE")) at $(url)"; return 0; fi
     [ ! -L "$TOKEN_FILE" ] || die "refusing $TOKEN_FILE: the token path is a symlink"
     if [ ! -e "$TOKEN_FILE" ]; then new_token "$TOKEN_FILE" || die "could not create $TOKEN_FILE"; fi
     [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ] || die "refusing $TOKEN_FILE: not a non-empty regular file"
@@ -145,20 +160,21 @@ start() {
         CORTEX_LIVE=0 CORTEX_CLOUD=0 CORTEX_QWEN=0 CORTEX_IDLE=1 \
         nohup "$py" -m uvicorn engram.cortex.api:create_app --factory --host "$HOST" --port "$PORT" \
         >>"$LOG" 2>&1 </dev/null &
-    echo $! > "$PID_FILE"
+    child=$!; echo "$child" > "$PID_FILE"
     i=0
     while [ $i -lt 30 ]; do
-        kill -0 "$(cat "$PID_FILE")" 2>/dev/null || break      # our process died (e.g. the port was taken): never "started"
-        if [ "$(owns_port "$(cat "$PID_FILE")")" = ours ] && ours >/dev/null 2>&1 && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-            echo "cortex-sidecar: started (pid $(cat "$PID_FILE")) at $(url); db $DB; token file $TOKEN_FILE; log $LOG"
+        kill -0 "$child" 2>/dev/null || break      # our process died (e.g. the port was taken): never "started"
+        if [ "$(owns_port "$child")" = ours ] && ours >/dev/null 2>&1 && kill -0 "$child" 2>/dev/null; then
+            echo "cortex-sidecar: started (pid $child) at $(url); db $DB; token file $TOKEN_FILE; log $LOG"
             echo "cortex-sidecar: inspector: ssh -L $PORT:$(tunnel_host):$PORT starrasp@star-pi, then http://127.0.0.1:$PORT/cortex"
             return 0
         fi
         sleep 1; i=$((i+1))
     done
     tail -n 20 "$LOG" >&2 || true
-    kill "$(cat "$PID_FILE")" 2>/dev/null || true
-    rm -f "$PID_FILE"
+    # Only our own child, and only the PID file that still names it.
+    kill "$child" 2>/dev/null || true
+    [ "$(cat "$PID_FILE" 2>/dev/null || true)" != "$child" ] || rm -f "$PID_FILE"
     die "did not become healthy; see $LOG"
 }
 
