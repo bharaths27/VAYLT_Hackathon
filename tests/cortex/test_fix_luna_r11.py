@@ -209,3 +209,24 @@ def test_guard_an_expiry_at_the_window_edge_is_the_same_for_recovery_and_approva
     p=brain.command('Go to the shelf b',principal='carther');clock.advance(brain.store.policy.approval_ttl_s)
     with pytest.raises(Stale): approve(brain,p)                                              # at the edge: expired for approval
     brain.recover();assert brain.operation(p['operation_id'])['status']=='expired'          # and for recovery
+
+
+# P2-7 (class A): an idle answer is kept whole under an unchanged activity generation, or not at all and asked again.
+# Barrier-controlled: foreground work begins right after the answer was recorded, before the cycle kept its hypotheses.
+from .test_fix_learn_dream import SOP,Stub,idle_brain
+
+def test_an_idle_answer_interrupted_while_it_is_kept_stays_pending_and_is_asked_again(arena,clock,monkeypatch):
+    b=idle_brain(arena,clock);b.store.teach('SOP',SOP,owner='op')
+    stub=Stub(lambda bundle:[{'text':'Goggles near the bench may help.','refs':[bundle['allowed_refs'][0]]}]);b.dreamer.qwen=stub
+    save=b.dreamer._save_model_state;touched=[]
+    def then_foreground_work(st):
+        save(st)
+        if st.get('answered') and not touched: touched.append(1);b.activity.touch()
+    monkeypatch.setattr(b.dreamer,'_save_model_state',then_foreground_work)
+    hypotheses=lambda:b.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis'")['n']
+    first=b.dreamer.cycle()
+    assert touched and first['model_pending'] and not hypotheses(),first                     # nothing of it kept...
+    assert b.dreamer._model_state()['answered'] is None                                      # ...nor recorded answered (was)
+    second=b.dreamer.cycle(force=True)
+    assert stub.calls==2 and hypotheses()==1 and not second['model_pending'],second         # asked again, kept whole
+    b.close()

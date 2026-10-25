@@ -186,6 +186,10 @@ class Activity:
         with self.lock: return self.busy,self.generation,self.clock()-self.last
 
 
+class _Interrupted(Exception):
+    """Foreground work began while an idle answer was being kept: the transaction keeping it rolls back."""
+
+
 class Dreamer:
     LIVE_CAP=128                 # per-kind cap on LIVE rows (stale/deleted rows do not count)
     PRACTICE_WINDOW_S=86400.0    # practice cap is rolling: cases created in the last day
@@ -232,6 +236,26 @@ class Dreamer:
         if not self._cycle_lock.acquire(blocking=False): return {'status':'busy'}
         try: return self._cycle(force=force)
         finally: self._cycle_lock.release()
+
+    def _keep(self, q, asked: str, refs: list[str], made: list, errors: list, interrupted: Callable[[], bool]) -> bool:
+        """An idle answer is kept whole or not at all. Its hypotheses and the record that its input was answered commit
+        in one transaction, under an activity generation still unchanged when it commits. Interrupted, nothing of it is
+        kept and the input stays pending, to be asked again (False)."""
+        kept,rejected=[],[]
+        try:
+            with self.store.tx():
+                for h in q.value.get('candidates',[])[:3]:
+                    if self._live_hypotheses()>=self.LIVE_CAP: break                # the cap holds for every accepted row
+                    try:                                                            # one bad candidate never sinks its siblings
+                        if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list) or not all(isinstance(x,str) for x in h['refs']):
+                            raise Missing('malformed hypothesis candidate')
+                        if not h['refs'] or not set(h['refs'])<=set(refs): raise Missing('hypothesis must cite allowed refs')
+                        kept.append(self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')['id'])
+                    except CortexError as e: rejected.append('hypothesis rejected: '+type(e).__name__)
+                st=self._model_state(); st.update(answered=asked,input=None,attempts=0); self._save_model_state(st)
+                if interrupted(): raise _Interrupted
+        except _Interrupted: return False
+        made.extend(kept); errors.extend(rejected); return True
 
     def _live_hypotheses(self) -> int:
         return self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
@@ -359,7 +383,8 @@ class Dreamer:
             # first: one already answered (or explicitly abandoned), or none worth asking, is no pending work and lets the
             # watermark advance. A new input stays pending until the model answered it: past the time budget it keeps the
             # watermark open; past the call budget it waits, persisted, until the oldest call leaves the window (idle ticks
-            # do not re-run the cycle meanwhile); a failed attempt keeps it open and backs off. A cap of zero never asks.
+            # do not re-run the cycle meanwhile); a failed attempt keeps it open and backs off. A cap of zero never asks. An
+            # answer is kept whole, or (foreground work began) not at all and asked again: Dreamer._keep.
             if self.qwen and self._model_cap()>0:
                 evidence=[]; refs=[]
                 for r in self.store.rules()[:4]:
@@ -387,28 +412,15 @@ class Dreamer:
                     st=self._model_state(); q=None; st['calls'].append(self.store.clock()); self._save_model_state(st)
                     try: q=self.qwen.complete('dream',bundle)                           # yields to foreground work
                     except CortexError as e: errors.append(type(e).__name__)
-                    st=self._model_state()
                     if q is None and interrupted(): model_pending=True                   # it yielded: not a failed attempt
                     elif q is None:
-                        n=st['attempts']+1 if st['input']==asked else 1
+                        st=self._model_state(); n=st['attempts']+1 if st['input']==asked else 1
                         if n>=self.MODEL_ATTEMPTS:
                             st.update(answered=asked,input=None,attempts=0)    # explicitly abandoned, and recorded
                             self.store.decision('dream_model','local',None,False,f'input abandoned after {n} failed model attempts')
                         else: st.update(input=asked,attempts=n); model_pending=model_failed=True
-                    elif interrupted(): model_pending=True                     # a late answer is not kept: asked again
-                    else: st.update(answered=asked,input=None,attempts=0)
-                    self._save_model_state(st)
-                    if q and not interrupted():
-                        for h in q.value.get('candidates',[])[:3]:
-                            if self._live_hypotheses()>=self.LIVE_CAP: break                # the cap holds for every accepted row
-                            # One bad candidate never sinks its siblings or the cycle.
-                            try:
-                                if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list) or not all(isinstance(x,str) for x in h['refs']):
-                                    raise Missing('malformed hypothesis candidate')
-                                if not h['refs'] or not set(h['refs'])<=set(refs): raise Missing('hypothesis must cite allowed refs')
-                                m=self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')
-                                made.append(m['id'])
-                            except CortexError as e: errors.append('hypothesis rejected: '+type(e).__name__)
+                        self._save_model_state(st)
+                    elif not self._keep(q,asked,refs,made,errors,interrupted): model_pending=True   # a late answer: asked again
             status='yielded' if interrupted() else 'complete'; leftover=leftover or (model_pending and model_wait is None)
         except Exception as e:
             status='failed'; errors.append(type(e).__name__)
