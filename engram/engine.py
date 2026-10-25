@@ -9,6 +9,7 @@ Flow for one request:
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import sqlite3
@@ -24,7 +25,7 @@ from .heard import record_heard
 from .ids import digest, new_id
 from .memory import Memory
 from .planner import PlanResult, RulePlanner, find_zone, refusal, targets_in
-from .prospective import Prospective, parse_when
+from .prospective import Prospective, normalize, parse_when
 from .recall import Recall, is_memory_question
 from .robot.base import RobotAdapter
 from .skills import Skills
@@ -56,12 +57,24 @@ class Engine:
         self.executor = Executor(conn, robot, self.memory)
         self.models_dir = models_dir
         self.model_hashes_at_start = hash_models(models_dir)
+        # Canonical request text (normalized) -> fixed steps. See register_fixed_request().
+        self.fixed_requests: dict[str, list[dict[str, Any]]] = {}
 
     # ---- setup -----------------------------------------------------------
 
     def set_robot(self, robot: RobotAdapter) -> None:
         self.robot = robot
         self.executor.robot = robot
+
+    def register_fixed_request(self, request: str, steps: list[dict[str, Any]]) -> None:
+        """Plan this exact request (case and punctuation aside) as these steps, without a planner.
+
+        For short canonical requests the rule planner cannot plan because they name no object,
+        such as a voice preset's "Open the gripper". Only planning is skipped: propose() still
+        refuses negated or future wording, the checker must accept the steps, and a person must
+        approve the plan's digest before anything runs. Future tasks that fire use the same path.
+        """
+        self.fixed_requests[normalize(request)] = copy.deepcopy(steps)
 
     def load_arena(self, arena: dict[str, Any]) -> None:
         """Bind tagged objects from the arena file. Locations come only from observations."""
@@ -123,8 +136,12 @@ class Engine:
         bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
         targets = targets_in(request, self.memory)
         zone = find_zone(request, self.zones)
-        skill = self.skills.find(targets, zone) if targets else None
-        if skill:
+        fixed = self.fixed_requests.get(normalize(request))
+        skill = self.skills.find(targets, zone) if targets and fixed is None else None
+        if fixed is not None:
+            plan = {"goal": request, "steps": copy.deepcopy(fixed), "evidence": [], "rules_used": []}
+            res = PlanResult(plan, planner_calls=0, source="fixed", targets=targets, zone=None)
+        elif skill:
             t0 = time.perf_counter()
             plan = {"goal": request, "steps": skill["definition"]["steps"],
                     "evidence": skill["definition"]["evidence"], "rules_used": skill["definition"]["rules_used"],
