@@ -278,6 +278,16 @@ def _cli(*args, env_extra=None):
                           capture_output=True, text=True, env=env, timeout=60)
 
 
+def _vision_ask():
+    """scripts/vision_ask.py as a module, for the tests that swap one of its parts."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("vision_ask", REPO / "scripts" / "vision_ask.py")
+    va = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(va)
+    return va
+
+
 def test_the_cli_exits_nonzero_when_a_file_fails_and_two_without_configuration(tmp_path):
     missing = str(tmp_path / "no-such-photo.jpg")
     r = _cli("hand", "--image", missing, env_extra={"TYPESAFE_API_KEY": KEY, "TYPESAFE_INTENT_MODEL": "m"})
@@ -297,11 +307,7 @@ def test_the_cli_refuses_an_interval_or_timeout_that_is_not_a_sane_number_of_sec
 
 
 def test_the_cli_takes_zero_as_one_frame_and_a_fraction_as_an_interval():
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("vision_ask", REPO / "scripts" / "vision_ask.py")
-    va = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(va)
+    va = _vision_ask()
     every, timeout = va._seconds(0.0, 3600.0, low_ok=True), va._seconds(0.0, iv.MAX_TIMEOUT_S, low_ok=False)
     assert every("0") == 0.0 and every("0.5") == 0.5 and every("3600") == 3600.0
     assert timeout("4") == 4.0 and timeout(str(iv.MAX_TIMEOUT_S)) == iv.MAX_TIMEOUT_S
@@ -309,11 +315,8 @@ def test_the_cli_takes_zero_as_one_frame_and_a_fraction_as_an_interval():
 
 def test_a_truncated_robot_frame_is_a_failed_frame_not_a_crash(monkeypatch):
     import http.client
-    import importlib.util
 
-    spec = importlib.util.spec_from_file_location("vision_ask", REPO / "scripts" / "vision_ask.py")
-    va = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(va)
+    va = _vision_ask()
 
     class Truncated:
         def __enter__(self):
@@ -328,3 +331,70 @@ def test_a_truncated_robot_frame_is_a_failed_frame_not_a_crash(monkeypatch):
     monkeypatch.setattr(va.urllib.request, "urlopen", lambda *a, **k: Truncated())
     with pytest.raises(iv.VisionError):
         va.robot_frame("http://robot.invalid:8200")
+
+
+def _fake_cv2(opened=True, frame=(True, "a frame"), encode=(True, b"jpeg bytes")):
+    """Just enough of OpenCV for the webcam path, so these tests never open a real camera."""
+    import types
+
+    class Cap:
+        released = False
+
+        def isOpened(self):
+            return opened
+
+        def read(self):
+            if isinstance(frame, Exception):
+                raise frame
+            return frame
+
+        def release(self):
+            Cap.released = True
+
+    cv2 = types.SimpleNamespace(IMWRITE_JPEG_QUALITY=1, error=type("error", (Exception,), {}), Cap=Cap)
+    cv2.VideoCapture = lambda index: Cap()
+
+    def imencode(ext, img, params):
+        if encode == "raise":
+            raise cv2.error("bad frame")
+        return encode
+    cv2.imencode = imencode
+    return cv2
+
+
+class _Encoded(bytes):
+    def tobytes(self):
+        return bytes(self)
+
+
+@pytest.mark.parametrize("encode", [(False, None), (True, _Encoded(b"")), "raise"])
+def test_a_webcam_frame_that_cannot_be_encoded_is_a_failed_frame_not_a_crash(monkeypatch, encode):
+    # luna round 7: imencode's status was never checked and cv2.error is not an OSError, so the CLI died mid-loop
+    fake = _fake_cv2(encode=encode)
+    monkeypatch.setitem(sys.modules, "cv2", fake)
+    va = _vision_ask()
+    with pytest.raises(iv.VisionError):
+        va.webcam_frame(fake.VideoCapture(0))
+
+
+def test_a_good_webcam_frame_is_returned_as_its_jpeg_bytes(monkeypatch):
+    fake = _fake_cv2(encode=(True, _Encoded(b"jpeg bytes")))
+    monkeypatch.setitem(sys.modules, "cv2", fake)
+    assert _vision_ask().webcam_frame(fake.VideoCapture(0)) == b"jpeg bytes"
+
+
+@pytest.mark.parametrize("cv2_module,expect", [(None, "needs OpenCV"), ("closed", "did not open"),
+                                               ("unencodable", "could not be encoded")])
+def test_the_cli_prints_one_error_line_and_exits_1_when_the_webcam_fails(monkeypatch, capsys, cv2_module, expect):
+    if cv2_module == "closed":
+        cv2_module = _fake_cv2(opened=False)
+    elif cv2_module == "unencodable":
+        cv2_module = _fake_cv2(encode=(False, None))
+    monkeypatch.setitem(sys.modules, "cv2", cv2_module)  # None makes `import cv2` raise ImportError
+    monkeypatch.setenv("TYPESAFE_API_KEY", KEY)
+    monkeypatch.setenv("TYPESAFE_INTENT_MODEL", "m")
+    monkeypatch.setattr(sys, "argv", ["vision_ask.py", "hand", "--webcam", "0"])
+    va = _vision_ask()
+    assert va.main() == 1
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1 and expect in json.loads(lines[0])["error"] and KEY not in lines[0]
