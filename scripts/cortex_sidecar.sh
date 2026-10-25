@@ -43,11 +43,13 @@ running() {
 # Canonical path (symlinks and .. resolved, also for a path that does not exist yet; '/' separators) and file
 # identity, both by the Python that runs Cortex: portable beyond GNU realpath/stat. Two paths are the same file when
 # they resolve to one canonical path (whether or not it exists yet) or, existing, share device + inode (a hard link).
-# same_file answers with a word, so a failed check can never read as "different".
+# same_file answers with a word, so a failed check can never read as "different"; is_absolute likewise never reads a
+# failed check as "absolute" (a drive-letter path counts, as the brain's Python sees it).
 canon() { "$(python_bin)" -c 'import os,sys;print(os.path.realpath(sys.argv[1]).replace(os.sep,"/"))' "$1"; }
 same_file() { "$(python_bin)" -c 'import os,sys;a,b=sys.argv[1:]
 same=os.path.realpath(a)==os.path.realpath(b) or (os.path.exists(a) and os.path.exists(b) and os.path.samefile(a,b))
 print("same" if same else "different")' "$1" "$2"; }
+is_absolute() { "$(python_bin)" -c 'import os,sys;print("absolute" if os.path.isabs(sys.argv[1]) else "relative")' "$1"; }
 
 # The listener on the port is our child: the listening socket's inode is in the child's fd table (Linux /proc).
 # Until that is shown no credential goes to whatever answers there; without /proc it cannot be shown: not ours.
@@ -116,6 +118,11 @@ refuse_unsafe_config() {
     for name in "$DB" "$db"; do
         [ "$(basename -- "$name")" != engram.db ] || die "refusing CORTEX_DB=$DB (resolves to $db): Cortex never opens the old brain's database"
     done
+    # The brain resolves a relative ENGRAM_DB against its own working directory, which is not known here (nor is it this
+    # shell's): only an absolute path can be compared with CORTEX_DB.
+    if [ -n "${ENGRAM_DB:-}" ] && [ "$(is_absolute "$ENGRAM_DB")" != absolute ]; then
+        die "refusing ENGRAM_DB=$ENGRAM_DB: give the brain's database as an absolute path (the brain resolves a relative one against its own working directory)"
+    fi
     for brain in "$REPO/engram.db" "${ENGRAM_DB:-}"; do
         [ -z "$brain" ] || [ "$(same_file "$DB" "$brain")" = different ] || die "refusing CORTEX_DB=$DB: it is the same file as the old brain's database $brain"
     done
