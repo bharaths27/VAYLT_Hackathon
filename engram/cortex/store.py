@@ -152,6 +152,10 @@ class Store:
             finally:
                 self._held.tx -= 1
 
+    def in_tx(self) -> bool:
+        """Whether this thread is inside one of this store's transactions."""
+        return bool(getattr(self._held, 'tx', 0))
+
     @contextmanager
     def held_authority(self):
         """Hold the vault's authority (see __init__). Taken before the store lock, never from inside a transaction that

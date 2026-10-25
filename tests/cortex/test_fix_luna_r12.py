@@ -167,3 +167,42 @@ def test_a_settled_commitment_is_never_withdrawn_to_cancelled(brain,clock,outcom
     assert status()==outcome
     with pytest.raises(Conflict,match='outcome stands'): brain.cancel_task(t,principal='carther')   # was: cancelled
     assert status()==outcome
+
+
+# P2-5 (class A, in round 11's own fix): no foreground work begins between an idle answer's last check and its commit.
+# Barrier-controlled: the keep's COMMIT pauses while another thread tries to begin foreground work.
+from .test_fix_learn_dream import SOP as DREAM_SOP,Stub,idle_brain
+class PausingAtCommit:
+    """The vault's connection, pausing at its next COMMIT once armed: right then the hook runs."""
+    def __init__(self,conn): self.conn,self.armed,self.hook=conn,False,None
+    def execute(self,sql,*args):
+        if self.armed and sql=='COMMIT': self.armed=False;self.hook()
+        return self.conn.execute(sql,*args)
+    def __getattr__(self,name): return getattr(self.conn,name)
+
+def test_foreground_work_cannot_begin_between_an_idle_answers_check_and_its_commit(arena,clock,monkeypatch):
+    b=idle_brain(arena,clock);b.store.teach('SOP',DREAM_SOP,owner='op')
+    b.dreamer.qwen=Stub(lambda bundle:[{'text':'Goggles near the bench may help.','refs':[bundle['allowed_refs'][0]]}])
+    conn=PausingAtCommit(b.store.conn);b.store.conn=conn;entered,release,began=threading.Event(),threading.Event(),[]
+    def foreground():
+        with b.activity.foreground(): entered.set();release.wait(5)
+    worker=threading.Thread(target=foreground,daemon=True)
+    def at_commit(): worker.start();began.append(entered.wait(.5))                        # does it begin before the commit?
+    conn.hook=at_commit;save=b.dreamer._save_model_state
+    def arm(st):
+        save(st)
+        if st.get('answered'): conn.armed=True                                             # recorded: the keep's commit is next
+    monkeypatch.setattr(b.dreamer,'_save_model_state',arm)
+    try: b.dreamer.cycle()
+    finally:
+        release.set();b.store.conn=conn.conn
+        if worker.ident: worker.join(5)
+    assert began==[False],began                                                            # was: it began, the answer kept anyway
+    assert b.dreamer._model_state()['answered'] and b.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis'")['n']==1
+    b.close()
+
+def test_guard_an_idle_answer_is_never_kept_from_inside_a_transaction(arena,clock):
+    b=idle_brain(arena,clock)
+    with b.store.tx():
+        with pytest.raises(RuntimeError,match='lock order'): b.dreamer._keep(None,'x',[],[],[],0)
+    b.close()

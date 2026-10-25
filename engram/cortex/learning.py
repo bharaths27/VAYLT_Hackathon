@@ -176,7 +176,8 @@ class Skills:
 
 
 class Activity:
-    """Process-local interactive activity; no inference is allowed to own the stop path."""
+    """Process-local interactive activity; no inference is allowed to own the stop path. Its lock is never taken while
+    the store's is held (foreground work begins before its transactions), so idle work may hold it over a commit."""
     def __init__(self, monotonic: Callable=time.monotonic):
         self.clock=monotonic; self.lock=threading.Lock(); self.busy=0; self.generation=0; self.last=self.clock()
 
@@ -193,9 +194,11 @@ class Activity:
     def snapshot(self):
         with self.lock: return self.busy,self.generation,self.clock()-self.last
 
-
-class _Interrupted(Exception):
-    """Foreground work began while an idle answer was being kept: the transaction keeping it rolls back."""
+    @contextmanager
+    def quiet(self, generation: int):
+        """No foreground work begins while the block runs. Yields whether none began since `generation` (none busy, none
+        started): idle work that commits its result inside the block makes that check and that commit one step."""
+        with self.lock: yield self.busy==0 and self.generation==generation
 
 
 class Dreamer:
@@ -264,12 +267,14 @@ class Dreamer:
         try: return self._cycle(force=force)
         finally: self._cycle_lock.release()
 
-    def _keep(self, q, asked: str, refs: list[str], made: list, errors: list, interrupted: Callable[[], bool]) -> bool:
-        """An idle answer is kept whole or not at all. Its hypotheses and the record that its input was answered commit
-        in one transaction, under an activity generation still unchanged when it commits. Interrupted, nothing of it is
-        kept and the input stays pending, to be asked again (False)."""
+    def _keep(self, q, asked: str, refs: list[str], made: list, errors: list, generation: int) -> bool:
+        """An idle answer is kept whole or not at all. Its hypotheses and the record that its input was answered commit in
+        one transaction inside Activity.quiet, so no foreground work can begin between its last check and its commit. If
+        some began since `generation`, nothing of it is kept and the input stays pending, to be asked again (False)."""
+        if self.store.in_tx(): raise RuntimeError('lock order: an idle answer is kept outside any transaction')
         kept,rejected=[],[]
-        try:
+        with self.activity.quiet(generation) as idle:
+            if not idle or self._stop.is_set(): return False
             with self.store.tx():
                 for h in q.value.get('candidates',[])[:3]:
                     if self._live_hypotheses()>=self.LIVE_CAP: break                # the cap holds for every accepted row
@@ -280,8 +285,6 @@ class Dreamer:
                         kept.append(self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')['id'])
                     except CortexError as e: rejected.append('hypothesis rejected: '+type(e).__name__)
                 st=self._model_state(); st.update(answered=asked,input=None,attempts=0); self._save_model_state(st)
-                if interrupted(): raise _Interrupted
-        except _Interrupted: return False
         made.extend(kept); errors.extend(rejected); return True
 
     def _live_hypotheses(self) -> int:
@@ -447,7 +450,7 @@ class Dreamer:
                             self.store.decision('dream_model','local',None,False,f'input abandoned after {n} failed model attempts')
                         else: st.update(input=asked,attempts=n); model_pending=model_failed=True
                         self._save_model_state(st)
-                    elif not self._keep(q,asked,refs,made,errors,interrupted): model_pending=True   # a late answer: asked again
+                    elif not self._keep(q,asked,refs,made,errors,generation): model_pending=True   # a late answer: asked again
             status='yielded' if interrupted() else 'complete'; leftover=leftover or (model_pending and model_wait is None)
         except Exception as e:
             status='failed'; errors.append(type(e).__name__)

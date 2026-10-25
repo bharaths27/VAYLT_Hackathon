@@ -212,21 +212,26 @@ def test_guard_an_expiry_at_the_window_edge_is_the_same_for_recovery_and_approva
 
 
 # P2-7 (class A): an idle answer is kept whole under an unchanged activity generation, or not at all and asked again.
-# Barrier-controlled: foreground work begins right after the answer was recorded, before the cycle kept its hypotheses.
+# Barrier-controlled: foreground work begins on another thread after the model answered, before the answer is kept. (It
+# can no longer begin between the keep's check and its commit, round 12: test_fix_luna_r12.)
 from .test_fix_learn_dream import SOP,Stub,idle_brain
 
-def test_an_idle_answer_interrupted_while_it_is_kept_stays_pending_and_is_asked_again(arena,clock,monkeypatch):
-    b=idle_brain(arena,clock);b.store.teach('SOP',SOP,owner='op')
-    stub=Stub(lambda bundle:[{'text':'Goggles near the bench may help.','refs':[bundle['allowed_refs'][0]]}]);b.dreamer.qwen=stub
-    save=b.dreamer._save_model_state;touched=[]
-    def then_foreground_work(st):
-        save(st)
-        if st.get('answered') and not touched: touched.append(1);b.activity.touch()
-    monkeypatch.setattr(b.dreamer,'_save_model_state',then_foreground_work)
+def test_an_idle_answer_interrupted_before_it_is_kept_stays_pending_and_is_asked_again(arena,clock):
+    b=idle_brain(arena,clock);b.store.teach('SOP',SOP,owner='op');busy,done=threading.Event(),threading.Event()
+    def foreground():
+        with b.activity.foreground(): busy.set();done.wait(5)
+    worker=threading.Thread(target=foreground,daemon=True)
+    class Interrupted(Stub):
+        def complete(self,purpose,bundle,**kw):
+            q=super().complete(purpose,bundle,**kw)
+            if self.calls==1: worker.start();assert busy.wait(5)                              # foreground work began meanwhile
+            return q
+    stub=Interrupted(lambda bundle:[{'text':'Goggles near the bench may help.','refs':[bundle['allowed_refs'][0]]}]);b.dreamer.qwen=stub
     hypotheses=lambda:b.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis'")['n']
-    first=b.dreamer.cycle()
-    assert touched and first['model_pending'] and not hypotheses(),first                     # nothing of it kept...
-    assert b.dreamer._model_state()['answered'] is None                                      # ...nor recorded answered (was)
+    try: first=b.dreamer.cycle()
+    finally: done.set();worker.join(5)
+    assert first['model_pending'] and not hypotheses(),first                                 # nothing of it kept...
+    assert b.dreamer._model_state()['answered'] is None                                      # ...nor recorded answered
     second=b.dreamer.cycle(force=True)
     assert stub.calls==2 and hypotheses()==1 and not second['model_pending'],second         # asked again, kept whole
     b.close()
