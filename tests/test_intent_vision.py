@@ -78,6 +78,8 @@ def test_prepare_jpeg_refuses_non_images_and_impossible_shapes():
     ({"answers": {}}, 200),
     ({"answers": {"signal": {"type": "noul", "noul": 0.5}}}, 200),
     ({"answers": {"signal": {"type": "choice", "choice": "dance", "confidence": 1, "probabilities": {"dance": 1}}}}, 200),
+    ({"answers": {"signal": {"type": "choice", "choice": "dance", "confidence": 1,
+                             "probabilities": {k: 0.125 for k in iv.HAND_SIGNALS}}}}, 200),
     (b"<html>gateway</html>", 200),
     ({"error": "bad"}, 400),
     ({"error": "nope"}, 500),
