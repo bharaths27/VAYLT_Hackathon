@@ -45,13 +45,32 @@ running() {
 canon() { "$(python_bin)" -c 'import os,sys;print(os.path.realpath(sys.argv[1]).replace(os.sep,"/"))' "$1"; }
 same_file() { "$(python_bin)" -c 'import os,sys;a,b=sys.argv[1:];print("same" if os.path.exists(a) and os.path.exists(b) and os.path.samefile(a,b) else "different")' "$1" "$2"; }
 
-# The responder is OUR Cortex: /health says cortex, our token is accepted and a wrong one refused. Any other
-# service on the port (one that kept it when our uvicorn failed to bind) fails this. The token goes via env, not argv.
+# The listener on the port is our child: the listening socket's inode is in the child's fd table (Linux /proc).
+# Until that is shown no credential goes to whatever answers there; without /proc it cannot be shown: not ours.
+owns_port() { "$(python_bin)" -c 'import os,sys
+pid,port=sys.argv[1],int(sys.argv[2]);inodes=set()
+for t in ("/proc/net/tcp","/proc/net/tcp6"):
+    try:
+        for line in open(t).read().splitlines()[1:]:
+            f=line.split()
+            if f[3]=="0A" and int(f[1].rsplit(":",1)[1],16)==port:inodes.add("socket:["+f[9]+"]")
+    except OSError:pass
+fds="/proc/"+pid+"/fd";mine=False
+try:
+    for fd in os.listdir(fds):
+        try:mine=mine or os.readlink(fds+"/"+fd) in inodes
+        except OSError:pass
+except OSError:pass
+print("ours" if inodes and mine else "not-ours")' "$1" "$PORT"; }
+# The responder is OUR Cortex: /health says cortex, our token is accepted and a wrong one refused. Called only once
+# owns_port showed the listener is our child; redirects are not followed. The token goes via env, not argv.
 ours() { CORTEX_CHECK_TOKEN="$(cat "$TOKEN_FILE")" "$(python_bin)" -c 'import json,os,sys,urllib.error,urllib.request
+class N(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*a,**k):return None
 def get(path,token=None):
     r=urllib.request.Request(sys.argv[1]+path,headers={"Authorization":"Bearer "+token} if token else {})
     try:
-        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=2) as x:return x.status,x.read()
+        with urllib.request.build_opener(urllib.request.ProxyHandler({}),N()).open(r,timeout=2) as x:return x.status,x.read()
     except urllib.error.HTTPError as e:return e.code,b""
 t=os.environ["CORTEX_CHECK_TOKEN"];s,body=get("/health")
 ok=s==200 and json.loads(body or b"{}").get("service")=="cortex" and get("/camera/status",t)[0]==200 and get("/camera/status","not-"+t)[0]==401
@@ -128,7 +147,7 @@ start() {
     i=0
     while [ $i -lt 30 ]; do
         kill -0 "$(cat "$PID_FILE")" 2>/dev/null || break      # our process died (e.g. the port was taken): never "started"
-        if ours >/dev/null 2>&1 && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        if [ "$(owns_port "$(cat "$PID_FILE")")" = ours ] && ours >/dev/null 2>&1 && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
             echo "cortex-sidecar: started (pid $(cat "$PID_FILE")) at $(url); db $DB; token file $TOKEN_FILE; log $LOG"
             echo "cortex-sidecar: inspector: ssh -L $PORT:$(tunnel_host):$PORT starrasp@star-pi, then http://127.0.0.1:$PORT/cortex"
             return 0
