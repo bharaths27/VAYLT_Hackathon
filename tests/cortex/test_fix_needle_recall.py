@@ -1,4 +1,4 @@
-"""Needle-benchmark fixes (H:/_scratch/needle-bench): every question reaches memory on the command path, and a
+"""8-needle recall benchmark fixes: every question reaches memory on the command path, and a
 location is answered from object state only while that state is current. The question tests fail on d22c851."""
 import pytest
 from engram.cortex.types import *
