@@ -821,6 +821,31 @@ def test_busy_endpoints_answer_503(monkeypatch):
     assert r.json() == {"ok": False, "reason": "busy: 4 speech jobs already waiting or running (limit 4)"}
 
 
+@pytest.mark.skipif(not _console_web_deps(), reason="python-multipart (console/requirements.txt) not installed")
+def test_stt_upload_is_read_bounded_and_oversize_is_refused(monkeypatch):
+    from fastapi.testclient import TestClient
+    from starlette.datastructures import UploadFile
+
+    from console.server import main
+
+    reads, real_read = [], UploadFile.read
+
+    async def spy(self, size=-1):
+        data = await real_read(self, size)
+        reads.append((size, len(data)))
+        return data
+
+    async def never(audio, suffix):
+        pytest.fail("an oversized upload reached the STT queue")
+
+    monkeypatch.setattr(UploadFile, "read", spy)
+    monkeypatch.setattr(main.voice, "transcribe", never)
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 4096)
+    r = TestClient(main.app).post("/stt", files={"audio": ("a.wav", b"\x00" * 50_000, "audio/wav")}, data={"auto": "0"})
+    assert r.status_code == 413 and r.json() == {"ok": False, "reason": "audio too large: over 4096 bytes"}
+    assert reads == [(4097, 4097)]  # one bounded read; the rest of the upload is never pulled into memory
+
+
 # ------------------------------------------------------------------ server deadline (review fix 2)
 @pytest.mark.parametrize("raw,expected", [
     ("inf", 30.0), ("-inf", 30.0), ("nan", 30.0), ("-5", 30.0), ("0", 30.0), ("1e9", 30.0),

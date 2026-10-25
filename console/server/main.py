@@ -416,7 +416,10 @@ async def tts(text: str):
 
 @app.post("/stt")
 async def stt(audio: UploadFile = File(...), auto: str = Form("1")):
-    data = await audio.read()
+    limit = config.STT_MAX_PENDING_BYTES
+    data = await audio.read(limit + 1)  # bounded: never hold more than the STT queue would accept
+    if len(data) > limit:
+        return JSONResponse({"ok": False, "reason": f"audio too large: over {limit} bytes"}, status_code=413)
     suffix = Path(audio.filename or "a.webm").suffix or ".webm"
     text, why = await voice.transcribe(data, suffix)
     if not text:
