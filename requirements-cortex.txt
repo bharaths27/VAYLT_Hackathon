@@ -1,0 +1,6 @@
+# Install in a separate reviewed environment. These are compatibility ranges, not a lockfile.
+fastapi>=0.115,<1
+pydantic>=2,<3
+httpx>=0.27,<1
+uvicorn>=0.30,<1
+pytest>=8,<10

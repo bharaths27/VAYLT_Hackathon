@@ -1,0 +1,50 @@
+"""Compatibility with the existing Brian adapter. No replacement motor driver.
+
+Location references preserve their ORIGINAL timestamp. A cached observation is not
+re-stamped as a fresh camera observation. E_UNVERIFIED remains unknown.
+"""
+from __future__ import annotations
+import os
+from types import SimpleNamespace
+from .types import Denied,Missing
+from .models import validate_loopback
+from .simulation import Result
+
+class MemoryView:
+    def __init__(self,store):self.store=store
+    def object_state(self,oid):
+        o=next((x for x in self.store.objects() if x['id']==oid),None)
+        if not o:return None
+        return SimpleNamespace(tag_id=o['tag'],last_zone=o['last_zone'],stale=not o['fresh'],name=o['name'])
+
+class GuardedUpstream:
+    def __init__(self,upstream,store):self.upstream,self.store=upstream,store
+    def state(self):return self.upstream.state()
+    def stop(self):self.upstream.stop()
+    def reset_stop(self):self.upstream.reset_stop()
+    def execute(self,op,args):
+        if op=='locate_tag':
+            o=next((x for x in self.store.objects() if x['id']==args['object_id']),None)
+            if not o or not o['fresh'] or not o['last_observation_id']:return Result('failed','no current source-grounded location')
+            row=self.store.one('SELECT payload FROM observation WHERE id=?',(o['last_observation_id'],))
+            import json
+            payload=json.loads(row['payload']) if row else {}
+            if payload.get('mode')!='PHYSICAL':return Result('failed','location is not a physical sensor observation')
+            r=Result('done','reference to a current sensor observation, not a new camera capture')
+            r.location_evidence={o['id']:{'observation_id':o['last_observation_id'],'zone':o['last_zone'],'captured_at':o['last_seen_at']}}
+            return r
+        r=self.upstream.execute(op,args)
+        if 'not sensor checked' in getattr(r,'detail','').lower() or 'E_UNVERIFIED' in getattr(r,'detail',''):
+            return Result('unknown','Adapter reported an unverified physical effect; operator reconciliation required.')
+        return r
+
+def upstream_robot(store,arena):
+    if os.environ.get('CORTEX_LIVE_ACK')!='WITNESSED_STOP_AND_SINGLE_EXECUTOR':
+        raise Denied('live startup requires the witnessed-stop and single-executor acknowledgment')
+    url=validate_loopback(os.environ.get('ENGRAM_ROBOT_URL','http://127.0.0.1:8200'))
+    keyfile=os.environ.get('ENGRAM_ROBOT_KEY_FILE')
+    if not keyfile:raise Missing('existing robot secret file is not configured')
+    # Import the reviewed existing adapter, never embed or duplicate its secret.
+    from ..robot.brian8200 import BrianRobot,read_secret
+    upstream=BrianRobot(url,MemoryView(store),read_secret(keyfile),{zone:int(tag) for tag,zone in arena.get('zone_tags',{}).items()})
+    return GuardedUpstream(upstream,store)
