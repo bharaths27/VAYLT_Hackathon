@@ -98,7 +98,7 @@ def test_guard_limitations_with_hazard_or_deontic_wording_stay_caught(store,sent
 
 @pytest.mark.parametrize('sentence',['Sample A is stored in fridge 2.','Safety goggles are kept at the ppe station.',
     'The example operator prefers concise explanations that include the relevant source.',
-    'In this synthetic fixture, prepare the inspection means bring Sample B to the bench while satisfying the current lab rules.'])
+    'In this synthetic fixture, prepare the inspection means bring Sample B to the bench under the current lab rules.'])
 def test_control_plain_notes_and_task_definitions_add_no_constraint(store,sentence):
     assert not store.teach('Note',sentence,owner='carther')['unresolved_rules']
 

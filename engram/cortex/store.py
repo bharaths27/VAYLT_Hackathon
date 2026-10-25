@@ -60,6 +60,9 @@ CONDITIONAL_RE = re.compile(r"\b(?:unless|except|exceptions?|only\s+if|if|provid
                             r"subject\s+to|pending|until\s+(?:\w+\s+){0,3}(?:approv\w*|authori[sz]\w*|clear\w*|permit\w*)|"
                             r"(?:when|whenever|once|after)\s+(?:\w+\s+){0,3}(?:approv\w*|authori[sz]\w*|permit\w*|allow\w*|clear\w*|signs?\s+off|signed\s+off|supervis\w*)|"
                             r"with(?:out)?\s+(?:\w+\s+){0,2}(?:approval|permission|authori[sz]ation|supervision|clearance|sign-?off|consent))\b", re.I)
+# A condition of time or circumstance ("while the floor is wet", "when the tray arrives", "before noon"). On a statement
+# about motion or handling it is a condition too, never resolved: it is checked on what a stored rule template leaves.
+TEMPORAL_RE = re.compile(r"\b(?:while|whilst|when|whenever|once|after|before|until|till|during|as\s+soon\s+as)\b", re.I)
 # A hazard or a permission ("unsafe", "dangerous", "a biohazard", "can/cannot/may be used, moved, handled", "not allowed",
 # "requires approval"). Unparsed, it is never accepted silently: it becomes an unresolved constraint (scope: Store._reach).
 HAZARD_RE = re.compile(r"\b(?:unsafe|safe(?:ly)?|danger\w*|\w*hazard\w*|toxic|flammable|corrosive|fragile|explosive|volatile|caution|warning|risk\w*|"
@@ -376,6 +379,7 @@ class Store:
                 residual = ''                             # a reviewer's total ban on exactly these objects covers it
             rest = self._mask(residual)
             if CONDITIONAL_RE.search(masked): why = 'Conditional exception'                  # never resolved
+            elif TEMPORAL_RE.search(rest) and (self._handling(masked) or MOTION_RE.search(masked)): why = 'Condition on motion or handling'
             elif HAZARD_RE.search(rest): why = 'Unparsed hazard or permission'
             elif SAFETY_RE.search(rest) or PROHIBIT_RE.search(residual): why = 'Unparsed safety statement'
             elif self._handling(rest): why = 'Unparsed handling instruction or limitation'

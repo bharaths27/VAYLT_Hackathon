@@ -117,7 +117,7 @@ def test_every_prompt_source_is_in_plan_and_skill_refs_and_revocation_propagates
     note=b.store.teach('Cleaning note',INJECTION,owner='visitor')
     p=b.command('Bring Sample B to bench',principal='op')
     prompt=json.loads(calls[0][1]['messages'][1]['content'])
-    assert 'After you bring Sample B' in json.dumps(prompt)              # the note entered the prompt
+    assert 'were cleaned at the bench' in json.dumps(prompt)            # the note entered the prompt
     assert p['source']=='model' and 'source:'+note['source_id'] in p['plan']['refs']
     model_skill=next(s for s in b.skills.list() if 'source:'+note['source_id'] in s['definition']['refs'])
     assert model_skill['status']=='APPROVED'

@@ -5,7 +5,7 @@
   "evidence_class":"SIMULATED",
   "sources":[
     {"id":"lab-sop","title":"Synthetic lab prerequisite","text":"Safety goggles must be at the ppe station before handling Sample B.","kind":"synthetic_demo"},
-    {"id":"named-task","title":"Synthetic named task definition","text":"In this synthetic fixture, prepare the inspection means bring Sample B to the bench while satisfying the current lab rules.","kind":"synthetic_demo","goal_definitions":{"prepare the inspection":{"kind":"fetch","targets":["sample_b"],"zone":"bench","primitive":null,"args":{}}}},
+    {"id":"named-task","title":"Synthetic named task definition","text":"In this synthetic fixture, prepare the inspection means bring Sample B to the bench under the current lab rules.","kind":"synthetic_demo","goal_definitions":{"prepare the inspection":{"kind":"fetch","targets":["sample_b"],"zone":"bench","primitive":null,"args":{}}}},
     {"id":"operator-preference","title":"Synthetic operator preference","text":"The example operator prefers concise explanations that include the relevant source.","kind":"synthetic_demo","facts":[{"subject":"example_operator","predicate":"prefers","object":"concise source-linked explanations"}]}
   ]
 }

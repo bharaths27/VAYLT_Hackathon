@@ -33,3 +33,22 @@ class NoHoldingReport(FakeRobot):
 def test_closing_a_claw_whose_contents_are_unreported_is_refused(store,arena):
     b=Brain(store,NoHoldingReport(arena))
     with pytest.raises(Conflict,match='contents are unknown'): b.command('Close the claw',principal='carther')   # was: proposed
+
+
+# P1-2: a condition of time or circumstance on motion or handling is unresolved: it blocks the unconditional plan.
+@pytest.mark.parametrize('note,command',[('Go to shelf B while the floor is wet.','Go to the shelf b'),
+                                         ('When the tray arrives, bring Sample A to the bench.','Bring Sample A to the bench.'),
+                                         ('Take Sample B to the bench during the night shift.','Bring Sample B to the bench.')])
+def test_a_condition_on_motion_or_handling_blocks_the_unconditional_plan(brain,note,command):
+    assert brain.store.teach('Note',note,owner='carther')['unresolved_rules']
+    with pytest.raises(Missing,match='structured review'): brain.command(command,principal='carther')   # was: proposed
+
+def test_a_condition_taught_after_proposing_stops_its_approval(brain):
+    p=brain.command('Go to the shelf b',principal='carther');assert p['status']=='proposed'
+    brain.store.teach('Note','Go to shelf B while the floor is wet.',owner='carther')
+    with pytest.raises(CortexError): approve(brain,p)
+    assert not [c for c in brain.robot.calls if c[0]=='go_to_zone']
+
+@pytest.mark.parametrize('note',['Safety goggles must be at the ppe station before handling Sample B.','Lena arrives when the lab opens.'])
+def test_control_a_stored_rule_and_a_remark_add_no_condition(store,note):
+    assert not store.teach('Note',note,owner='carther')['unresolved_rules']
