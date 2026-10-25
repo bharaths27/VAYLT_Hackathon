@@ -141,9 +141,15 @@ class ParseResult:
     data: dict[str, Any] = field(default_factory=dict)
     trace: list[str] = field(default_factory=list)  # why the parser decided what it did (shown on HUD)
     short: str = ""  # the reason in a few words, for the spoken "... Please clarify." (the HUD shows reason)
-    # A clarification for a request that was understood but cannot be done as said ("In 5 minutes, look around":
-    # only a robot action is scheduled). It is a refusal, not an ambiguous or misheard command: it stops nothing.
-    understood: bool = False
+    # How the request was taken, stated by every result: "understood" (a plan, a rule, or a refusal of something
+    # understood: unsafe, a limit, "don't", a plan that failed validation, a request that cannot be scheduled as
+    # said), "unclear" (ambiguous, or nothing it knows matched) or "misheard" (nothing heard). The console stops a
+    # running task for a result that does not act and is not "understood"; one that does not say counts as unclear.
+    classification: str = "unclear"
+
+    @property
+    def understood(self) -> bool:
+        return self.classification == "understood"
 
 
 def _num(s: str) -> float | None:
@@ -302,7 +308,7 @@ def _unfinished(text: str, t: str, forms: tuple[str, ...], bundle: dict, trace: 
     rest = _leftover(t, forms, bundle)
     if rest is None:
         return None
-    return ParseResult("clarify", text, reason=f"I don't understand '{rest}', so I won't do anything now. Say just "
+    return ParseResult("clarify", text, classification="unclear", reason=f"I don't understand '{rest}', so I won't do anything now. Say just "
                        "the command, or 'In 5 minutes, ...' to schedule it.", quip=quip("clarify"),
                        trace=trace + [f"leftover: '{rest}'"], short=f"I don't understand '{rest}'")
 
@@ -348,7 +354,7 @@ def parse(text: str, bundle: dict) -> ParseResult:
     try:
         return _parse(text, bundle)
     except PlanError as e:
-        return ParseResult("clarify", text, reason=f"I can't plan that safely: {e}", quip=quip("clarify"),
+        return ParseResult("clarify", text, classification="understood", reason=f"I can't plan that safely: {e}", quip=quip("clarify"),
                            trace=[f"plan rejected by validation: {e}"], short="I can't plan that safely")
 
 
@@ -356,30 +362,30 @@ def _parse(text: str, bundle: dict) -> ParseResult:
     t = _norm(text)
     trace: list[str] = [f"normalized: '{t}'"]
     if not t:
-        return ParseResult("clarify", text, reason="empty command", quip=quip("clarify"), trace=trace,
+        return ParseResult("clarify", text, classification="misheard", reason="empty command", quip=quip("clarify"), trace=trace,
                            short="I didn't catch that")
 
     # 0. STOP always wins, no approval needed (see STOP_WORDS)
     m = STOP_WORDS.search(t)
     if m:
-        return ParseResult("stop", text, quip=quip("stop"), trace=trace + [f"stop word '{m.group(1)}'"])
+        return ParseResult("stop", text, classification="understood", quip=quip("stop"), trace=trace + [f"stop word '{m.group(1)}'"])
 
     # 1. safety screen
     for pat, why in UNSAFE:
         if re.search(pat, t):
             trace.append(f"unsafe pattern matched: {pat}")
-            return ParseResult("abstain", text, reason=why, quip=quip("abstain"), trace=trace)
+            return ParseResult("abstain", text, classification="understood", reason=why, quip=quip("abstain"), trace=trace)
 
     # 2. teaching a rule
     m = re.match(r"^(?:new rule|rule|remember( that)?|from now on|note( that)?|learn( that)?)\s*[:,-]?\s*(.+)$", t)
     if m:
         body = text.split(":", 1)[1].strip() if ":" in text else m.group(m.lastindex)
-        return ParseResult("rule", text, data={"rule_text": body}, quip=quip("rule"), trace=trace + ["rule prefix"])
+        return ParseResult("rule", text, classification="understood", data={"rule_text": body}, quip=quip("rule"), trace=trace + ["rule prefix"])
 
     # 2b. a negated command is never planned, and never handed to the LLM fallback (see NEGATION)
     m = NEGATION.search(t)
     if m:
-        return ParseResult("abstain", text, reason=f"You said '{m.group(1)}', so nothing will move. "
+        return ParseResult("abstain", text, classification="understood", reason=f"You said '{m.group(1)}', so nothing will move. "
                            "To make it a rule, say 'Remember that ...'", quip=quip("abstain"),
                            trace=trace + [f"negation '{m.group(1)}'"])
 
@@ -387,7 +393,7 @@ def _parse(text: str, bundle: dict) -> ParseResult:
     # prefix is cut off, because that cut loses the commas in "In 5 seconds, open the claw, close it."
     w = _multiple(_norm(text, keep=_KEEP), bundle)
     if w:
-        return ParseResult("clarify", text, reason=f"One thing at a time: which first? ('{w}' asks for more than "
+        return ParseResult("clarify", text, classification="unclear", reason=f"One thing at a time: which first? ('{w}' asks for more than "
                            "one thing; I plan one action on one object per command.)", quip=quip("clarify"),
                            trace=trace + [f"multiple: '{w}'"], short="One thing at a time: which first?")
 
@@ -397,21 +403,21 @@ def _parse(text: str, bundle: dict) -> ParseResult:
     if m:
         n = _num(m.group(1))
         if n is None:
-            return ParseResult("clarify", text, reason="couldn't read the delay", quip=quip("clarify"), trace=trace,
+            return ParseResult("clarify", text, classification="unclear", reason="couldn't read the delay", quip=quip("clarify"), trace=trace,
                                short="I couldn't read the delay")
         secs = n * (60 if m.group(2).startswith("min") else 1)
         inner = m.group(3)
         sub = parse(inner, bundle)
         if sub.kind != "plan" or sub.plan is None or not sub.plan.physical():
             return _not_schedulable(text, inner, sub, trace)
-        return ParseResult("prospective", text, plan=sub.plan, quip=quip("prospective"),
+        return ParseResult("prospective", text, classification="understood", plan=sub.plan, quip=quip("prospective"),
                            data={"delay_s": secs, "inner": inner}, trace=trace + [f"prospective in {secs:.0f}s"] + sub.trace)
 
     # 3b. a command meant for later, on a condition, or chained to another step must not run now (see DEFERRAL)
     d = _deferral(t, bundle)
     if d:
         phrase, why = d
-        return ParseResult("clarify", text, reason=f"{why}, so I won't do anything now. Say one thing to do now, "
+        return ParseResult("clarify", text, classification="unclear", reason=f"{why}, so I won't do anything now. Say one thing to do now, "
                            "or 'In 5 minutes, ...' to schedule it.", quip=quip("clarify"),
                            trace=trace + [f"deferral: '{phrase}'"], short=why)
 
@@ -441,7 +447,7 @@ def _parse(text: str, bundle: dict) -> ParseResult:
                 n = 90.0
             deg = n if m.group(2) == "right" else -n
         if abs(deg) > 180:
-            return ParseResult("abstain", text, reason=f"turns are bounded to 180 degrees per step (asked {abs(deg):.0f})",
+            return ParseResult("abstain", text, classification="understood", reason=f"turns are bounded to 180 degrees per step (asked {abs(deg):.0f})",
                                quip=quip("abstain"), trace=trace)
         return _unfinished(text, t, ("turn",), bundle, trace) or _ok(
             goal, [Step(op="turn_bounded", args={"degrees": deg}, expect=f"heading changed {deg:+.0f} deg")], [], trace + ["turn"])
@@ -461,7 +467,7 @@ def _parse(text: str, bundle: dict) -> ParseResult:
         if direction.startswith("back") or re.search(r"back up|reverse", t):
             n = -n
         if abs(n) > 50:
-            return ParseResult("abstain", text, reason=f"drive is bounded to 50 cm per step (asked {abs(n):.0f} cm). Split it up or approve multiple steps.",
+            return ParseResult("abstain", text, classification="understood", reason=f"drive is bounded to 50 cm per step (asked {abs(n):.0f} cm). Split it up or approve multiple steps.",
                                quip=quip("abstain"), trace=trace + [f"unit {unit}"])
         return _unfinished(text, t, ("drive",), bundle, trace) or _ok(
             goal, [Step(op="drive_bounded", args={"distance_cm": round(n, 1)}, expect=f"moved {n:+.0f} cm, LiDAR clear")], [], trace + ["drive"])
@@ -487,7 +493,7 @@ def _parse(text: str, bundle: dict) -> ParseResult:
             req = rule.get("requires", {})
             if obj and obj.get("tag_id") != req.get("tag_id"):
                 trace.append(f"operator named tag {obj.get('tag_id')} but rule requires tag {req.get('tag_id')}")
-                return ParseResult("clarify", text, reason=f"Rule {rule['id']} says tag {req.get('tag_id')} is needed here, but you named "
+                return ParseResult("clarify", text, classification="unclear", reason=f"Rule {rule['id']} says tag {req.get('tag_id')} is needed here, but you named "
                                    f"{obj.get('name')}. Confirm which one.", quip=quip("clarify"), trace=trace,
                                    data={"evidence_ids": [rule["source_id"]]},
                                    short=f"Rule {rule['id']} needs tag {req.get('tag_id')}, but you named {obj.get('name')}")
@@ -503,7 +509,7 @@ def _parse(text: str, bundle: dict) -> ParseResult:
                 return _clarify(text, "'it' is ambiguous. Name the object or its tag number", bundle, trace)
             return _clarify(text, "I couldn't match that to a tagged object in memory", bundle, trace)
         if not zone:
-            return ParseResult("clarify", text, reason=f"Where should {obj['name']} go? Say a zone.", quip=quip("clarify"),
+            return ParseResult("clarify", text, classification="unclear", reason=f"Where should {obj['name']} go? Say a zone.", quip=quip("clarify"),
                                short=f"Where should {obj['name']} go?",
                                trace=trace, data={"options": [z.get("name") for z in bundle.get("zones", [])]})
         evidence += [e for e in (obj.get("source_id"), zone.get("source_id")) if e and e not in evidence]
@@ -513,11 +519,11 @@ def _parse(text: str, bundle: dict) -> ParseResult:
             return unfinished
         sp = skill_plan(t, goal, bundle, int(obj["tag_id"]), str(zone["zone"]), evidence)
         if sp:
-            r = ParseResult("plan", text, plan=sp, quip=quip("skill"), trace=trace + [f"reused APPROVED skill {sp.skill_id}"])
+            r = ParseResult("plan", text, classification="understood", plan=sp, quip=quip("skill"), trace=trace + [f"reused APPROVED skill {sp.skill_id}"])
             return r
         return _ok(goal, fetch_steps(int(obj["tag_id"]), str(zone["zone"])), evidence, trace + ["grammar: fetch"])
 
-    return ParseResult("abstain", text, reason="I don't have a safe primitive for that yet", quip=quip("abstain"),
+    return ParseResult("abstain", text, classification="unclear", reason="I don't have a safe primitive for that yet", quip=quip("abstain"),
                        short="I don't have a safe primitive for that yet",
                        trace=trace + ["no grammar rule matched"], data={"llm_eligible": True})
 
@@ -535,14 +541,14 @@ def _not_schedulable(text: str, inner: str, sub: ParseResult, trace: list[str]) 
                        f"{why}. Say the rule now, or schedule a robot action, like 'In 5 minutes, open the claw'.",
                        quip=quip("clarify"), trace=trace + [f"only a robot action is scheduled, not a {sub.kind}"] + sub.trace,
                        short="I can only schedule a robot action" if understood else (sub.short or sub.reason),
-                       understood=understood)
+                       classification="understood" if understood else "unclear")
 
 
 def _ok(goal, steps, evidence, trace, physical=True) -> ParseResult:
     plan = validate_plan(Plan(goal=goal, steps=steps, evidence_ids=[e for e in evidence if e]))
-    return ParseResult("plan", goal, plan=plan, quip=quip("plan"), trace=trace)
+    return ParseResult("plan", goal, classification="understood", plan=plan, quip=quip("plan"), trace=trace)
 
 
 def _clarify(text, why, bundle, trace) -> ParseResult:
-    return ParseResult("clarify", text, reason=why, quip=quip("clarify"), trace=trace,
+    return ParseResult("clarify", text, classification="unclear", reason=why, quip=quip("clarify"), trace=trace,
                        data={"options": [f"{b.get('name')} (tag {b.get('tag_id')})" for b in bundle.get("bindings", [])]})

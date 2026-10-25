@@ -415,3 +415,28 @@ def test_a_brain_plan_aborted_for_an_unknown_outcome_still_needs_verification(c,
     op = c.post("/commands", json={"text": "bring sample b to the bench"}).json()["operation"]
     assert c.post(f"/operations/{op['id']}/approve", json={"digest": op["digest"]}).status_code == 200
     assert wait(c, op["id"])["status"] == "NEEDS_VERIFICATION"
+
+
+# ---- every parse states how it was taken; a refusal says "understood", and only that keeps a task going ------
+
+
+@pytest.mark.parametrize("text,cls", [
+    ("open the claw", "understood"), ("remember that the bench is wet", "understood"),
+    ("In 5 seconds, open the claw.", "understood"), ("drive at full speed", "understood"),
+    ("don't open the claw", "understood"), ("drive forward 2 meters", "understood"),
+    ("find tag 500", "understood"), ("In 5 minutes, look around.", "understood"),
+    ("bring it here", "unclear"), ("juggle", "unclear"), ("open the claw and close it", "unclear"), ("", "misheard"),
+], ids=["plan", "rule", "scheduled", "unsafe", "negated", "over a limit", "fails validation", "not schedulable",
+        "ambiguous", "unparsed", "more than one thing", "nothing"])
+def test_every_parse_states_its_classification(text, cls):
+    from server.parser import parse
+    assert parse(text, {}).classification == cls
+
+
+def test_a_plan_that_fails_validation_while_a_task_runs_is_refused_and_stops_nothing(c, held, said):
+    op = start_op(c, held)
+    j = c.post("/commands", json={"text": "find tag 500"}).json()     # tag 500 is outside the allowed tags
+    assert j["kind"] == "clarify" and "stopped" not in j and "outside" in j["reason"]
+    assert said[-1] == "I can't plan that safely." and not main.engine.stopped
+    held.finish.set()
+    assert wait(c, op["id"])["status"] != "STOPPED"

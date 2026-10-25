@@ -351,16 +351,17 @@ async def handle_command(text: str, source: str) -> dict:
         planner_calls = 1
         r.trace.append(why)
         if plan:
-            r.kind, r.plan, r.quip = "plan", plan, quip("plan")
+            r.kind, r.plan, r.quip, r.classification = "plan", plan, quip("plan"), "understood"
         else:
             r.reason = why
     metrics = {"memory_ms": memory_ms, "parse_ms": parse_ms, "planner_calls": planner_calls,
                "plan_ms": int((time.time() - t0) * 1000)}
     out = {"kind": r.kind, "reason": r.reason, "quip": r.quip, "trace": r.trace, "data": r.data, "metrics": metrics}
-    # Unclear: the parser asks ("clarify") about something it did not understand, or nothing it knows matched and no
-    # model plan came of it (an unparsed request, often a misheard one). Clear refusals (unsafe, a limit, "don't") are
-    # understood and stay abstentions; so is a request understood but impossible as said (r.understood).
-    unclear = (r.kind == "clarify" and not r.understood) or (r.kind == "abstain" and r.data.get("llm_eligible") is True)
+    # A result that does not act follows Carter's rule unless the parser states it was understood (a refusal: unsafe,
+    # a limit, "don't", a plan that failed validation, a request that cannot be scheduled as said). Whatever does
+    # not say so is unclear: the parser asks, nothing it knows matched and no model plan came of it, or nothing was
+    # heard. Stated, never worked out from the kind or the words.
+    unclear = r.kind not in ("plan", "rule", "prospective", "stop") and r.classification != "understood"
 
     if unclear:
         await _clarify(out, r.short or r.reason, source)
