@@ -269,6 +269,34 @@ def test_stop_acts_before_telemetry_and_survives_its_failure(monkeypatch, route,
         c.post("/stop/clear")
 
 
+def test_a_failing_robot_stop_still_stops_the_brain(monkeypatch):
+    # The robot and the brain are stopped at once, each failure on its own: before, a robot call that raised
+    # (for example on a reply that is not JSON) skipped the brain's stop and the cancellations.
+    told = []
+
+    async def robot_stop():
+        raise ValueError("robot reply was not JSON")
+
+    async def brain_stop():
+        told.append("stop")
+        return {"stopped": True}
+
+    async def brain_clear():
+        return {}
+
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.brain, "enabled", lambda: True)
+            m.setattr(main.brain, "stop", brain_stop)
+            m.setattr(main.brain, "clear_stop", brain_clear)
+            m.setattr(main.engine.robot, "stop", robot_stop)
+            r = c.post("/stop")
+            assert r.status_code == 200 and main.engine.stopped and told == ["stop"], (r.status_code, told)
+            assert r.json()["status"] == "stop_request_failed" and "ValueError" in r.json()["error"], r.json()
+            c.post("/stop/clear")
+
+
 def test_spoken_stop_does_not_wait_on_the_brain(monkeypatch):
     # With the brain bridge on, every command used to go to the brain first. A stop must not
     # depend on the brain answering (or understanding it); engine.stop() still tells the brain.
