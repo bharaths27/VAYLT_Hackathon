@@ -267,7 +267,10 @@ def whisper_server_endpoint() -> str | None:
     if (u.scheme not in ("http", "https") or u.hostname not in _LOOPBACK_HOSTS
             or "@" in u.netloc or u.query or u.fragment):
         return None
-    return f"{u.scheme}://{u.netloc}{u.path.rstrip('/')}/inference"
+    # A numeric host: no resolver call (which no deadline can cancel) ever sits in front of the clip.
+    host = "127.0.0.1" if u.hostname == "localhost" else u.hostname
+    netloc = (f"[{host}]" if ":" in host else host) + (f":{u.port}" if u.port else "")
+    return f"{u.scheme}://{netloc}{u.path.rstrip('/')}/inference"
 
 
 # fmt chunk of the one format whisper.cpp reads as-is: (format tag 1 = PCM, 1 channel, 16000 Hz,

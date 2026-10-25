@@ -180,7 +180,8 @@ def test_non_native_without_ffmpeg_says_so(stt):
 # ------------------------------------------------------------------ resident whisper.cpp server
 @pytest.mark.parametrize("url,endpoint", [
     ("http://127.0.0.1:8178", "http://127.0.0.1:8178/inference"),
-    ("http://localhost:8178/", "http://localhost:8178/inference"),
+    ("http://localhost:8178/", "http://127.0.0.1:8178/inference"),
+    ("http://localhost/", "http://127.0.0.1/inference"),
     ("http://[::1]:8178", "http://[::1]:8178/inference"),
     ("  http://127.0.0.1:8178/whisper/  ", "http://127.0.0.1:8178/whisper/inference"),
 ])
@@ -266,6 +267,24 @@ def test_server_transcript_is_used_when_it_answers(stt, whisper_server, monkeypa
     ((path, ctype, body),) = whisper_server["requests"]
     assert path == "/inference" and ctype.startswith("multipart/form-data")
     assert b'name="file"' in body and upload in body
+
+
+def test_localhost_never_waits_on_the_resolver(stt, whisper_server, monkeypatch):
+    import socket
+    asked, real = [], socket.getaddrinfo
+
+    def stalled(host, *a, **k):  # a resolver that hangs for "localhost" (anyio passes it as bytes)
+        asked.append(host.decode() if isinstance(host, bytes) else host)
+        if asked[-1] == "localhost":
+            threading.Event().wait(5)
+        return real(host, *a, **k)
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled)
+    monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"].replace("127.0.0.1", "localhost"))
+    start = time.monotonic()
+    text, why = run(voice.transcribe(wav_bytes(), ".wav"))
+    assert text == "hello from the server" and "localhost" not in asked
+    assert time.monotonic() - start < 2
 
 
 def test_server_alone_is_enough(stt, whisper_server, monkeypatch, tmp_path):
