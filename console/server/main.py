@@ -20,7 +20,7 @@ from . import brain, config, llm, voice
 from .adapters.memory import make_memory
 from .adapters.robot import make_camera, make_robot
 from .core import Bus, Engine, Ledger, Operation, hash_models, upstream_online
-from .parser import parse, quip
+from .parser import is_stop, parse, quip
 
 WEB = config.ROOT / "web"
 
@@ -172,6 +172,8 @@ async def handle_command(text: str, source: str) -> dict:
     t0 = time.time()
     await bus.emit("heard", text=text, source=source)
     ledger.append("command", text=text, source=source)
+    if is_stop(text):
+        return await _stop_command(text, source, t0)
     if brain.enabled():
         return await _brain_command(text, source, t0)
     scene = STATUS.get("last_state") or {}
@@ -222,6 +224,18 @@ async def handle_command(text: str, source: str) -> dict:
     await bus.emit("parsed", **{k: v for k, v in out.items() if k != "operation"})
     if r.quip:
         await bus.emit("say", text=r.quip if r.kind != "abstain" else f"{r.quip} {r.reason}.")
+    return out
+
+
+async def _stop_command(text: str, source: str, t0: float) -> dict:
+    """A spoken or typed stop acts before memory, the brain bridge or any planner is asked: none of them
+    may delay it or read it as something else. engine.stop() also stops the brain when the bridge is on."""
+    await engine.stop(by=f"command:{source}")
+    out = {"kind": "stop", "reason": "", "quip": quip("stop"), "trace": ["stop word"], "data": {},
+           "metrics": {"plan_ms": int((time.time() - t0) * 1000), "planner_calls": 0}}
+    ledger.append("parse", text=text, result_kind="stop", reason="", trace=out["trace"], metrics=out["metrics"])
+    await bus.emit("parsed", **out)
+    await bus.emit("say", text=out["quip"])
     return out
 
 

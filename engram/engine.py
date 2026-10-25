@@ -10,6 +10,7 @@ Flow for one request:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -30,6 +31,11 @@ from .skills import Skills
 from .teach import extract_rules
 
 APPROVAL_TTL_S = 120.0
+# A stop word anywhere in a command stops the robot ("Stop.", "STOP!", "Please stop.", "Stop. Bring ...").
+# whisper.cpp writes "Stop."; without this it reached the planner and was refused as an unknown object.
+# Deliberately broad ("don't stop the timer" stops too): a needless stop costs one clear_stop, a missed
+# stop can hurt someone. Same words as the console parser's STOP_WORDS.
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa)\b", re.IGNORECASE)
 
 
 class EngineError(Exception):
@@ -84,6 +90,9 @@ class Engine:
         return result
 
     def _command(self, text: str, who: str) -> dict[str, Any]:
+        # A stop wins before anything else (it is still recorded as heard by command()).
+        if STOP_WORDS.search(text):
+            return {"kind": "stopped", **self.stop()}
         stripped = text.strip()
         low = stripped.lower()
         if low.startswith("remember"):
