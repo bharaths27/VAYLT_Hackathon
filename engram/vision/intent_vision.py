@@ -107,7 +107,9 @@ def _default_transport(url: str, body: bytes, headers: dict[str, str], timeout_s
 
 def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
     """Any JPEG/PNG -> an RGB JPEG the API accepts: longest side at most max_side, except that a very narrow
-    image is enlarged until its short side reaches the API's 280 px minimum (never past its 1568 px limit)."""
+    image is enlarged until its short side reaches the API's 280 px minimum (never past its 1568 px limit).
+    Transparent pixels become white, as an image viewer shows them: dropping the alpha alone would reveal (and
+    send) whatever colour the hidden pixels hold."""
     if not MIN_SIDE <= max_side <= MAX_SIDE:
         raise ValueError(f"max_side must be in [{MIN_SIDE}, {MAX_SIDE}]")
     try:
@@ -119,6 +121,9 @@ def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
         img.load()
     except Exception as e:  # noqa: BLE001 - any decode failure is "not an image"
         raise VisionError(f"not a readable image: {type(e).__name__}") from None
+    if "transparency" in img.info or any(band in ("A", "a") for band in img.getbands()):
+        rgba = img.convert("RGBA")
+        img = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba)
     img = img.convert("RGB")
     w, h = img.size
     scale = _scale(w, h, max_side)
@@ -136,7 +141,7 @@ def _prepare_cv2(data: bytes, max_side: int) -> bytes:
     except ImportError:
         raise VisionError("needs Pillow or OpenCV to read images: pip install pillow") from None
     try:
-        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        img = _decode_on_white(cv2, np, data)
     except Exception as e:  # noqa: BLE001 - OpenCV raises cv2.error on some inputs (e.g. an empty buffer)
         raise VisionError(f"not a readable image: {type(e).__name__}") from None
     if img is None:
@@ -152,6 +157,20 @@ def _prepare_cv2(data: bytes, max_side: int) -> bytes:
     if not ok:
         raise VisionError("could not encode the image")
     return jpg.tobytes()
+
+
+def _decode_on_white(cv2, np, data: bytes):
+    """BGR pixels, with any alpha composited onto white. A JPEG has no alpha and keeps the one fast decode (camera
+    frames); anything else is read once with its alpha, if it has one, and composited."""
+    buf = np.frombuffer(data, np.uint8)
+    if data[:2] != b"\xff\xd8":
+        raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if raw is not None and raw.ndim == 3 and raw.shape[2] == 4:
+            full = float(np.iinfo(raw.dtype).max) if raw.dtype.kind == "u" else 1.0
+            alpha = raw[:, :, 3:4].astype(np.float32) / full
+            bgr = raw[:, :, :3].astype(np.float32) / full
+            return np.clip((bgr * alpha + (1.0 - alpha)) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
 
 def _scale(w: int, h: int, max_side: int) -> float:

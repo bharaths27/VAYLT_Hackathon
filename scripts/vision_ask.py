@@ -20,6 +20,7 @@ import json
 import math
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -38,6 +39,15 @@ def _seconds(low: float, high: float, low_ok: bool):
             raise argparse.ArgumentTypeError(f"must be a number of seconds from {low:g} ({'inclusive' if low_ok else 'exclusive'}) to {high:g}")
         return v
     return parse
+
+
+def _robot_url(text: str) -> str:
+    """An argparse type: the robot server's http(s) URL. An empty --robot satisfied the required source group but read
+    as false below, so the CLI fell through to the webcam path with no camera (luna round 8)."""
+    u = urllib.parse.urlsplit(text)
+    if u.scheme not in ("http", "https") or not u.netloc:
+        raise argparse.ArgumentTypeError("must be the robot server's http:// or https:// URL")
+    return text
 
 
 def robot_frame(base: str) -> bytes:
@@ -85,7 +95,7 @@ def main() -> int:
     ap.add_argument("mode", choices=["hand", "scene", "find"])
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--image", nargs="+", help="image file(s)")
-    src.add_argument("--robot", help="robot server base URL, e.g. http://star-pi.local:8200")
+    src.add_argument("--robot", type=_robot_url, help="robot server base URL, e.g. http://star-pi.local:8200")
     src.add_argument("--webcam", type=int, help="local camera index")
     ap.add_argument("--what", help="object to find (find mode)")
     ap.add_argument("--every", type=_seconds(0.0, 3600.0, low_ok=True), default=0.0,
@@ -126,14 +136,14 @@ def main() -> int:
         results = [run(p, lambda p=p: Path(p).read_bytes()) for p in a.image]
         return 0 if all(results) else 1
     cap = None
-    label = a.robot or f"webcam {a.webcam}"
+    label = a.robot if a.robot is not None else f"webcam {a.webcam}"
     if a.webcam is not None:
         try:
             cap = open_webcam(a.webcam)
         except VisionError as e:
             print(json.dumps({"source": label, "error": str(e)}), flush=True)
             return 1
-    get = (lambda: robot_frame(a.robot)) if a.robot else (lambda: webcam_frame(cap))
+    get = (lambda: robot_frame(a.robot)) if a.robot is not None else (lambda: webcam_frame(cap))
     try:
         next_at = time.monotonic()
         while True:

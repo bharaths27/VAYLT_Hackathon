@@ -18,12 +18,25 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def png(w, h, color=(200, 30, 30)):
-    """A solid-colour PNG built by hand, so these tests need neither Pillow nor OpenCV to make inputs."""
+    """A solid-colour PNG built by hand, so these tests need neither Pillow nor OpenCV to make inputs. Four colour
+    components (r, g, b, alpha) make an RGBA PNG."""
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
     row = b"\x00" + bytes(color) * w
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6 if len(color) == 4 else 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(row * h)) + chunk(b"IEND", b""))
+
+
+def mean_rgb(jpeg):
+    """The average (r, g, b) of an image, read with whichever library is installed."""
+    try:
+        from PIL import Image, ImageStat
+        return tuple(ImageStat.Stat(Image.open(io.BytesIO(jpeg)).convert("RGB")).mean)
+    except ImportError:
+        cv2 = pytest.importorskip("cv2")
+        import numpy as np
+        b, g, r = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR).reshape(-1, 3).mean(axis=0)
+        return r, g, b
 
 
 def image_size(jpeg):
@@ -398,3 +411,25 @@ def test_the_cli_prints_one_error_line_and_exits_1_when_the_webcam_fails(monkeyp
     assert va.main() == 1
     lines = capsys.readouterr().out.strip().splitlines()
     assert len(lines) == 1 and expect in json.loads(lines[0])["error"] and KEY not in lines[0]
+
+
+@pytest.mark.parametrize("pillow", [True, False])
+def test_transparent_pixels_are_sent_as_white_never_as_their_hidden_colour(monkeypatch, pillow):
+    # luna round 8: convert("RGB") / IMREAD_COLOR dropped the alpha, so a fully transparent PNG whose hidden pixels
+    # are red reached the model as a red image
+    if not pillow:
+        pytest.importorskip("cv2")
+        monkeypatch.setitem(sys.modules, "PIL", None)
+    r, g, b = mean_rgb(iv.prepare_jpeg(png(400, 300, (255, 0, 0, 0))))
+    assert min(r, g, b) > 245, (r, g, b)
+    r, g, b = mean_rgb(iv.prepare_jpeg(png(400, 300, (255, 0, 0, 255))))  # opaque red stays red
+    assert r > 200 and g < 60 and b < 60, (r, g, b)
+    r, g, b = mean_rgb(iv.prepare_jpeg(png(400, 300, (255, 0, 0, 128))))  # half transparent: pink on white
+    assert r > 230 and 100 < g < 160 and 100 < b < 160, (r, g, b)
+
+
+@pytest.mark.parametrize("url", ["", "star-pi.local:8200", "ftp://star-pi.local", "http://"])
+def test_the_cli_refuses_a_robot_address_that_is_not_an_http_url(url):
+    # luna round 8: --robot "" satisfied the required source group, read as false, and fell through to the webcam
+    r = _cli("hand", "--robot", url, env_extra={"TYPESAFE_API_KEY": KEY, "TYPESAFE_INTENT_MODEL": "m"})
+    assert r.returncode == 2 and "--robot" in r.stderr and r.stdout == ""
