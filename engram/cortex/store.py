@@ -34,7 +34,12 @@ PROHIBIT_RE = re.compile(r"\b(never|must not|do not|don't)\s+(move|touch|handle|
 # Deontic or hazard wording. Left over after the two templates above in a sentence that names a registered
 # object or station, it is never silently accepted: it is an unresolved constraint until a person structures it.
 SAFETY_RE = re.compile(r"\b(?:must|mustn't|never|should|shouldn't|shall|needs? to|ha(?:s|ve) to|required?|requires|forbidden|prohibited|"
-                       r"not (?:allowed|permitted)|do not|don't|cannot|can't|may not|only|always|avoid|keep|hazard\w*|danger\w*|caution|warning)\b", re.I)
+                       r"not (?:allowed|permitted)|not\s+to\s+be|(?:is|are)\s+to\s+be\s+(?:kept|left|used|moved|handled|stored)|off[- ]limits|"
+                       r"out\s+of\s+(?:bounds|service|order)|(?:no\s*one|nobody)\s+(?:may|should|can|is\s+to)|"
+                       r"do not|don't|cannot|can't|may not|only|always|avoid|keep|hazard\w*|danger\w*|caution|warning)\b", re.I)
+CONDITIONAL_RE = re.compile(r"\b(?:unless|except|exceptions?|only if|provided that)\b", re.I)
+# Motion or use wording: a conditional that names nothing registered but speaks of these is scoped to everything.
+MOTION_RE = re.compile(r"\b(?:move[ds]?|moving|bring|take|carry|put|handled?|handling|touch|pick|use[ds]?|using|go|drive|leave|enter)\b", re.I)
 
 
 class Store:
@@ -188,6 +193,20 @@ class Store:
         return [z['id'] for z in self.rows('SELECT * FROM cx_station')
                 if any(' '+normalize(n)+' ' in p for n in [z['id'], z['name']] + json.loads(z['aliases_json']))]
 
+    def resolve_targets(self, phrase: str) -> list[str]:
+        """Objects a request names as targets, each unambiguously: longer names consume their words first, and a name
+        several objects share (an alias collision) is refused rather than read as all of them."""
+        owners = {}
+        for o in self.objects():
+            for n in [o['id'], o['name']] + o['aliases']:
+                if normalize(n): owners.setdefault(normalize(n), set()).add(o['id'])
+        rest, found = ' ' + normalize(phrase) + ' ', set()
+        for n in sorted(owners, key=len, reverse=True):
+            if ' ' + n + ' ' in rest:
+                if len(owners[n]) > 1: raise Missing(f'"{n}" names more than one registered object; name the one you mean')
+                rest = rest.replace(' ' + n + ' ', ' | '); found |= owners[n]
+        return [o['id'] for o in self.objects() if o['id'] in found]
+
     def named(self, phrase: str) -> list[str]:
         """Registered objects and stations a phrase names: the scope an unresolved statement blocks."""
         return sorted(set(self.resolve_objects(phrase)) | set(self.zones_named(phrase)))
@@ -237,13 +256,15 @@ class Store:
               rules: list[dict] | None = None, supersedes: str | None = None,
               cloud_ok: bool = False, goal_definitions: dict | None = None, prohibitions: list[str] | None = None, facts: list[dict] | None = None) -> dict:
         title, body, owner = text(title, 'title', 200), text(body, 'source', 200000), text(owner, 'source owner', 100)
-        extracted, unresolved = self._extract(body) if rules is None else (rules, [])
+        sentences = [s.replace(chr(0x2019), "'") for s in re.split(r'[.\n]', body)]
+        extracted, unresolved = (rules, []) if rules is not None else ([], [])
+        if rules is None:
+            for s in sentences:
+                if CONDITIONAL_RE.search(s): continue      # no template rule from a conditional sentence: unresolved below
+                found, unknown = self._extract(s); extracted += found; unresolved += unknown
         if not isinstance(extracted, list) or len(extracted) > 64:
             raise CortexError('too many rules')
         known = {o['id'] for o in self.objects()}
-        if rules is None and re.search(r'\b(unless|except|only if|provided that)\b',body,re.I):
-            unresolved.append('Conditional exception requires explicit structured review')
-            extracted=[]
         checked = []
         for r in extracted:
             if not isinstance(r, dict) or set(r) - {'subject','prerequisite','required_zone','rule_key'}:
@@ -253,18 +274,24 @@ class Store:
             if r['subject'] == r['prerequisite']:
                 raise Conflict('self-dependent rule')
             checked.append({**r, 'rule_key': r.get('rule_key') or f"{r['subject']}::requires::{r['prerequisite']}"})
-        forbidden, safety = list(prohibitions or []), []
-        # Only entities a reviewer structured explicitly (the rules/prohibitions arguments) clear a safety sentence about them.
-        structured = {x for r in (rules or []) if isinstance(r, dict) for x in (r.get('subject'), r.get('prerequisite'), r.get('required_zone'))} | set(forbidden)
-        for sent in re.split(r'[.\n]', body):
-            sent = sent.replace(chr(0x2019), "'")
+        forbidden, pending = list(prohibitions or []), []
+        # A reviewer's structured item resolves only the sentence it structures: a rule, a sentence naming exactly its
+        # subject, prerequisite and station; the prohibitions, a sentence naming nothing but prohibited objects. Every
+        # other conditional or unparsed safety sentence stays an unresolved constraint, whatever `rules` says, scoped
+        # to what the sentence names (else the source; a motion conditional naming nothing registered: everything).
+        rule_sets = {frozenset((r.get('subject'), r.get('prerequisite'), r.get('required_zone'))) for r in (rules or []) if isinstance(r, dict)}
+        banned = set(forbidden)
+        def resolved(names): return frozenset(names) in rule_sets or bool(names) and set(names) <= banned
+        for sent in sentences:
             if PROHIBIT_RE.search(sent):
                 forbidden.extend(self.resolve_objects(sent))
-            # Safety wording neither template captured, scoped to what the sentence (else the source) names; scanned
-            # whether or not structured rules were supplied, cleared only when the reviewer structured all it names.
-            if SAFETY_RE.search(PROHIBIT_RE.sub(' ', RULE_RE.sub(' ', sent))):
-                named = self.named(sent) or self.named(body)
-                if named and not set(named) <= structured: safety.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], named))
+            named = self.named(sent) or self.named(body)
+            if CONDITIONAL_RE.search(sent):
+                scope = named or (['*'] if MOTION_RE.search(sent) or SAFETY_RE.search(sent) else [])
+                if scope and not resolved(scope): pending.append(('Conditional exception; structured review required: '+sent.strip()[:300], scope))
+            elif SAFETY_RE.search(PROHIBIT_RE.sub(' ', RULE_RE.sub(' ', sent))):
+                if named and not resolved(named): pending.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], named))
+        pending += [('Unresolved rule wording: '+u[:300], self.named(u) or self.named(body)) for u in unresolved]
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
@@ -293,10 +320,8 @@ class Store:
             self.conn.execute('INSERT INTO source_chunk_fts(text,section,chunk_id) VALUES(?,?,?)', (body, '', cid))
             self.conn.execute('INSERT INTO cx_source VALUES(?,?,?,?,?,?,?)',
                               (sid, self.workspace, 'accepted', rev, supersedes, hashlib.sha256(body.encode()).hexdigest(), int(cloud_ok)))
-            if unresolved:
-                self.conn.execute('INSERT INTO cx_unresolved VALUES(?,?,?)',(sid,canonical(self.resolve_objects(body)),'; '.join(unresolved)[:1000]))
-            for reason, named in safety:
-                self.conn.execute('INSERT INTO cx_unresolved VALUES(?,?,?)',(sid,canonical(named),reason))
+            for reason, mentions in pending:
+                self.conn.execute('INSERT INTO cx_unresolved VALUES(?,?,?)',(sid,canonical(sorted(mentions)),reason[:1000]))
             if supersedes:
                 self.conn.execute("UPDATE cx_constraint SET status='superseded' WHERE assertion_id IN (SELECT id FROM assertion WHERE source_id=?)", (supersedes,))
             for obj in sorted(set(forbidden)):
@@ -335,7 +360,7 @@ class Store:
             self._bump()
             self.invalidate()
         return {'source_id': sid, 'chunk_id': cid, 'revision': rev, 'rules': added,
-                'unresolved_rules': unresolved+[reason for reason, _ in safety], 'kind': 'taught'}
+                'unresolved_rules': [reason for reason, _ in pending], 'kind': 'taught'}
 
     def source_state(self, sid: str) -> dict:
         r = self.one('SELECT s.*,c.* FROM source s JOIN cx_source c ON c.source_id=s.id WHERE s.id=? AND c.workspace=?', (sid, self.workspace))
@@ -429,7 +454,7 @@ class Store:
 
     def unresolved_for(self,ids: set[str]) -> list[dict]:
         rows=self.rows("SELECT u.* FROM cx_unresolved u JOIN cx_source s ON s.source_id=u.source_id WHERE s.status='accepted' AND s.workspace=?",(self.workspace,))
-        return [r for r in rows if ids & set(json.loads(r['mentions_json']))]
+        return [r for r in rows if (m := set(json.loads(r['mentions_json']))) and ('*' in m or ids & m)]   # '*': scoped to everything
 
     @staticmethod
     def scope(goal: Goal, rules: list[dict]) -> set[str]:

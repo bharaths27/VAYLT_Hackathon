@@ -234,6 +234,10 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         response.headers['Cache-Control']='no-store'
         response.headers['X-Content-Type-Options']='nosniff'
         response.headers['Referrer-Policy']='no-referrer'
+        # No response may be framed: a hostile page cannot overlay the inspector's approval controls (clickjacking).
+        response.headers['X-Frame-Options']='DENY'
+        csp=response.headers.get('Content-Security-Policy')
+        response.headers['Content-Security-Policy']=(csp+'; ' if csp else '')+"frame-ancestors 'none'"
         return response
     app.add_middleware(Guard,credentials=[*keys,*skeys]) # added last = outermost
     adapter_label=b.robot.state().get('adapter')

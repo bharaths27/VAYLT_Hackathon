@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from typing import Callable
 
 from .models import IntentAdvisor, ModelUnavailable, QwenClient
-from .planning import Compiler, verify
+from .planning import PHYSICAL, Compiler, verify
 from .store import Store
 from .types import Conflict, CortexError, Denied, Goal, Missing, Stale, canonical, digest, text, uid
 
@@ -70,11 +70,17 @@ class Skills:
             for i,oid in enumerate(sorted(variant['objects'])):
                 ring=[zones[(i+shift+k)%len(zones)] for k in range(len(zones))]
                 variant['positions'][oid]=next((z for z in ring if z not in moves.get(oid,())),ring[0])
+            # The robot starts somewhere else too, away from the goal's station: a goto must actually travel.
+            variant['at_zone']=next((z for z in zones[shift:]+zones[:shift] if z!=g.zone),None)
             variants.append(variant)
         results=[]
         for v in variants:
-            results.append(verify(g,d['steps'],v,self.store.related_rules(g),self.store.policy,
-                                  expected_basis=d['basis'],actual_basis=self.store.basis(g)).to_dict())
+            results.append({**verify(g,d['steps'],v,self.store.related_rules(g),self.store.policy,
+                                     expected_basis=d['basis'],actual_basis=self.store.basis(g)).to_dict(),'start_zone':v.get('at_zone')})
+        # No effect step is no competence for a fetch or goto: such a procedure only "passes" where the goal already
+        # held (e.g. composed while the target sat at its destination), so it never becomes a skill.
+        if g.kind in {'fetch','goto'} and not any(st['op'] in PHYSICAL for st in d['steps']):
+            results.append({'ok':False,'errors':['no effect step: a no-op procedure passes only where the goal already holds'],'start_zone':None})
         passed=all(r['ok'] for r in results)
         record={'ok':passed,'mode':'SIMULATED','verifier':'symbolic-verifier-v1','cases':results,
                 'assumptions':'Registered primitives succeed in the symbolic environment; this is not physical competence evidence.',
@@ -240,7 +246,7 @@ class Dreamer:
                 if advice['status']=='ok' and (advice['scores']['conflict']>=0.8 or advice['scores']['practice']<0.2):
                     errors.append('Advisory practice veto; no permission or factual conclusion inferred.')
                     rules_now=[]
-            objects=self.store.objects(); zones=sorted(self.store.zones())
+            zones=sorted(self.store.zones())
             proposed=[]
             for r in rules_now:
                 if r['status']=='active' and zones:
@@ -304,7 +310,10 @@ class Dreamer:
                 refs+=['episode:'+e['id'] for e in episodes[:2]]
                 live=self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
                 # The bundle is intentionally small; no whole-vault prompt.
-                bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],'pending_commitments':self.store.rows("SELECT id,trigger,request,status FROM prospective_task WHERE status IN ('waiting','fired','unknown') LIMIT 3"),'approved_skills':self.store.rows("SELECT v.name,v.status FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' LIMIT 3"),'declared_knowledge':declared,'source_passages':recent_sources,'observations':[{'id':o['id'],'statement':o['statement'],'fresh':o['fresh']} for o in objects[:4]]}
+                # Only citable memory enters the prompt: every item carries a ref that is in allowed_refs. Observations,
+                # pending commitments and approved-skill rows have no resolvable ref, so a hypothesis could not cite them.
+                bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],
+                        'declared_knowledge':declared,'source_passages':recent_sources}
                 asked=digest(bundle)
                 if refs and live<self.LIVE_CAP and asked!=self._model_answered:
                     q=None; self._model_calls.append(self.monotonic())

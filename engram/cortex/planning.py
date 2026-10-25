@@ -103,7 +103,7 @@ def parse_goal(request: str, store: Store) -> Goal:
     kinds=[k for k,v in VERBS.items() if re.search(r'\b(?:'+v+r')\b',low)]
     if len(kinds)>1 or sum(len(re.findall(r'\b(?:'+v+r')\b',low)) for v in VERBS.values())>1:
         raise Missing('more than one action in one request; give one instruction at a time')
-    ids=store.resolve_objects(request)
+    ids=store.resolve_targets(request)   # each target named unambiguously: an alias two objects share is refused
     zone=store.resolve_zone(request)
     extra=_uncovered(low,store)
     if kinds and extra: raise Missing('unrecognised words '+repr(' '.join(extra)[:80])+'; name only registered objects and one registered station')

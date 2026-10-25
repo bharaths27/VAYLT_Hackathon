@@ -33,7 +33,7 @@ class Brain:
         self.qwen=qwen; self.intent=intent or IntentAdvisor(enabled=False)
         self.compiler=Compiler(store); self.skills=Skills(store); self.activity=Activity()
         self.dreamer=Dreamer(store,self.skills,self.activity,qwen,self.intent)
-        self._recoverable_preparing=set(); self._effect_lock=threading.Lock(); self._stopped=threading.Event(); self._file_lock=None
+        self._recoverable_preparing=set(); self._effect_lock=threading.Lock(); self._stopped=threading.Event(); self._stop_gen=0; self._file_lock=None
         self.mode='SIMULATED' if robot.state().get('adapter')=='mock' else 'PHYSICAL'
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
@@ -245,7 +245,8 @@ class Brain:
                     r=self.operation(ep); plan=r['plan']
                     if r['owner']!=principal: raise Denied('approver does not own this operation')
                     if r['status']!='proposed': raise Conflict('operation is not awaiting approval')
-                    if self._stopped.is_set() or self.robot.state().get('stopped'): raise Denied('stop is latched')
+                    # The durable latch is the authority; the event and the adapter flag are faster copies of it.
+                    if self._stopped.is_set() or self.robot.state().get('stopped') or self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): raise Denied('stop is latched')
                     self._require_reconciled('new motion')
                     if self.store.clock()>=r['expires_at']: raise Stale('proposal expired')
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
@@ -355,32 +356,40 @@ class Brain:
         return self.operation(ep)
 
     def stop(self):
-        self._stopped.set(); self.activity.touch(); confirmed=False
-        # Durable first: a crash during the robot call still leaves the latch set and every pending proposal revoked.
-        with self.store.tx():
-            self._latch('operator stop')
-            for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
-                self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
+        self._stop_gen+=1; self._stopped.set(); self.activity.touch(); confirmed=False
         try:
-            self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
-        except Exception: pass
+            # Durable first: a crash during the robot call still leaves the latch set and every pending proposal revoked.
+            with self.store.tx():
+                self._latch('operator stop')
+                for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
+                    self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
+        finally:
+            # The hardware STOP goes out even when that transaction failed: storage never swallows a STOP. The in-memory
+            # latch stays set, and a storage error still reaches the caller, after the stop.
+            try:
+                self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
+            except Exception: pass
         self.journal(None,'stop',{},'confirmed' if confirmed else 'requested')
         return {'stop_requested':True,'stop_confirmed':confirmed,'auto_resume':False}
 
     def clear_stop(self,*,principal: str):
-        principal=text(principal,'operator',100)
+        principal=text(principal,'operator',100); gen=self._stop_gen
         with self.store.tx():
             self._require_reconciled('rearming')
-            self.robot.reset_stop()
             self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
             self.journal(None,'clear_stop',{},'cleared',principal)
-            self._stopped.clear()
+        # Re-arm only after the durable transition committed: a refused COMMIT leaves the robot and the event stopped.
+        # A stop or failure latch that arrived meanwhile wins: the robot is stopped again and nothing is cleared.
+        self.robot.reset_stop()
+        if self._stop_gen!=gen:
+            self.robot.stop(); raise Conflict('a stop arrived while the latch was being cleared; the robot stays stopped')
+        self._stopped.clear()
         self.activity.touch()
         return self.robot.state()
 
     def _latch(self,reason: str):
         # The stop latch is durable: recover() restores it, so a restart cannot silently re-arm motion.
-        self._stopped.set()
+        self._stop_gen+=1; self._stopped.set()
         with self.store.tx(): self.store.conn.execute("INSERT OR IGNORE INTO meta VALUES('cortex_stop',?)",(canonical({'at':self.store.clock(),'reason':reason}),))
 
     def _require_reconciled(self,action: str):
