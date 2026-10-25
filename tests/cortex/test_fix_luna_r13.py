@@ -147,3 +147,40 @@ def test_a_system_event_an_operator_caused_is_theirs_and_only_public_kinds_are_s
     assert ('clear_stop','alice') in alice and any('zqxnote' in d for _,d in alice)
     assert not any('zqxlegacy' in d for _,d in alice+bob)                                    # unowned and not allowlisted: nobody's
     b.close()
+
+
+# P3-5: the body guard gathers a body into one growing buffer, so a body in tiny chunks costs linear, not quadratic,
+# copying; and it never reads a body for a method that takes none (nor buffers one before any credential check).
+def asgi_scope(method,path,token=None):
+    headers=[(b'transfer-encoding',b'chunked')]+([(b'authorization',('Bearer '+token).encode())] if token else [])
+    return {'type':'http','asgi':{'version':'3.0'},'http_version':'1.1','method':method,'path':path,'raw_path':path.encode(),
+            'root_path':'','scheme':'http','query_string':b'','client':('127.0.0.1',1),'server':('127.0.0.1',80),'headers':headers}
+
+async def ok(scope,receive,send):
+    await send({'type':'http.response.start','status':200,'headers':[]});await send({'type':'http.response.body','body':b''})
+
+def test_a_body_in_one_byte_chunks_arrives_whole_at_linear_cost():
+    n,got=api.MAX_BODY,[]
+    async def echo(scope,receive,send): got.append(len((await receive())['body']));await ok(scope,receive,send)
+    guard=api.Guard(echo,credentials=[TA])
+    def best(target):                                                  # the best of three runs: machine noise only adds
+        times=[]
+        for _ in range(3):
+            left=[n]
+            async def receive():
+                left[0]-=1;return {'type':'http.request','body':b'x' if left[0]>=0 else b'','more_body':left[0]>=0}
+            async def send(m): pass
+            t=time.perf_counter();asyncio.run(target(receive,send));times.append(time.perf_counter()-t)
+        return min(times)
+    async def drain(receive,send):                                     # the cost of merely receiving those chunks
+        while (await receive())['more_body']: pass
+    async def guarded(receive,send): await guard(asgi_scope('POST','/memory/query',TA),receive,send)
+    received,cost=best(drain),best(guarded)
+    assert got==[n]*3 and cost<received*4,(received,cost)              # was: about 13 times, the body re-copied per byte
+
+def test_a_method_that_takes_no_body_never_has_one_read():
+    reads,sent=[],[]
+    async def receive(): reads.append(1);return {'type':'http.request','body':b'x'*1000,'more_body':True}   # an endless body
+    async def send(m): sent.append(m)
+    asyncio.run(api.Guard(ok,credentials=[TA])(asgi_scope('GET','/health'),receive,send))
+    assert not reads and sent[0]['status']==200                        # was: read and buffered, with no credential at all
