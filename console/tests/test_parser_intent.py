@@ -147,7 +147,17 @@ PROSPECTIVE_INNER = [
     ("In 5 seconds, don't open the claw.", "abstain"),
     ("In 5 seconds, cancel that.", "abstain"),
     ("In 5 seconds, bring it here.", "clarify"),
-    ("In 5 seconds, juggle.", "abstain"),  # no grammar: the LLM would plan it for NOW
+    ("In 5 seconds, juggle.", "clarify"),  # no grammar: the LLM would plan it for NOW (round 10: asks)
+    # Review round 10: only a robot action can be scheduled. A rule was taught at once ("In 5 minutes, remember
+    # that ..."), and a question or a look was scheduled; they ask now ("say the rule now, or schedule an action").
+    ("In 5 minutes, remember that the vial must remain in zone B.", "clarify"),
+    ("In 5 minutes, rule: the vial stays in zone B.", "clarify"),
+    ("In 5 minutes, note that the bench is wet.", "clarify"),
+    ("In 5 minutes, from now on keep the vial in zone B.", "clarify"),
+    ("In 5 minutes, what do you see?", "clarify"),
+    ("In 5 minutes, look around.", "clarify"),
+    ("In 5 minutes, where is the vial?", "clarify"),
+    ("In 5 minutes, find the vial.", "clarify"),
     ("In 5 seconds, stop.", "stop"),
     ("In 2 minutes, open the claw. Stop!", "stop"),
     ("In 5 seconds, open the claw, close it.", "clarify"),  # scheduled only the open
@@ -165,6 +175,8 @@ STILL_WORKS = [
     ("In 5 seconds, open the claw.", "prospective", "gripper_open"),
     ("In 2 minutes, bring the red cup to zone B.", "prospective", "search_tag"),
     ("In five minutes, open the claw.", "prospective", "gripper_open"),
+    ("In 5 minutes, drive forward 10 cm.", "prospective", "drive_bounded"),
+    ("In 1 minute, turn left 90.", "prospective", "turn_bounded"),
     # Round 6: this used to plan a fetch of the VIAL ("the cup" is not in memory, "vial" is); now it asks.
     ("Bring the cup next to the vial to zone B.", "clarify", None),
     # Filler around a command is fine.
@@ -279,6 +291,22 @@ def test_prospective_schedules_only_a_plan(text, kind):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == (kind, None), (text, r.kind, r.trace)
     assert not r.data.get("llm_eligible"), "the LLM fallback would plan the task now and drop the delay"
+    assert "rule_text" not in r.data, "a rule inside a delay must not be taught"
+
+
+@pytest.mark.parametrize("text", ["In 5 minutes, remember that the vial must remain in zone B.",
+                                  "In 5 minutes, what do you see?"])
+def test_a_deferred_rule_or_question_is_neither_taught_nor_scheduled(text):
+    # Review round 10: the route taught "In 5 minutes, remember that ..." at once, because the parser returned
+    # the inner rule as itself. Nothing may be stored: no rule, no new source, no scheduled task.
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        before = (len(main.memory.sources), len(main.memory.constraints), len(main.memory.prospective))
+        out = c.post("/commands", json={"text": text, "source": "voice"}).json()
+        after = (len(main.memory.sources), len(main.memory.constraints), len(main.memory.prospective))
+    assert out["kind"] == "clarify" and "rule" not in out and "prospective" not in out, out
+    assert before == after, (before, after)
+    assert "rule now" in out["reason"] and "In 5 minutes, open the claw" in out["reason"], out["reason"]
 
 
 @pytest.mark.parametrize("text,kind,first_op", STILL_WORKS)
