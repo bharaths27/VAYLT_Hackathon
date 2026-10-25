@@ -589,21 +589,23 @@ def test_seal_captures_exactly_what_had_arrived_and_decides_once():
         PcmWindow().seal(generation=-1)                         # another utterance than the one held
 
 
-def test_partials_stop_when_the_window_moves_on_to_another_utterance():
+@pytest.mark.parametrize("next_s", [0.6, 0.1], ids=["next utterance long", "next utterance short"])
+def test_partials_stop_when_the_window_moves_on_to_another_utterance(next_s):
     fake, window = _FakeWhisper(), PcmWindow()
     fake.release.set()
     tr = LiveTranscriber(fake, window, poll_s=0.005)
     window.reset()                                              # this transcriber's utterance is gone
-    _speech(window, 0.6)                                        # audio of the next one
+    _speech(window, next_s)                                     # audio of the next one
     tr.start()
-    time.sleep(0.15)
+    tr._thread.join(0.5)
+    assert not tr._thread.is_alive()                            # it stops at once, whatever the next holds
     assert fake.calls == [] and tr.poll() is None               # never sent as this utterance's partial
 
 
 class _ClipsAtSnapshot(PcmWindow):
     """Stops being whole between the partial loop's check and its snapshot (the race, made certain)."""
 
-    def snapshot(self):
+    def snapshot(self, generation=None):
         raise AudioOverflow("clipped between the check and the snapshot")
 
 
@@ -699,3 +701,75 @@ def test_an_empty_chunk_is_not_a_refusal():
     w.append(b"", seq=1)                                        # a keep-alive: accepted, nothing stored
     w.append(SAMPLES, seq=2)
     assert w.intact(w.generation) and read_wav(w.snapshot())[3] == SAMPLES + SAMPLES
+
+
+# ---- every read of an utterance is checked against its generation, atomically ------------------------------
+
+
+def test_every_read_of_an_utterance_refuses_another_generation():
+    w = PcmWindow()
+    w.append(SAMPLES)
+    old = w.generation
+    sealed = w.seal(old)
+    w.reset()
+    w.append(SAMPLES)                                           # the next utterance
+    assert not w.intact(old)
+    with pytest.raises(AudioOverflow):
+        w.snapshot(old)
+    with pytest.raises(AudioOverflow):
+        w.duration(old)
+    with pytest.raises(AudioOverflow):
+        w.seal(old)
+    assert w.finalize(sealed) is False                          # an older utterance's seal is never final
+    assert read_wav(w.snapshot(w.generation))[3] == SAMPLES and w.duration(w.generation) == pytest.approx(0.05)
+
+
+def test_a_reset_during_the_final_makes_it_not_final():
+    stt, window = _BlockingFinal(), PcmWindow(max_seconds=1.0)
+    _speech(window, 0.6)
+    tr = LiveTranscriber(stt, window)
+    t, out = _finish_in_thread(tr)
+    assert stt.final_started.wait(2)                            # the final transcription is running
+    window.reset()                                              # the producer moves on, with no late append
+    _speech(window, 0.3)                                        # and the next utterance is accepted
+    stt.release.set()
+    t.join(5)
+    assert "text" not in out and isinstance(out["error"], AudioOverflow)
+
+
+class _MovesOnBeforeReading(PcmWindow):
+    """Moves on to the next utterance (reset, then its audio) just before a partial reads the audio: the
+    race between the partial loop's check and its read, made certain."""
+
+    NEXT = (7).to_bytes(2, "little") * 8000                    # the next utterance's audio, recognisable
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.moved_on = False
+
+    def snapshot(self, generation=None):
+        if not self.moved_on:
+            self.moved_on = True
+            self.reset()
+            self.append(self.NEXT)
+        return super().snapshot() if generation is None else super().snapshot(generation)
+
+
+class _RecordingWhisper:
+    def __init__(self):
+        self.sent = []
+
+    def transcribe(self, wav, cancel=None):
+        self.sent.append(wav)
+        return "Open the claw"
+
+
+def test_an_old_transcriber_never_sends_the_next_utterances_audio():
+    stt, window = _RecordingWhisper(), _MovesOnBeforeReading()
+    window.append(SAMPLES * 12)                                 # 0.6 s of this utterance
+    tr = LiveTranscriber(stt, window, poll_s=0.005)
+    tr.start()
+    tr._thread.join(1.0)
+    assert window.moved_on and not tr._thread.is_alive()        # it stopped: its utterance is gone
+    assert not any(_MovesOnBeforeReading.NEXT in wav for wav in stt.sent)
+    assert stt.sent == []                                       # nothing was sent for it at all

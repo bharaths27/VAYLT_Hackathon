@@ -386,3 +386,20 @@ def test_after_any_refused_chunk_nothing_of_the_utterance_is_proposed(taught, sp
     assert out["kind"] == "clarify" and voice.gate.prepared() is None
     assert stt.calls.count("final") == 0
     assert nothing_happened(taught)
+
+
+def test_a_reset_during_the_final_never_becomes_a_proposal(taught, spawn, clock):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _BlockingFinalWhisper(), PcmWindow(max_seconds=5.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)           # "open the gripper" prepared
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", voice.finish_live(1, 99, tr)))
+    t.start()
+    assert stt.final_started.wait(2)                            # the final is being made...
+    window.reset()                                              # ...when the window moves on, no late append
+    window.append(SAMPLES)
+    stt.release.set()
+    t.join(5)
+    assert out["r"]["kind"] == "clarify" and voice.gate.prepared() is None
+    assert nothing_happened(taught)
