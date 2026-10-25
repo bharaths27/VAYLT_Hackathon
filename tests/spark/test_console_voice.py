@@ -491,6 +491,15 @@ def test_word_error_rate():
     assert voice_probe.word_error_rate("", "anything") is None
 
 
+def test_word_error_rate_keeps_real_words_in_parentheses_and_any_script():
+    assert voice_probe.word_error_rate("pick (up) the beaker", "pick the beaker") == 0.25  # "(up)" is a word
+    assert voice_probe.word_error_rate("pick up the beaker", "(upbeat music) pick up the beaker (laughs)") == 0
+    assert voice_probe.word_error_rate("pick up the beaker", "[ Silence ] pick up the beaker") == 0
+    assert voice_probe.words("Ouvre la pince, café crème!") == ["ouvre", "la", "pince", "café", "crème"]
+    assert voice_probe.word_error_rate("le café", "le cafe") == 0.5  # an accent is a different word
+    assert voice_probe.words("don't stop") == ["don't", "stop"]
+
+
 def _clips(tmp_path, **clips):
     folder = tmp_path / "clips"
     folder.mkdir()

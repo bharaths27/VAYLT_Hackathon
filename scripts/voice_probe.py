@@ -31,10 +31,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from console.server import config, voice  # noqa: E402
 
 
+# Whisper marks non-speech as [BLANK_AUDIO] / [MUSIC] (square brackets) or as a parenthesised sound
+# description like "(upbeat music)" or "(laughs)". Only those are dropped: "(up)" in a reference is a word.
+_SOUND = re.compile(r"\((?:[^()]*\s)?(?:music|laugh\w*|applause|silence|noise|inaudible|cough\w*|sigh\w*|"
+                    r"breath\w*|clap\w*|static|beep\w*|bell\w*|whistl\w*|foreign language)(?:\s[^()]*)?\)")
+
+
 def words(text: str) -> list[str]:
-    """Lowercase words for scoring. Drops whisper tags like [BLANK_AUDIO] and punctuation."""
-    text = re.sub(r"\[.*?\]|\(.*?\)", " ", text.lower())
-    return re.findall(r"[a-z0-9']+", text)
+    """Lowercase words for scoring, in any script (accented letters count). Drops whisper's
+    bracket tags and parenthesised sound descriptions, and punctuation."""
+    text = _SOUND.sub(" ", re.sub(r"\[[^\]]*\]", " ", text.lower()))
+    return re.findall(r"[^\W_]+(?:'[^\W_]+)*", text)
 
 
 def word_error_rate(reference: str, hypothesis: str) -> float | None:
