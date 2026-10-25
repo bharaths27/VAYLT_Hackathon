@@ -937,6 +937,16 @@ def info_list(size):
     return b"LIST", b"INFO" + b"ICMT" + struct.pack("<I", size) + b"x" * size
 
 
+def with_riff_size(clip, riff_size):
+    return clip[:4] + struct.pack("<I", riff_size) + clip[8:]
+
+
+# 1 s of audio in a plain WAV: a 44-byte header whose sizes are exactly true
+PLAIN_HEADER_1S = (b"RIFF" + struct.pack("<I", 36 + 32000) + b"WAVE" + b"fmt "
+                   + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16) + b"data" + struct.pack("<I", 32000))
+PLAIN_1S = PLAIN_HEADER_1S + PCM_1S
+
+
 # WAVE_FORMAT_EXTENSIBLE: cbSize 22, 16 valid bits, front-centre, KSDATAFORMAT_SUBTYPE_PCM
 EXTENSIBLE = fmt(tag=0xFFFE, extra=struct.pack("<HHI", 22, 16, 4) + bytes.fromhex("0100000000001000800000aa00389b71"))
 
@@ -947,7 +957,7 @@ def test_12_bit_audio_in_2_byte_samples_is_converted(stt, tmp_path):
     clip.write_bytes(twelve)
     with wave.open(str(clip), "rb") as w:  # what fooled the old check: 2 bytes per sample
         assert (w.getsampwidth(), w.getnchannels(), w.getframerate()) == (2, 1, 16000)
-    assert voice._native_seconds(clip) is None
+    assert voice._native_data(clip) is None
     text, _ = run(voice.transcribe(twelve, ".wav"))
     assert text == "pick up the beaker"
     assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw == CONVERTED
@@ -974,14 +984,49 @@ def test_plain_16_bit_pcm_still_skips_ffmpeg_around_other_chunks(stt):
     assert stt.tools() == ["whisper-cli"] and stt.whisper_saw == native
 
 
-def test_length_counts_only_the_audio_really_in_the_file(stt, monkeypatch, tmp_path):
+@pytest.mark.parametrize("clip", [
+    riff(fmt(), (b"data", PCM_1S), data_size=0xFFFFFFFF),
+    with_riff_size(riff(fmt(), (b"data", PCM_1S)), 0xFFFFFFFF),
+    with_riff_size(riff(fmt(), (b"data", PCM_1S)), 36),
+    riff(fmt(), (b"data", PCM_1S), info_list(10)),
+    riff(fmt(), (b"data", PCM_1S), (b"data", PCM_1S)),
+    riff(fmt(), (b"data", PCM_1S + b"\x01")),
+], ids=["streaming-data-size", "riff-size-too-big", "riff-size-too-small", "chunk-after-data",
+        "second-data-chunk", "half-a-sample"])
+def test_a_native_wav_whose_header_disagrees_with_its_bytes_reaches_whisper_plain(stt, monkeypatch, tmp_path, clip):
     monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
-    streamed = riff(fmt(), (b"data", PCM_1S), data_size=0xFFFFFFFF)  # a streaming writer's header
-    clip = tmp_path / "streamed.wav"
-    clip.write_bytes(streamed)
-    assert voice._native_seconds(clip) == 1.0
-    assert run(voice.transcribe(streamed, ".wav"))[0] == "pick up the beaker"
-    assert stt.tools() == ["whisper-cli"]
+    path = tmp_path / "clip.wav"
+    path.write_bytes(clip)
+    assert voice._native_data(path) == (44, 32000, False)  # 1 s of audio; the header says otherwise
+    details = {}
+    assert run(voice.transcribe(clip, ".wav", details=details))[0] == "pick up the beaker"
+    assert details == {"conversion": "native-stripped"} and stt.tools() == ["whisper-cli"]
+    assert stt.whisper_saw[:44] == PLAIN_HEADER_1S  # the header whisper reads has the true sizes
+    assert stt.whisper_saw == PLAIN_1S
+
+
+def test_a_native_wav_whose_header_is_exact_reaches_whisper_unchanged(stt, tmp_path):
+    path = tmp_path / "plain.wav"
+    path.write_bytes(PLAIN_1S)
+    assert voice._native_data(path) == (44, 32000, True)
+    details = {}
+    assert run(voice.transcribe(PLAIN_1S, ".wav", details=details))[0] == "pick up the beaker"
+    assert details == {"conversion": "native"} and stt.whisper_saw == PLAIN_1S
+
+
+def test_the_whisper_server_also_gets_the_plain_file(stt, whisper_server, monkeypatch):
+    monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"])
+    streamed = riff(fmt(), (b"data", PCM_1S), data_size=0xFFFFFFFF)
+    assert run(voice.transcribe(streamed, ".wav"))[0] == "hello from the server"
+    ((_, _, body),) = whisper_server["requests"]
+    assert PLAIN_1S in body and streamed[:44] not in body
+
+
+def test_a_converter_output_with_unset_sizes_reaches_whisper_plain(stt):
+    stt.decode = lambda cmd: riff(fmt(), (b"data", PCM_1S), data_size=0xFFFFFFFF)
+    details = {}
+    assert run(voice.transcribe(wav_bytes(rate=44100), ".wav", details=details))[0] == "pick up the beaker"
+    assert details == {"conversion": "ffmpeg"} and stt.whisper_saw == PLAIN_1S
 
 
 def _real_ffmpeg():
@@ -1044,9 +1089,8 @@ def test_a_short_native_clip_with_big_metadata_never_needs_ffmpeg(stt, monkeypat
 
 def test_a_stray_odd_byte_is_not_counted_as_audio(tmp_path):
     clip = tmp_path / "odd.wav"
-    clip.write_bytes(riff(fmt(), (b"data", PCM_1S + b"")))  # half a sample at the end
-    offset, size = voice._native_data(clip)
-    assert (offset, size) == (44, len(PCM_1S)) and voice._native_seconds(clip) == 1.0
+    clip.write_bytes(riff(fmt(), (b"data", PCM_1S + b"\x01")))  # half a sample at the end
+    assert voice._native_data(clip) == (44, len(PCM_1S), False)
 
 
 def test_stripping_reads_the_audio_in_bounded_blocks(stt, monkeypatch):
@@ -1104,6 +1148,66 @@ def test_probe_reports_what_the_path_actually_did(stt, monkeypatch, tmp_path, ca
     a, b, c, d = json.loads(capsys.readouterr().out)["clips"]
     assert (a["conversion"], b["conversion"], c["conversion"]) == ("native", "native-stripped", "ffmpeg")
     assert (d["conversion"], d["reason"]) == ("native", "audio too long: 3.0 s (limit 2 s)")  # native, refused on length
+
+
+
+def test_probe_never_reads_a_clip_over_the_queue_byte_limit(stt, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 64 * 1024)
+    folder = _clips(tmp_path, a=(wav_bytes(), None))
+    with open(folder / "b.wav", "wb") as f:
+        f.truncate(1024 * 1024)  # 1 MiB, sparse: nothing written
+    opened, sent = [], []
+    real_open, real_transcribe = open, voice.transcribe
+
+    def watched_open(path, *args, **kwargs):
+        opened.append(Path(path).name)
+        return real_open(path, *args, **kwargs)
+
+    async def watched_transcribe(audio, suffix, details=None):
+        sent.append(len(audio))
+        return await real_transcribe(audio, suffix, details)
+
+    monkeypatch.setattr(voice_probe, "open", watched_open, raising=False)
+    monkeypatch.setattr(voice_probe.voice, "transcribe", watched_transcribe)
+    code = voice_probe.main([str(folder)])
+    a, b = json.loads(capsys.readouterr().out)["clips"]
+    assert a["ok"] and a["conversion"] == "native"
+    assert (b["ok"], b["transcript"], b["conversion"]) == (False, None, None)
+    assert b["reason"] == "audio too large: 1048576 bytes (limit 65536)"
+    assert opened == ["a.wav"] and sent == [len(wav_bytes())]  # the big clip was never opened or sent
+    assert code == 1
+
+
+def test_probe_reads_at_most_one_byte_past_the_limit(stt, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 64 * 1024)
+    folder = _clips(tmp_path, a=(wav_bytes(), None))  # small when its size is checked...
+    reads, real_open = [], open
+
+    class Watched:
+        def __init__(self, f):
+            self.f = f
+
+        def read(self, n=-1):
+            reads.append(n)
+            return self.f.read(n)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.f.__exit__(*exc)
+
+    def growing_open(path, *args, **kwargs):  # ...and 1 MiB bigger by the time it is opened
+        with real_open(path, "ab") as f:
+            f.write(bytes(1024 * 1024))
+        return Watched(real_open(path, *args, **kwargs))
+
+    monkeypatch.setattr(voice_probe, "open", growing_open, raising=False)
+    voice_probe.main([str(folder)])
+    (a,) = json.loads(capsys.readouterr().out)["clips"]
+    size = (folder / "a.wav").stat().st_size
+    assert reads == [64 * 1024 + 1]  # one bounded read, stopped just past the limit
+    assert (a["transcript"], a["reason"]) == (None, f"audio too large: {size} bytes (limit 65536)")
 
 
 

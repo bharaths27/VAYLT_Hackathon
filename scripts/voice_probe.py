@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from console.server import voice  # noqa: E402
+from console.server import config, voice  # noqa: E402
 
 
 def words(text: str) -> list[str]:
@@ -50,6 +50,18 @@ def word_error_rate(reference: str, hypothesis: str) -> float | None:
     return row[-1] / len(ref)
 
 
+def _read_within_limit(path: Path) -> bytes | str:
+    """The clip's bytes, or why it was not read: a clip over the byte limit the console's STT
+    queue uses (ENGRAM_STT_MAX_PENDING_BYTES) is refused from its size alone, never read."""
+    limit = config.STT_MAX_PENDING_BYTES
+    if path.stat().st_size <= limit:
+        with open(path, "rb") as f:
+            audio = f.read(limit + 1)  # bounded, even if the file grew since its size was checked
+        if len(audio) <= limit:
+            return audio
+    return f"audio too large: {path.stat().st_size} bytes (limit {limit})"
+
+
 def probe_clip(path: Path) -> dict:
     ref_path = path.with_suffix(".txt")
     reference, reference_error = None, None
@@ -61,7 +73,11 @@ def probe_clip(path: Path) -> dict:
     details: dict = {}
     started = time.perf_counter()
     try:
-        text, reason = asyncio.run(voice.transcribe(path.read_bytes(), ".wav", details=details))
+        audio = _read_within_limit(path)
+        if isinstance(audio, str):
+            text, reason = None, audio
+        else:
+            text, reason = asyncio.run(voice.transcribe(audio, ".wav", details=details))
     except Exception as e:  # noqa: BLE001 - record it against this clip and go on to the next
         text, reason = None, f"error: {type(e).__name__}: {str(e)[:200]}"
     latency = time.perf_counter() - started
