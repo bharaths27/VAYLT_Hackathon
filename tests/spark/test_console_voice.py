@@ -808,7 +808,7 @@ def test_busy_endpoints_answer_503(monkeypatch):
     async def busy_tts(text):
         raise voice.VoiceBusy("busy: 8 speech jobs already waiting or running (limit 8)")
 
-    async def busy_stt(audio, suffix):
+    async def busy_stt(audio, suffix, **kwargs):
         return None, "busy: 4 speech jobs already waiting or running (limit 4)"
 
     monkeypatch.setattr(main.voice, "synthesize", busy_tts)
@@ -835,15 +835,239 @@ def test_stt_upload_is_read_bounded_and_oversize_is_refused(monkeypatch):
         reads.append((size, len(data)))
         return data
 
-    async def never(audio, suffix):
+    async def never(audio, suffix, **kwargs):
         pytest.fail("an oversized upload reached the STT queue")
 
     monkeypatch.setattr(UploadFile, "read", spy)
     monkeypatch.setattr(main.voice, "transcribe", never)
     monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 4096)
-    r = TestClient(main.app).post("/stt", files={"audio": ("a.wav", b"\x00" * 50_000, "audio/wav")}, data={"auto": "0"})
+    # within the request cap (so the endpoint, not the upload guard, sees it), over the audio limit
+    r = TestClient(main.app).post("/stt", files={"audio": ("a.wav", b"\x00" * 10_000, "audio/wav")}, data={"auto": "0"})
     assert r.status_code == 413 and r.json() == {"ok": False, "reason": "audio too large: over 4096 bytes"}
     assert reads == [(4097, 4097)]  # one bounded read; the rest of the upload is never pulled into memory
+
+# ------------------------------------------------------------------ /stt upload guard + reservations (review fix 10)
+needs_web = pytest.mark.skipif(not _console_web_deps(), reason="python-multipart (console/requirements.txt) not installed")
+BOUNDARY = "vaylt-test-boundary"
+FORM_TYPE = (b"content-type", f"multipart/form-data; boundary={BOUNDARY}".encode())
+
+
+def multipart(audio: bytes, auto: str = "0") -> bytes:
+    return (f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="auto"\r\n\r\n{auto}\r\n'
+            f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="audio"; filename="a.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n").encode() + audio + f"\r\n--{BOUNDARY}--\r\n".encode()
+
+
+def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False):
+    """Drive the ASGI app directly, the way a server would. Returns (status, body, pulled):
+    pulled counts the receive() calls the app made and the body bytes it took."""
+    pulled = {"calls": 0, "bytes": 0}
+    chunks = iter(chunks)
+    upcoming = [next(chunks, None)]
+
+    async def receive():
+        pulled["calls"] += 1
+        chunk = upcoming[0]
+        if chunk is None:
+            return {"type": "http.disconnect"}
+        upcoming[0] = next(chunks, None)
+        pulled["bytes"] += len(chunk)
+        return {"type": "http.request", "body": chunk, "more_body": upcoming[0] is not None or hang_up}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+             "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+             "headers": list(headers), "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8000)}
+    asyncio.run(app(scope, receive, send))
+    status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+    return status, b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body"), pulled
+
+
+def _queue_is_empty():
+    return (voice._STT.jobs, voice._STT.bytes) == (0, 0)
+
+
+@needs_web
+def test_stt_content_length_over_the_cap_is_refused_unread(monkeypatch):
+    from console.server import main
+
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 4096)
+    body = multipart(b"\x00" * 50_000)
+    assert len(body) > main.stt_upload_cap()
+    status, out, pulled = _asgi(main.app, [FORM_TYPE, (b"content-length", str(len(body)).encode())], [body])
+    assert status == 413 and json.loads(out) == {"ok": False, "reason": "audio too large: over 4096 bytes"}
+    assert pulled == {"calls": 0, "bytes": 0}  # the app never pulled a byte of the body
+    assert _queue_is_empty()
+
+
+@needs_web
+def test_a_chunked_stt_upload_is_cut_off_just_past_the_cap(monkeypatch):
+    from console.server import main
+
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 4096)
+    cap, chunk = main.stt_upload_cap(), 1024
+    body = multipart(b"\x00" * (3 * cap))
+    status, out, pulled = _asgi(main.app, [FORM_TYPE, (b"transfer-encoding", b"chunked")],
+                                (body[i:i + chunk] for i in range(0, len(body), chunk)))
+    assert status == 413 and json.loads(out)["reason"] == "audio too large: over 4096 bytes"
+    assert cap < pulled["bytes"] <= cap + chunk  # cut off at the first chunk past the cap
+    assert _queue_is_empty()  # its reservation was released
+
+
+@needs_web
+def test_the_upload_guard_leaves_other_routes_alone(monkeypatch):
+    from console.server import main
+
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 4096)
+    huge = (b"content-length", str(10 ** 9).encode())
+    assert _asgi(main.app, [huge], [b""], path="/no-such-route")[0] == 404
+    assert _asgi(main.app, [huge], [b""], method="PUT")[0] == 405
+
+
+@needs_web
+def test_concurrent_uploads_never_hold_more_than_the_queue_limit(stt, monkeypatch):
+    import httpx
+    from starlette import formparsers
+
+    from console.server import main
+
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 100_000)
+    monkeypatch.setattr(config, "STT_MAX_PENDING", 10)  # only the byte limit binds here
+    held = []
+
+    class Watched(voice._SpeechQueue):  # records every value the queue's byte count takes
+        def __setattr__(self, name, value):
+            if name == "bytes":
+                held.append(value)
+            super().__setattr__(name, value)
+
+    monkeypatch.setattr(voice, "_STT", Watched("stt", lambda: config.STT_MAX_PENDING,
+                                               lambda: config.STT_MAX_PENDING_BYTES))
+    parsed, real_parse = [], formparsers.MultiPartParser.parse
+
+    async def counted_parse(self):
+        parsed.append(1)
+        return await real_parse(self)
+
+    monkeypatch.setattr(formparsers.MultiPartParser, "parse", counted_parse)
+    stt.gate = threading.Event()  # whisper holds the first job, so the second waits in the queue
+    clip = wav_bytes(frames=20_000)  # 40 044 bytes: two fit in 100 000, a third does not
+
+    async def burst():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://console") as c:
+            asyncio.get_running_loop().call_later(0.5, stt.gate.set)
+            return await asyncio.gather(*(c.post("/stt", files={"audio": ("a.wav", clip, "audio/wav")},
+                                                 data={"auto": "0"}) for _ in range(5)))
+
+    replies = run(burst())
+    assert sorted(r.status_code for r in replies) == [200, 200, 503, 503, 503]
+    assert all(r.json()["reason"].startswith("busy:") for r in replies if r.status_code == 503)
+    assert max(held) <= 100_000  # reserved and queued audio never passed the aggregate limit
+    assert len(parsed) == 2  # the refused uploads were never parsed, spooled or read
+    assert _queue_is_empty()  # released after success
+
+
+@needs_web
+def test_reservations_are_released_after_failure_refusal_and_disconnect(stt, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    from console.server import main
+
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 100_000)
+    client = TestClient(main.app, raise_server_exceptions=False)
+    upload = {"files": {"audio": ("a.wav", wav_bytes(), "audio/wav")}, "data": {"auto": "0"}}
+
+    stt.time_out_on = {1}  # whisper-cli times out: the request fails with 500
+    assert client.post("/stt", **upload).status_code == 500 and _queue_is_empty()
+
+    monkeypatch.setattr(config, "WHISPER_MODEL", str(tmp_path / "missing.bin"))  # STT answers "not installed"
+    assert client.post("/stt", **upload).status_code == 503 and _queue_is_empty()
+
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 2000)  # the clip is bigger than one may be
+    assert client.post("/stt", **upload).status_code == 413 and _queue_is_empty()
+
+    broken = (b"--" + BOUNDARY.encode() + b"\r\nnot a part header\r\n")  # malformed multipart
+    status, _, _ = _asgi(main.app, [FORM_TYPE, (b"content-length", str(len(broken)).encode())], [broken])
+    assert status == 400 and _queue_is_empty()
+
+    body = multipart(wav_bytes())  # the client hangs up half way through its upload
+    status, _, pulled = _asgi(main.app, [FORM_TYPE, (b"content-length", str(len(body)).encode())],
+                              [body[: len(body) // 2]], hang_up=True)
+    assert pulled["bytes"] == len(body) // 2 and _queue_is_empty()
+
+
+@needs_web
+def test_an_upload_longer_than_its_content_length_is_not_read_past_its_reservation(stt, monkeypatch):
+    from starlette.datastructures import UploadFile
+
+    from console.server import main
+
+    reads, real_read = [], UploadFile.read
+
+    async def spy(self, size=-1):
+        data = await real_read(self, size)
+        reads.append((size, len(data)))
+        return data
+
+    monkeypatch.setattr(UploadFile, "read", spy)
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 100_000)
+    body = multipart(wav_bytes(frames=20_000))  # 40 KB of audio, declared as 1000 bytes
+    status, out, _ = _asgi(main.app, [FORM_TYPE, (b"content-length", b"1000")], [body])
+    assert status == 413 and json.loads(out)["reason"] == "audio too large: over 1000 bytes"
+    assert reads == [(1001, 1001)]  # read no further than the 1000 bytes reserved, plus one
+    assert stt.calls == [] and _queue_is_empty()
+
+
+def test_a_reservation_holds_room_until_its_job_takes_it_or_it_is_released():
+    q = voice._SpeechQueue("test", lambda: 2, lambda: 100)
+    r = q.reserve(60)
+    assert (q.jobs, q.bytes) == (1, 60)
+    with pytest.raises(voice.VoiceBusy):
+        q.reserve(50)  # 110 bytes would pass the limit
+    r.trim(30)
+    assert (q.jobs, q.bytes) == (1, 30)
+    with pytest.raises(ValueError):
+        r.trim(40)  # a reservation never grows
+    assert run(q.run(lambda x: x * 2, 21, size=25, reservation=r)) == 42
+    assert (q.jobs, q.bytes) == (0, 0)  # the job gave the room back when it finished
+    r.release()  # spent: releasing it changes nothing
+    assert (q.jobs, q.bytes) == (0, 0)
+    with pytest.raises(ValueError):
+        run(q.run(lambda: None, reservation=r))  # and it cannot be used twice
+    small = q.reserve(10)
+    with pytest.raises(ValueError):
+        run(q.run(lambda: None, size=11, reservation=small))  # too small for the job
+    small.release()
+    small.release()  # releasing twice gives the room back once
+    assert (q.jobs, q.bytes) == (0, 0)
+    with q.reserve(40):
+        assert (q.jobs, q.bytes) == (1, 40)
+    assert (q.jobs, q.bytes) == (0, 0)  # a with-block releases it
+
+
+def test_a_reserved_job_cancelled_while_it_waits_gives_its_room_back():
+    q = voice._SpeechQueue("test", lambda: 2, lambda: 100)
+    gate = threading.Event()
+
+    async def scenario():
+        running = asyncio.ensure_future(q.run(gate.wait, 2, size=30))
+        await asyncio.sleep(0.05)
+        waiting = asyncio.ensure_future(q.run(lambda: "never", size=20, reservation=q.reserve(40)))
+        await asyncio.sleep(0.05)
+        assert (q.jobs, q.bytes) == (2, 50)  # the waiting job holds its trimmed reservation
+        waiting.cancel()
+        await asyncio.sleep(0.05)
+        held_after_cancel = (q.jobs, q.bytes)
+        gate.set()
+        await running
+        return held_after_cancel
+
+    assert run(scenario()) == (1, 30)
+    assert (q.jobs, q.bytes) == (0, 0)
 
 
 # ------------------------------------------------------------------ server deadline (review fix 2)

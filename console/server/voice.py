@@ -59,9 +59,33 @@ class _Job:
         self.future, self.fn, self.args, self.size = future, fn, args, size
 
 
+class Reservation:
+    """Room held in a speech queue (one job slot and `size` bytes) before the audio is read.
+    Hand it to run(..., reservation=...) for the job; on every other way out, release() it (it
+    is a context manager). trim() gives back what the audio turned out not to need."""
+
+    __slots__ = ("_queue", "size", "_held")
+
+    def __init__(self, queue: "_SpeechQueue", size: int) -> None:
+        self._queue, self.size, self._held = queue, size, True
+
+    def trim(self, size: int) -> None:
+        self._queue._trim(self, size)
+
+    def release(self) -> None:
+        self._queue._unreserve(self)
+
+    def __enter__(self) -> "Reservation":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
 class _SpeechQueue:
     """One worker thread, so two jobs of a kind never overlap, with bounded admission: at most
-    max_jobs() jobs waiting or running, holding at most max_bytes() of audio between them.
+    max_jobs() jobs waiting or running (or reserved), holding at most max_bytes() of audio
+    between them. reserve() takes the room before the audio is even read.
 
     The waiting line is our own deque, not ThreadPoolExecutor's queue (which keeps a cancelled
     job and its audio until the worker reaches it). A slot is given back only together with the
@@ -76,23 +100,58 @@ class _SpeechQueue:
         self._worker = None
         self.jobs = self.bytes = 0
 
-    async def run(self, fn, *args, size: int = 0):
+    def _admit(self, size: int) -> None:
+        """Raise VoiceBusy unless one more job of `size` bytes fits. Hold the lock."""
+        max_jobs, max_bytes = self._max_jobs(), self._max_bytes()
+        if max_bytes is not None and size > max_bytes:
+            raise VoiceBusy(f"audio too large: {size} bytes (limit {max_bytes})")
+        if self.jobs >= max_jobs:
+            raise VoiceBusy(f"busy: {self.jobs} speech jobs already waiting or running (limit {max_jobs})")
+        if max_bytes is not None and self.bytes + size > max_bytes:
+            raise VoiceBusy(f"busy: {self.bytes} bytes of audio already queued (limit {max_bytes})")
+
+    def reserve(self, size: int) -> Reservation:
+        """Hold a job slot and `size` bytes now, before the audio is read; VoiceBusy if full."""
+        with self._cond:
+            self._admit(size)
+            self.jobs += 1
+            self.bytes += size
+            return Reservation(self, size)
+
+    def _trim(self, reservation: Reservation, size: int) -> None:
+        with self._cond:
+            if not reservation._held or not 0 <= size <= reservation.size:
+                raise ValueError(f"cannot trim a reservation of {reservation.size} bytes to {size}")
+            self.bytes -= reservation.size - size
+            reservation.size = size
+
+    def _unreserve(self, reservation: Reservation) -> None:
+        with self._cond:
+            if reservation._held:  # not handed to a job, not released yet
+                reservation._held = False
+                self.jobs -= 1
+                self.bytes -= reservation.size
+
+    async def run(self, fn, *args, size: int = 0, reservation: Reservation | None = None):
+        """Queue fn(*args) as a job of `size` bytes. With a reservation, the job takes over its
+        slot and bytes (trimmed to `size`) instead of being admitted afresh."""
         future = concurrent.futures.Future()
         future.add_done_callback(self._drop_if_cancelled)
         with self._cond:
-            max_jobs, max_bytes = self._max_jobs(), self._max_bytes()
-            if max_bytes is not None and size > max_bytes:
-                raise VoiceBusy(f"audio too large: {size} bytes (limit {max_bytes})")
-            if self.jobs >= max_jobs:
-                raise VoiceBusy(f"busy: {self.jobs} speech jobs already waiting or running (limit {max_jobs})")
-            if max_bytes is not None and self.bytes + size > max_bytes:
-                raise VoiceBusy(f"busy: {self.bytes} bytes of audio already queued (limit {max_bytes})")
+            if reservation is None:
+                self._admit(size)
+            elif reservation._queue is not self or not reservation._held or size > reservation.size:
+                raise ValueError("the reservation is spent, released, too small or not this queue's")
             if self._worker is None:
                 worker = threading.Thread(target=self._work, name=f"{self._name}-speech", daemon=True)
                 worker.start()
                 self._worker = worker
-            self.jobs += 1
-            self.bytes += size
+            if reservation is None:
+                self.jobs += 1
+                self.bytes += size
+            else:  # the job holds the reserved slot and bytes from here on
+                self.bytes -= reservation.size - size
+                reservation.size, reservation._held = size, False
             self._waiting.append(_Job(future, fn, args, size))
             self._cond.notify()
         del fn, args  # the job holds them now, and lets go of them when it gives its slot back
@@ -449,11 +508,19 @@ def _transcribe_job(audio: bytes, suffix: str, details: dict | None = None) -> t
         return p.stdout.decode().strip(), f"ok (whisper-cli; {server_why})" if server_why else "ok"
 
 
-async def transcribe(audio: bytes, suffix: str, details: dict | None = None) -> tuple[str | None, str]:
+def reserve_stt(size: int) -> Reservation:
+    """Room in the STT queue for a clip of up to `size` bytes, taken before it is read (so a
+    full queue answers busy without the upload ever being held in memory). VoiceBusy if full."""
+    return _STT.reserve(size)
+
+
+async def transcribe(audio: bytes, suffix: str, details: dict | None = None,
+                     reservation: Reservation | None = None) -> tuple[str | None, str]:
     """(text, reason). If a dict is given as details, details["conversion"] is set to what the
     clip went through: "native", "native-stripped" (rewritten as a plain WAV of just its audio)
-    or "ffmpeg"."""
+    or "ffmpeg". A reservation from reserve_stt() is used for the job instead of a fresh
+    admission check."""
     try:
-        return await _STT.run(_transcribe_job, audio, suffix, details, size=len(audio))
+        return await _STT.run(_transcribe_job, audio, suffix, details, size=len(audio), reservation=reservation)
     except VoiceBusy as e:
         return None, str(e)
