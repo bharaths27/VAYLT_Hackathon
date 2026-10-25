@@ -23,6 +23,9 @@ WHEN=re.compile(r'^\s*(?:when|once|after|as soon as)\s+(.+?),\s*(?:then\s+)?(.+)
 
 
 class Brain:
+    CLOCK_JUMP_S=3600.0  # a larger forward step between sweeps needs operator confirmation
+    CATCHUP_MAX=2        # overdue timers woken by such a step; the rest wait for the operator
+
     def __init__(self,store: Store,robot,*,qwen: QwenClient | None=None,intent: IntentAdvisor | None=None,
                  acquire_lock: bool=True):
         self.store,self.robot=store,robot
@@ -391,16 +394,34 @@ class Brain:
 
     def sweep_due(self) -> list[dict]:
         if not self.store.policy.clock_trusted: return []
-        now=self.store.clock()
+        now=self.store.clock(); limit=8
         with self.store.tx():
             last=self.store.one("SELECT value FROM meta WHERE key='cortex_last_utc'")
+            if self.store.one("SELECT 1 FROM meta WHERE key='cortex_clock_hold'"): raise Stale('UTC clock jumped forward; operator must re-establish trusted time')
             if last and now<float(last['value'])-1: raise Stale('UTC clock moved backward; operator must re-establish trusted time')
+            if last and now-float(last['value'])>self.CLOCK_JUMP_S:
+                # Bad NTP, an RTC-less boot or a long outage: wake a bounded few overdue timers, hold the rest for the operator.
+                jump={'last_utc':float(last['value']),'utc':now}
+                self.store.conn.execute("INSERT INTO meta VALUES('cortex_clock_hold',?)",(canonical(jump),))
+                self.journal(None,'clock_jump',jump,'held','operator must re-establish trusted time'); limit=self.CATCHUP_MAX
             self.store.conn.execute("INSERT INTO meta VALUES('cortex_last_utc',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(now),))
-        due=self.store.rows("SELECT p.id,p.trigger,c.owner,c.generation,d.due_at FROM prospective_task p JOIN cx_commitment c ON c.id=p.id JOIN cx_due d ON d.task_id=p.id WHERE p.status='waiting' AND d.due_at<=? ORDER BY d.due_at LIMIT 8",(now,))
+        due=self.store.rows("SELECT p.id,p.trigger,c.owner,c.generation,d.due_at FROM prospective_task p JOIN cx_commitment c ON c.id=p.id JOIN cx_due d ON d.task_id=p.id WHERE p.status='waiting' AND d.due_at<=? ORDER BY d.due_at LIMIT ?",(now,limit))
         results=[]
         for task in due:
             results+=self.trigger(task['trigger'],event_id='due:'+task['id']+':'+str(task['generation']),principal=task['owner'])
         return results
+
+    def reestablish_time(self,*,principal: str,note: str) -> dict:
+        """Operator attests the UTC clock is correct again: resets the high-water mark and releases a jump hold."""
+        principal=text(principal,'operator',100); note=text(note,'time evidence',1000)
+        if not self.store.policy.clock_trusted: raise Denied('timed commitments require a trusted UTC clock policy')
+        now=self.store.clock()
+        with self.store.tx():
+            last=self.store.one("SELECT value FROM meta WHERE key='cortex_last_utc'"); prior=float(last['value']) if last else None
+            self.store.conn.execute("INSERT INTO meta VALUES('cortex_last_utc',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(now),))
+            self.store.conn.execute("DELETE FROM meta WHERE key='cortex_clock_hold'")
+            self.journal(None,'clock_reestablished',{'previous_utc':prior,'utc':now},'confirmed',principal+': '+note)
+        return {'utc':now,'previous_utc':prior,'reestablished_by':principal}
 
     def cancel_task(self,tid: str,*,principal: str) -> dict:
         with self.store.tx():
