@@ -55,8 +55,10 @@ def main() -> int:
                          "slower (0 = one frame)")
     ap.add_argument("--timeout", type=float, default=4.0)
     a = ap.parse_args()
-    if a.mode == "find" and not a.what:
-        ap.error("find needs --what")
+    if a.mode == "find":
+        a.what = " ".join((a.what or "").split())
+        if not a.what or len(a.what) > 80:
+            ap.error("find needs --what with 1 to 80 characters")
 
     try:
         client = VisionClient.from_env(timeout_s=a.timeout)
@@ -77,7 +79,7 @@ def main() -> int:
             out.pop("probs", None)
             out.pop("posture_probs", None)
             print(json.dumps({"source": label, **out}), flush=True)
-        except (VisionError, OSError) as e:
+        except (VisionError, OSError, ValueError) as e:
             print(json.dumps({"source": label, "error": str(e)}), flush=True)
 
     if a.image:

@@ -40,6 +40,8 @@ Stop a live run with Ctrl+C.
 
 ## Measured on the warden's PC (2026-10-25, public test photos, not the C920)
 
+The per-photo record (titles, ground truth, every answer and time) is in `docs/VISION_EVIDENCE_2026-10-25.md`.
+
 - **Speed:** 0.32 to 0.61 s per frame, end to end over the internet, frames resized to 768 px.
 - **Hand signals:** 10 of 11 photos right (fist, open palm, peace, thumbs up, no signal). The miss was a stone
   sculpture of a pointing hand, read as a thumbs up. A wave and an open palm look the same in one still frame;
