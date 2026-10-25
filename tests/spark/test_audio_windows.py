@@ -108,6 +108,26 @@ def test_whisper_client_refuses_anything_but_a_loopback_ip(url):
         WhisperServerClient(url)
 
 
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:0", "http://[::1]:0", "http://127.0.0.1", "http://127.0.0.1:", "http://127.0.0.1:abc",
+    "http://127.0.0.1:65536",
+])
+def test_whisper_client_needs_an_explicit_real_port(url):
+    # port 0 or no port used to pass and then send the audio to port 80, where another local service may listen
+    with pytest.raises(ValueError):
+        WhisperServerClient(url)
+
+
+def test_a_connection_takes_the_default_port_only_when_none_is_given():
+    deadline = time.monotonic() + 5
+    assert _http._connection("http://127.0.0.1/x", deadline)[0].port == 80
+    assert _http._connection("https://127.0.0.1/x", deadline)[0].port == 443
+    assert _http._connection("http://127.0.0.1:8080/x", deadline)[0].port == 8080
+    for url in ("http://127.0.0.1:0/x", "https://127.0.0.1:0/x"):
+        with pytest.raises(ValueError):
+            _http._connection(url, deadline)   # was: port 0 silently became 80 / 443
+
+
 @pytest.mark.parametrize("url", ["http://127.0.0.1:8080", "http://127.0.0.1:8080/", "http://[::1]:9000"])
 def test_whisper_client_accepts_loopback(url):
     assert WhisperServerClient(url).endpoint.endswith("/inference")

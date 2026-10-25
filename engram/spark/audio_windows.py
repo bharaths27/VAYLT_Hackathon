@@ -261,7 +261,11 @@ class WhisperServerClient:
             host = ipaddress.ip_address(parts.hostname or "")
         except ValueError:
             raise ValueError("the whisper server URL must use a loopback IP such as 127.0.0.1") from None
-        if parts.scheme != "http" or not host.is_loopback or parts.username or parts.password \
+        try:
+            port = parts.port   # an explicit port in 1-65535: a missing one or port 0 would mean port 80
+        except ValueError:
+            port = None
+        if parts.scheme != "http" or not host.is_loopback or not port or parts.username or parts.password \
                 or parts.path not in ("", "/") or parts.query or parts.fragment:
             raise ValueError("the whisper server URL must be http://<loopback IP>:<port>")
         if not 0.0 < timeout_s <= 30.0:
