@@ -11,6 +11,9 @@
   resolution cannot be interrupted from Python, so at most MAX_OUTSTANDING workers may exist
   at once: when they are all still busy, post() fails fast with Busy instead of starting
   another thread.
+- Cancellable: pass a CancelToken and cancel it from any thread; the connection is shut down at
+  once and post() raises Cancelled without waiting for the server (used to drop a partial
+  transcription the moment speech ends).
 - Redirects are never followed (http.client has no redirect logic): a 3xx comes back as its
   status code, so a moved or hijacked endpoint cannot forward the request, or its
   Authorization header, anywhere else.
@@ -41,6 +44,46 @@ _tls_context = ssl.create_default_context
 
 class Busy(OSError):
     """Too many earlier requests are still unwinding; refusing to start another."""
+
+
+class Cancelled(OSError):
+    """The request was cancelled through its CancelToken; its connection was closed."""
+
+
+class CancelToken:
+    """Cancels one post() from any thread: the connection is shut down at once and post() raises
+    Cancelled straight away, without waiting for the server. One token per request."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._hook = None
+
+    @property
+    def cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._cancelled:
+                return
+            self._cancelled = True
+            hook = self._hook
+        if hook is not None:
+            hook()
+
+    def _attach(self, hook) -> bool:  # noqa: ANN001
+        """Run hook on cancel. False if already cancelled (the hook is then not kept)."""
+        with self._lock:
+            if self._cancelled:
+                return False
+            self._hook = hook
+            return True
+
+    def _detach(self) -> None:
+        with self._lock:
+            self._hook = None
 
 
 def _open_tcp(host: str, port: int, deadline: float) -> socket.socket:
@@ -119,18 +162,23 @@ def _abort(conn: http.client.HTTPConnection) -> None:
             pass
 
 
-def post(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tuple[int, bytes]:
+def post(url: str, body: bytes, headers: dict[str, str], timeout_s: float,
+         cancel: CancelToken | None = None) -> tuple[int, bytes]:
     """POST and return (status, body) within timeout_s in total. Raises TimeoutError at the deadline,
-    Busy when too many earlier workers are still unwinding, OSError for connection failures and
-    ValueError for an oversized reply."""
+    Cancelled as soon as `cancel` is cancelled (its connection is closed), Busy when too many earlier
+    workers are still unwinding, OSError for connection failures and ValueError for an oversized reply."""
     deadline = time.monotonic() + timeout_s
     conn, path = _connection(url, deadline)
     if not _SLOTS.acquire(blocking=False):
         raise Busy(f"{MAX_OUTSTANDING} earlier requests are still outstanding")
     out: dict[str, object] = {}
+    finished = threading.Event()   # set by the worker when done, or by a cancel
 
     def exchange() -> None:
         try:
+            conn.connect()
+            if cancel is not None and cancel.cancelled:
+                raise Cancelled("cancelled while connecting")
             conn.request("POST", path, body=body, headers=headers)
             resp = conn.getresponse()
             data = bytearray()
@@ -150,15 +198,32 @@ def post(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tu
         finally:
             conn.close()
             _SLOTS.release()
+            finished.set()
 
+    def on_cancel() -> None:   # runs on the cancelling thread
+        _abort(conn)
+        finished.set()
+
+    if cancel is not None and not cancel._attach(on_cancel):
+        _SLOTS.release()
+        raise Cancelled("cancelled before it was sent")
     worker = threading.Thread(target=exchange, name="spark-http", daemon=True)
     try:
         worker.start()
     except BaseException:
         _SLOTS.release()
+        if cancel is not None:
+            cancel._detach()
         raise
-    worker.join(max(0.0, deadline - time.monotonic()))
-    if worker.is_alive():
+    try:
+        finished.wait(max(0.0, deadline - time.monotonic()))
+    finally:
+        if cancel is not None:
+            cancel._detach()
+    if cancel is not None and cancel.cancelled:
+        _abort(conn)
+        raise Cancelled("cancelled; the connection was closed")
+    if not finished.is_set():
         _abort(conn)
         raise TimeoutError(f"no complete reply within {timeout_s} s")
     if "error" in out:

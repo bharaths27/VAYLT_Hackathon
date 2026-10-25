@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import ipaddress
 import json
+import re
 import threading
 import urllib.parse
 import uuid
@@ -23,6 +24,7 @@ import wave
 from typing import Callable
 
 from . import _http
+from ._http import Cancelled, CancelToken
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2          # bytes per sample: signed 16-bit little endian
@@ -108,12 +110,13 @@ class WhisperError(Exception):
     pass
 
 
-# (url, body, headers, timeout_s) -> (status, reply body). Swapped out in tests.
-Transport = Callable[[str, bytes, dict[str, str], float], tuple[int, bytes]]
+# (url, body, headers, timeout_s[, cancel=token]) -> (status, reply body). Swapped out in tests.
+Transport = Callable[..., tuple[int, bytes]]
 
 
-def _loopback_transport(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tuple[int, bytes]:
-    return _http.post(url, body, headers, timeout_s)
+def _loopback_transport(url: str, body: bytes, headers: dict[str, str], timeout_s: float,
+                        cancel: CancelToken | None = None) -> tuple[int, bytes]:
+    return _http.post(url, body, headers, timeout_s, cancel=cancel)
 
 
 class WhisperServerClient:
@@ -135,7 +138,8 @@ class WhisperServerClient:
         self.timeout_s = timeout_s
         self._transport = transport or _loopback_transport
 
-    def transcribe(self, wav: bytes) -> str:
+    def transcribe(self, wav: bytes, cancel: CancelToken | None = None) -> str:
+        """The text of this WAV. Raises Cancelled if `cancel` is cancelled meanwhile (connection closed)."""
         boundary = uuid.uuid4().hex
         parts = [
             (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="partial.wav"\r\n'
@@ -146,7 +150,12 @@ class WhisperServerClient:
         body = b"".join(parts) + f"--{boundary}--\r\n".encode()
         headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
         try:
-            status, data = self._transport(self.endpoint, body, headers, self.timeout_s)
+            if cancel is None:
+                status, data = self._transport(self.endpoint, body, headers, self.timeout_s)
+            else:
+                status, data = self._transport(self.endpoint, body, headers, self.timeout_s, cancel=cancel)
+        except Cancelled:
+            raise
         except Exception as e:
             raise WhisperError(f"whisper request failed: {type(e).__name__}") from None
         if status != 200:
@@ -158,3 +167,102 @@ class WhisperServerClient:
         if not isinstance(text, str):
             raise WhisperError("whisper reply was not JSON with a text field")
         return " ".join(text.split())
+
+
+_NOISE = re.compile(r"\[[^\]]*\]|\([^)]*\)")   # whisper's non-speech markers: [BLANK_AUDIO], (silence)
+
+
+def speech_only(text: str) -> str:
+    return " ".join(_NOISE.sub(" ", text).split())
+
+
+class LiveTranscriber:
+    """Partial transcripts while the user speaks, and the final one as soon as speech ends.
+
+    A worker thread sends the window heard so far to the whisper server, one request at a time,
+    whenever there is new audio. The newest partial waits in a single slot until the caller takes
+    it with poll(), on the caller's own thread (so the gate's database work stays there).
+
+    finish() is called at end of speech. Before it transcribes the whole utterance it:
+    - stops partials: none is started, and none is handed out, after end of speech;
+    - drops a partial that was not taken yet;
+    - cancels the partial request in flight: its connection is closed at once, so this client
+      stops waiting immediately and the server can drop the work.
+
+    What the cancel frees depends on the server. whisper.cpp's server notices a closed connection
+    only between steps. Measured on a workstation (tiny.en, 4 threads, a 1.25 s partial): cancelled
+    50/150/250 ms after it was sent, the partial still held the server for about 0.40/0.19/0.13 s
+    (not cancelled: about 0.47/0.37/0.27 s). The step in progress, mostly the encoder pass, which
+    is full size even for short audio, still runs; only the work after it is skipped. For a final
+    that never waits behind a partial, give it its own server instance: final_client.
+    """
+
+    def __init__(self, client: WhisperServerClient, window: PcmWindow, min_audio_s: float = 0.5,
+                 poll_s: float = 0.02, final_client: WhisperServerClient | None = None):
+        self._client = client
+        self._final_client = final_client or client
+        self._window = window
+        self._min_audio_s = min_audio_s
+        self._poll_s = poll_s
+        self._lock = threading.Lock()
+        self._ended = threading.Event()
+        self._token: CancelToken | None = None
+        self._slot: tuple[int, str] | None = None
+        self._revision = 0
+        self._thread: threading.Thread | None = None
+        self.cancelled = 0      # partial requests cancelled by finish()
+        self.partials = 0       # partial requests started
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="spark-partial-stt", daemon=True)
+        self._thread.start()
+
+    def poll(self) -> tuple[int, str] | None:
+        """The newest partial (revision, text) not taken yet, or None. Never one after finish()."""
+        with self._lock:
+            p, self._slot = self._slot, None
+            return None if self._ended.is_set() else p
+
+    def finish(self, join_s: float = 1.0) -> str:
+        """End of speech: stop and cancel partials, then transcribe everything heard."""
+        with self._lock:
+            self._ended.set()      # from now on: no new partial, and poll() hands out nothing
+            token = self._token
+        if token is not None:
+            token.cancel()
+        text = speech_only(self._final_client.transcribe(self._window.snapshot()))
+        if self._thread is not None:
+            self._thread.join(join_s)
+        return text
+
+    def _loop(self) -> None:
+        heard = 0.0
+        while not self._ended.is_set():
+            dur = self._window.duration_s
+            if dur < self._min_audio_s or dur <= heard:
+                self._ended.wait(self._poll_s)
+                continue
+            token = CancelToken()
+            with self._lock:
+                if self._ended.is_set():
+                    break
+                self._token = token
+                self.partials += 1
+            try:
+                text = speech_only(self._client.transcribe(self._window.snapshot(), cancel=token))
+            except Cancelled:
+                with self._lock:
+                    self.cancelled += 1
+                break
+            except WhisperError:
+                text = ""
+            finally:
+                with self._lock:
+                    self._token = None
+            heard = dur
+            with self._lock:
+                if self._ended.is_set():
+                    break
+                if text:
+                    self._revision += 1
+                    self._slot = (self._revision, text)
