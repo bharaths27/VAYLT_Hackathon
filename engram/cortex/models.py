@@ -109,14 +109,15 @@ def validate_loopback(url: str) -> str:
 def model_context(bundle: dict) -> dict:
     """Remove repeated presentation fields, never a mandatory rule or exception.
 
-    Pending commitments are not sent: they are not needed to compose this exact goal and
-    their text carries no ref that a revocation could follow."""
+    Pending commitments and applicable skills are not sent: they are not needed to compose this
+    exact goal (a matching approved skill means no model call at all) and they carry no ref that
+    prompt_refs could cite or a revocation could follow. The prompt holds only citable memory."""
     if 'facts' not in bundle and 'objects' not in bundle:return bundle
     out={k:bundle[k] for k in ('task','missing','omitted','declared_facts','prohibitions','unresolved_constraints','parametric') if k in bundle}
     out['rules']=bundle.get('facts',[])
     out['objects']=[{k:o[k] for k in ('id','name','tag','graspable','last_zone','fresh','evidence_class') if k in o} for o in bundle.get('objects',[])]
     out['evidence']=[{k:e[k] for k in ('chunk_id','id','source_id','text','revision','status') if k in e} for e in bundle.get('evidence',[])]
-    for k in ('related_episodes','applicable_skills','derived'):
+    for k in ('related_episodes','derived'):
         if k in bundle:out[k]=bundle[k]
     return out
 
@@ -151,9 +152,6 @@ def action_contract(goal: dict | None) -> dict:
              'turn_bounded':{'degrees':'finite [-180,180]'},'speak':{'text':'requested speech only'},'stop':{}}
     return {n:all_ops[n] for n in goal_ops(goal) if n in all_ops}
 
-PLAN_SCHEMA={'type':'object','additionalProperties':False,'properties':{
-    'steps':{'type':'array','minItems':1,'maxItems':32,'items':{'type':'object','additionalProperties':False,
-        'properties':{'op':{'type':'string','enum':sorted(CAPS)},'args':{'type':'object'}},'required':['op','args']}}},'required':['steps']}
 HYPOTHESIS_SCHEMA={'type':'object','additionalProperties':False,'properties':{
     'candidates':{'type':'array','maxItems':3,'items':{'type':'object','additionalProperties':False,
         'properties':{'text':{'type':'string','maxLength':600},'refs':{'type':'array','maxItems':12,'items':{'type':'string'}}},
@@ -165,7 +163,8 @@ def plan_schema(goal: dict | None, memory: dict | None=None) -> dict:
     exactly its argument keys; ids/stations limited to those the goal and its rules name."""
     g=goal or {}; facts=[f for f in (memory or {}).get('facts',[]) if isinstance(f,dict)]
     ops=goal_ops(g)
-    if not ops: return PLAN_SCHEMA
+    # No recognized typed goal, no grammar: never fall back to one that admits every primitive.
+    if not ops: raise Missing('a plan request needs a recognized typed goal')
     ids=sorted({x for x in list(g.get('targets') or [])+[f.get(k) for f in facts for k in ('subject','object')] if isinstance(x,str)})
     zones=sorted({z for z in [g.get('zone')]+[f.get('required_zone') for f in facts] if isinstance(z,str)})
     def arg(k,t):
@@ -233,6 +232,7 @@ class QwenClient:
 
     def complete(self, purpose: str, bundle: dict, *, goal: dict | None=None) -> ModelResult:
         if purpose not in {'plan','dream'}: raise CortexError('unsupported Qwen purpose')
+        schema=plan_schema(goal,bundle) if purpose=='plan' else HYPOTHESIS_SCHEMA   # refused before any model request
         if not self._lock.acquire(blocking=False): raise ModelUnavailable('local model busy; preserve interactive priority')
         start=time.perf_counter()
         trace=self.last_trace={'purpose':purpose,'stage':'template','http_status':None,'thinking_disabled':None,
@@ -258,7 +258,6 @@ class QwenClient:
             if not isinstance(toks,list) or any(not isinstance(t,(int,dict)) for t in toks): raise ModelUnavailable('token count unavailable')
             trace['input_tokens']=len(toks)
             if len(toks)>self.input_budget: raise Missing('mandatory memory does not fit Qwen context; no silent truncation')
-            schema=plan_schema(goal,bundle) if purpose=='plan' else HYPOTHESIS_SCHEMA
             trace['stage']='completion'
             # Use the exact template whose tokens were counted, avoiding template drift.
             response=self.transport(self.endpoint+'/completion',{'prompt':prompt,'n_predict':self.output_budget,'temperature':0,
@@ -294,13 +293,13 @@ class IntentAdvisor:
     ENDPOINT='https://api.typesafe.ai/v1/systemone'
     STAGES={'route','relevance','skill_selection','dream_priority','candidate_review','turn'}
 
-    def __init__(self, *, enabled: bool=False, api_key: str | None=None, model: str | None=None,
+    def __init__(self, *, enabled: bool=False, api_key: str | None=None,
                  timeout_s: float=2, transport: Callable=request_json, max_calls: int=20, window_s: float=60,
                  monotonic: Callable[[], float]=time.monotonic):
         self.enabled=bool(enabled)
         self._key=api_key if api_key is not None else os.environ.get('TYPESAFE_API_KEY','')
-        # The model id comes from the environment only; there is no default in code.
-        self.model=(model if model is not None else os.environ.get('TYPESAFE_INTENT_MODEL','')).strip()
+        # The model id comes from the environment only: no default in code and no constructor override.
+        self.model=os.environ.get('TYPESAFE_INTENT_MODEL','').strip()
         self.timeout=finite(timeout_s,'intent model timeout',0.1,15)
         self.transport=transport; self.max_calls=max_calls; self.window_s=finite(window_s,'advisory rate window',1,86400)
         self.calls=0; self._recent=collections.deque(); self._clock=monotonic

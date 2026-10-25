@@ -27,7 +27,7 @@ def test_qwen_gets_contract_and_current_memory_not_just_hash(tmp_path):
 
 def test_qwen_context_overflow_never_silently_truncates():
     t=LocalModelTransport(tokens=3000);q=QwenClient(input_budget=1024,transport=t)
-    with pytest.raises(Missing):q.complete('plan',{'facts':['must not move']},goal={})
+    with pytest.raises(Missing):q.complete('plan',{'facts':['must not move']},goal={'kind':'fetch'})
     assert len(t.calls)==2
 
 @pytest.mark.parametrize('url',['https://evil.example','http://192.168.1.1','http://localhost@evil.example','http://localhost:8080/?token=x'])
@@ -40,7 +40,7 @@ def test_qwen_malformed_output_rejected(bad):
     def transport(url,body,headers,timeout):
         if url.endswith('/completion'):return bad
         return t(url,body,headers,timeout)
-    with pytest.raises(ModelUnavailable):QwenClient(transport=transport).complete('plan',{})
+    with pytest.raises(ModelUnavailable):QwenClient(transport=transport).complete('plan',{},goal={'kind':'fetch'})
 
 def test_model_goal_error_falls_back_to_verified_composer(arena,clock):
     transport=LocalModelTransport([{'op':'drive_bounded','args':{'distance_m':.5}}])
@@ -59,6 +59,8 @@ def test_model_validated_plan_used_and_manifest_recorded(arena,clock):
     b.close()
 
 TEST_MODEL='test-intent-model'
+@pytest.fixture(autouse=True)
+def intent_model_env(monkeypatch): monkeypatch.setenv('TYPESAFE_INTENT_MODEL',TEST_MODEL)   # the model id comes only from the environment
 
 class AdvisoryTransport:
     def __init__(self):self.calls=[]
@@ -70,7 +72,7 @@ class AdvisoryTransport:
 def test_intent_disabled_private_or_keyless_never_calls():
     t=AdvisoryTransport()
     for enabled,key,allowed in [(False,'test',True),(True,'test',False),(True,'',True)]:
-        r=IntentAdvisor(model=TEST_MODEL,enabled=enabled,api_key=key,transport=t).route('synthetic',disclosure_allowed=allowed)
+        r=IntentAdvisor(enabled=enabled,api_key=key,transport=t).route('synthetic',disclosure_allowed=allowed)
         assert r['status']!='ok'
     assert not t.calls
 
@@ -85,31 +87,31 @@ def test_intent_model_id_comes_from_env_only(monkeypatch):
 
 @pytest.mark.parametrize('invalid',[{}, {'model':'other','answers':{}}, {'model':TEST_MODEL,'answers':{'score':{'type':'noul','noul':float('nan')}}}, {'model':TEST_MODEL,'answers':{'score':{'type':'noul','noul':True}}}, {'model':TEST_MODEL,'answers':{'score':{'type':'noul','noul':1.2}}}])
 def test_intent_invalid_is_unavailable_not_authorized(invalid):
-    j=IntentAdvisor(model=TEST_MODEL,enabled=True,api_key='TEST_NOT_A_KEY',transport=lambda *args:invalid)
+    j=IntentAdvisor(enabled=True,api_key='TEST_NOT_A_KEY',transport=lambda *args:invalid)
     r=j.evaluate('candidate_review',{}, {'score':'test'},disclosure_allowed=True)
     assert r['status']=='unavailable' and r['scores']=={}
 
 def test_intent_failure_does_not_leak_credential():
     key='TEST_SECRET_SENTINEL'
     def broken(*a):raise RuntimeError('bad '+key)
-    r=IntentAdvisor(model=TEST_MODEL,enabled=True,api_key=key,transport=broken).route('synthetic',disclosure_allowed=True)
+    r=IntentAdvisor(enabled=True,api_key=key,transport=broken).route('synthetic',disclosure_allowed=True)
     assert key not in json.dumps(r) and r['status']=='unavailable'
 
 def test_intent_budget_is_bounded():
-    t=AdvisoryTransport();j=IntentAdvisor(model=TEST_MODEL,enabled=True,api_key='TEST',transport=t,max_calls=1)
+    t=AdvisoryTransport();j=IntentAdvisor(enabled=True,api_key='TEST',transport=t,max_calls=1)
     assert j.route('synthetic',disclosure_allowed=True)['status']=='ok'
     assert j.route('synthetic',disclosure_allowed=True)['status']=='budget_exhausted'
     assert len(t.calls)==1
 
 def test_all_advisory_hooks_have_typed_responses_without_authority():
-    t=AdvisoryTransport();j=IntentAdvisor(model=TEST_MODEL,enabled=True,api_key='TEST',transport=t)
+    t=AdvisoryTransport();j=IntentAdvisor(enabled=True,api_key='TEST',transport=t)
     for stage in sorted(j.STAGES):
         r=j.evaluate(stage,{'synthetic':True},{'fits':'Does this match the evidence?'},disclosure_allowed=True)
         assert r['status']=='ok' and r['authority'] is False
     assert len(t.calls)==len(j.STAGES)
 
 def test_cloud_permitted_flow_exercises_route_relevance_review_selection(arena,clock):
-    t=AdvisoryTransport();j=IntentAdvisor(model=TEST_MODEL,enabled=True,api_key='TEST',transport=t)
+    t=AdvisoryTransport();j=IntentAdvisor(enabled=True,api_key='TEST',transport=t)
     s=Store(clock=clock,policy=Policy(cloud_enabled=True,auto_publish_verified=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena),intent=j)
     s.teach('Public synthetic SOP','Safety goggles must be at ppe station before handling Sample B.',owner='carther',cloud_ok=True)
     b.command('Bring Sample B to bench',principal='carther',cloud_allowed=True)

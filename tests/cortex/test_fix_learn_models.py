@@ -101,9 +101,9 @@ class AdvisoryTransport:
     def __call__(self,url,body,headers,timeout):
         self.calls.append(body); return {'model':'test-intent-model','answers':{k:{'type':'noul','noul':.01} for k in body['questions']}}
 
-def test_advisor_budget_is_per_minute_rate():
-    now=[1000.0]; t=AdvisoryTransport()
-    a=IntentAdvisor(model='test-intent-model',enabled=True,api_key='TEST',transport=t,max_calls=2,monotonic=lambda:now[0])
+def test_advisor_budget_is_per_minute_rate(monkeypatch):
+    now=[1000.0]; t=AdvisoryTransport(); monkeypatch.setenv('TYPESAFE_INTENT_MODEL','test-intent-model')
+    a=IntentAdvisor(enabled=True,api_key='TEST',transport=t,max_calls=2,monotonic=lambda:now[0])
     assert [a.route('x',disclosure_allowed=True)['status'] for _ in range(3)]==['ok','ok','budget_exhausted']
     now[0]+=61
     assert a.route('do not open the claw',disclosure_allowed=True)['status']=='ok' and len(t.calls)==3
