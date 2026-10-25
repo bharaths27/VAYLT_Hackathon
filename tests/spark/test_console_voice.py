@@ -5,6 +5,7 @@ on 127.0.0.1 inside the test. WAV clips are made here with the wave module.
 """
 
 import asyncio
+import gc
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import threading
 import time
 import types
 import wave
+import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -551,6 +553,98 @@ def test_a_cancelled_request_keeps_its_slot_until_its_process_exits(stt, monkeyp
     while_running, after = run(scenario())
     assert while_running[0] is None and while_running[1].startswith("busy:")
     assert after[0] == "pick up the beaker"
+
+
+class _Clip:
+    """Stands in for a clip's audio; unlike bytes it can be watched with a weakref."""
+
+    def __init__(self, n):
+        self.n = n
+
+
+def test_cancel_and_resubmit_cannot_get_past_the_limits():
+    q = voice._SpeechQueue("test", lambda: 2, lambda: 100)
+    gate = threading.Event()
+    dropped = {}  # clip number -> (jobs, bytes) still counted at the moment its audio was let go
+
+    def clip(n):
+        c = _Clip(n)
+        weakref.finalize(c, lambda: dropped.setdefault(n, (q.jobs, q.bytes)))
+        return c
+
+    def job(c):
+        gate.wait(2)
+        return c.n
+
+    async def scenario():
+        running = asyncio.ensure_future(q.run(job, clip(0), size=40))
+        await asyncio.sleep(0.05)  # running, held at the gate
+        for i in range(1, 30):  # the iPad gives up and asks again, over and over
+            waiting = asyncio.ensure_future(q.run(job, clip(i), size=40))
+            await asyncio.sleep(0.01)
+            assert (q.jobs, q.bytes, len(q._waiting)) == (2, 80, 1)
+            with pytest.raises(voice.VoiceBusy):
+                await q.run(job, _Clip(-1), size=40)
+            waiting.cancel()
+            await asyncio.sleep(0.01)
+            assert (q.jobs, q.bytes, len(q._waiting)) == (1, 40, 0)
+            del waiting  # the caller lets go of its cancelled request too
+        gc.collect()
+        # every cancelled clip is gone, and went before its slot was given back
+        assert dropped == {i: (2, 80) for i in range(1, 30)}
+        gate.set()
+        return await running
+
+    assert run(scenario()) == 0
+    gc.collect()
+    assert dropped[0] == (1, 40)  # the finished job, too, let go of its audio before its slot
+    assert (q.jobs, q.bytes) == (0, 0)
+
+
+def test_a_failed_job_pins_nothing_once_its_caller_is_done():
+    q = voice._SpeechQueue("test", lambda: 1)
+    dropped = threading.Event()
+
+    def job(c):
+        raise RuntimeError("whisper fell over")  # its traceback holds this frame, and c
+
+    async def scenario():
+        c = _Clip(1)
+        weakref.finalize(c, dropped.set)
+        task = asyncio.ensure_future(q.run(job, c))
+        del c
+        with pytest.raises(RuntimeError):
+            await task
+
+    run(scenario())
+    gc.collect()
+    assert dropped.is_set()  # the idle worker does not keep the failed job (or its audio)
+    assert (q.jobs, q.bytes) == (0, 0)
+
+
+def test_cancelled_waiting_stt_request_gives_back_its_slot_and_never_runs(stt, monkeypatch):
+    clip = wav_bytes()
+    monkeypatch.setattr(config, "STT_MAX_PENDING", 2)
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 2 * len(clip))
+    stt.gate = threading.Event()
+
+    async def scenario():
+        running = asyncio.ensure_future(voice.transcribe(clip, ".wav"))
+        await asyncio.sleep(0.05)
+        for _ in range(10):
+            waiting = asyncio.ensure_future(voice.transcribe(clip, ".wav"))
+            await asyncio.sleep(0.01)
+            assert (voice._STT.jobs, voice._STT.bytes) == (2, 2 * len(clip))
+            assert (await voice.transcribe(clip, ".wav"))[1].startswith("busy:")
+            waiting.cancel()
+            await asyncio.sleep(0.01)
+            assert (voice._STT.jobs, voice._STT.bytes, len(voice._STT._waiting)) == (1, len(clip), 0)
+        stt.gate.set()
+        return await running
+
+    assert run(scenario())[0] == "pick up the beaker"
+    assert stt.tools() == ["whisper-cli"]  # the cancelled requests never ran
+    assert (voice._STT.jobs, voice._STT.bytes) == (0, 0)
 
 
 def test_stt_queue_caps_the_audio_it_holds(stt, monkeypatch):

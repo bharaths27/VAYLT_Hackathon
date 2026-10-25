@@ -11,6 +11,8 @@ as busy straight away, and the iPad treats busy like unavailable.
 from __future__ import annotations
 
 import asyncio
+import collections
+import concurrent.futures
 import hashlib
 import os
 import shutil
@@ -18,7 +20,6 @@ import subprocess
 import tempfile
 import threading
 import wave
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -29,20 +30,34 @@ class VoiceBusy(RuntimeError):
     """A speech queue is full. Say so; the iPad falls back to typed commands / its own voice."""
 
 
+class _Job:
+    __slots__ = ("future", "fn", "args", "size")
+
+    def __init__(self, future, fn, args, size: int) -> None:
+        self.future, self.fn, self.args, self.size = future, fn, args, size
+
+
 class _SpeechQueue:
-    """One worker, so two jobs of a kind never overlap, with bounded admission: at most
+    """One worker thread, so two jobs of a kind never overlap, with bounded admission: at most
     max_jobs() jobs waiting or running, holding at most max_bytes() of audio between them.
-    A slot is freed when its job finishes (or is cancelled before it starts), not when the
-    caller stops waiting, so the bounds count what the worker really still holds."""
+
+    The waiting line is our own deque, not ThreadPoolExecutor's queue (which keeps a cancelled
+    job and its audio until the worker reaches it). A slot is given back only together with the
+    job's arguments: a job cancelled while it waits is taken out of the line in the same locked
+    step, and a running job keeps its slot until it finishes, even if its caller has gone."""
 
     def __init__(self, name: str, max_jobs, max_bytes=lambda: None) -> None:
-        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
-        self._lock = threading.Lock()
+        self._name = name
         self._max_jobs, self._max_bytes = max_jobs, max_bytes
+        self._cond = threading.Condition()
+        self._waiting = collections.deque()
+        self._worker = None
         self.jobs = self.bytes = 0
 
     async def run(self, fn, *args, size: int = 0):
-        with self._lock:
+        future = concurrent.futures.Future()
+        future.add_done_callback(self._drop_if_cancelled)
+        with self._cond:
             max_jobs, max_bytes = self._max_jobs(), self._max_bytes()
             if max_bytes is not None and size > max_bytes:
                 raise VoiceBusy(f"audio too large: {size} bytes (limit {max_bytes})")
@@ -50,20 +65,59 @@ class _SpeechQueue:
                 raise VoiceBusy(f"busy: {self.jobs} speech jobs already waiting or running (limit {max_jobs})")
             if max_bytes is not None and self.bytes + size > max_bytes:
                 raise VoiceBusy(f"busy: {self.bytes} bytes of audio already queued (limit {max_bytes})")
+            if self._worker is None:
+                worker = threading.Thread(target=self._work, name=f"{self._name}-speech", daemon=True)
+                worker.start()
+                self._worker = worker
             self.jobs += 1
             self.bytes += size
-        try:
-            fut = self._pool.submit(fn, *args)
-        except BaseException:
-            self._release(size)
-            raise
-        fut.add_done_callback(lambda _f: self._release(size))
-        return await asyncio.wrap_future(fut)
+            self._waiting.append(_Job(future, fn, args, size))
+            self._cond.notify()
+        del fn, args  # the job holds them now, and lets go of them when it gives its slot back
+        return await asyncio.wrap_future(future)
 
-    def _release(self, size: int) -> None:
-        with self._lock:
-            self.jobs -= 1
-            self.bytes -= size
+    def _drop_if_cancelled(self, future) -> None:
+        """A caller gave up. If its job is still waiting, take it out of the line (dropping its
+        audio) and give its slot back. If the worker already has it, the worker does that."""
+        if not future.cancelled():
+            return
+        with self._cond:
+            for job in self._waiting:
+                if job.future is future:
+                    self._waiting.remove(job)
+                    self._release(job)
+                    return
+
+    def _release(self, job: _Job) -> None:
+        """Give a job's slot back, dropping its arguments (the audio) first. Hold the lock."""
+        job.fn = job.args = None
+        self.jobs -= 1
+        self.bytes -= job.size
+
+    def _work(self) -> None:
+        while True:
+            with self._cond:
+                while not self._waiting:
+                    self._cond.wait()
+                job = self._waiting.popleft()
+            self._run(job)
+            del job  # pin nothing of a finished job while idle
+
+    def _run(self, job: _Job) -> None:
+        started = job.future.set_running_or_notify_cancel()  # False: cancelled after it left the line
+        ok, value = False, None
+        if started:
+            try:
+                ok, value = True, job.fn(*job.args)
+            except BaseException as e:  # noqa: BLE001 - handed to the caller
+                value = e
+        with self._cond:
+            self._release(job)
+        if started:
+            if ok:
+                job.future.set_result(value)
+            else:
+                job.future.set_exception(value)
 
 
 _STT = _SpeechQueue("stt", lambda: config.STT_MAX_PENDING, lambda: config.STT_MAX_PENDING_BYTES)
