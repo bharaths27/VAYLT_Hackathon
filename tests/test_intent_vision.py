@@ -286,6 +286,27 @@ def test_the_cli_exits_nonzero_when_a_file_fails_and_two_without_configuration(t
     assert r.returncode == 2
 
 
+@pytest.mark.parametrize("flag,value", [("--every", "nan"), ("--every", "inf"), ("--every", "-1"),
+                                        ("--every", "3601"), ("--timeout", "nan"), ("--timeout", "0"),
+                                        ("--timeout", "16")])
+def test_the_cli_refuses_an_interval_or_timeout_that_is_not_a_sane_number_of_seconds(flag, value):
+    # luna round 6: `--every nan` passed `every <= 0` and slept 0 s, so the live loop called the paid API back to back
+    r = _cli("hand", "--robot", "http://robot.invalid:8200", flag, value,
+             env_extra={"TYPESAFE_API_KEY": KEY, "TYPESAFE_INTENT_MODEL": "m"})
+    assert r.returncode == 2 and flag in r.stderr and r.stdout == ""
+
+
+def test_the_cli_takes_zero_as_one_frame_and_a_fraction_as_an_interval():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("vision_ask", REPO / "scripts" / "vision_ask.py")
+    va = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(va)
+    every, timeout = va._seconds(0.0, 3600.0, low_ok=True), va._seconds(0.0, iv.MAX_TIMEOUT_S, low_ok=False)
+    assert every("0") == 0.0 and every("0.5") == 0.5 and every("3600") == 3600.0
+    assert timeout("4") == 4.0 and timeout(str(iv.MAX_TIMEOUT_S)) == iv.MAX_TIMEOUT_S
+
+
 def test_a_truncated_robot_frame_is_a_failed_frame_not_a_crash(monkeypatch):
     import http.client
     import importlib.util

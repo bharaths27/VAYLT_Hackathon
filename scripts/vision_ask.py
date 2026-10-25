@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import math
 import sys
 import time
 import urllib.request
@@ -24,8 +25,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from engram.vision.intent_vision import (VisionClient, VisionError, classify_hand_signal,  # noqa: E402
-                                         find_object, scene_check)
+from engram.vision.intent_vision import (MAX_TIMEOUT_S, VisionClient, VisionError,  # noqa: E402
+                                         classify_hand_signal, find_object, scene_check)
+
+
+def _seconds(low: float, high: float, low_ok: bool):
+    """An argparse type for a finite number of seconds in range: `--every nan` would otherwise turn the live loop into
+    back-to-back calls to the paid API (nan <= 0 is false, and sleep(max(0.0, nan)) sleeps 0 s)."""
+    def parse(text: str) -> float:
+        v = float(text)
+        if not math.isfinite(v) or v > high or v < low or (v == low and not low_ok):
+            raise argparse.ArgumentTypeError(f"must be a number of seconds from {low:g} ({'inclusive' if low_ok else 'exclusive'}) to {high:g}")
+        return v
+    return parse
 
 
 def robot_frame(base: str) -> bytes:
@@ -54,10 +66,10 @@ def main() -> int:
     src.add_argument("--robot", help="robot server base URL, e.g. http://star-pi.local:8200")
     src.add_argument("--webcam", type=int, help="local camera index")
     ap.add_argument("--what", help="object to find (find mode)")
-    ap.add_argument("--every", type=float, default=0.0,
+    ap.add_argument("--every", type=_seconds(0.0, 3600.0, low_ok=True), default=0.0,
                     help="start a live frame every N seconds, or as soon as the last answer is back if that is "
                          "slower (0 = one frame)")
-    ap.add_argument("--timeout", type=float, default=4.0)
+    ap.add_argument("--timeout", type=_seconds(0.0, MAX_TIMEOUT_S, low_ok=False), default=4.0)
     a = ap.parse_args()
     if a.mode == "find":
         a.what = " ".join((a.what or "").split())
