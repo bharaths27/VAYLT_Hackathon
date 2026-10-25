@@ -534,3 +534,34 @@ def test_the_pending_loop_stages_nothing_before_a_command_reply_is_checked(c, on
     c.portal.call(main._stage_brain_pending)                    # the next poll
     assert PLAN["operation_id"] not in main.engine.ops          # never staged
     assert "ep_gesture" in main.engine.ops                      # a plan the brain made on its own shows now
+
+
+# ---- every brain result is checked before the console acts on its kind, not only proposals --------------------
+
+ANSWER = {"kind": "answer", "reply": "Sample B was last seen on shelf A."}
+TAUGHT = {"kind": "taught", "title": "Spoken note from verna-ipad", "rules": []}
+SCHEDULED = {"kind": "scheduled", "task_id": "pt_1", "created": True, "trigger": "calibration ends",
+             "request": "bring sample b to the bench"}
+
+
+@pytest.mark.parametrize("reply", [ANSWER, {**ANSWER, "classification": "unclear", "needs_clarification": True},
+                                   {**ANSWER, "classification": "understood"}, TAUGHT, SCHEDULED],
+                         ids=["an answer that does not say", "an answer stated unclear",
+                              "an answer without needs_clarification", "a note that does not say",
+                              "a task that does not say"])
+def test_a_brain_result_of_any_kind_not_stated_understood_stops_the_task_and_asks(c, on_brain, said, reply):
+    fake = on_brain(FakeBrain(reply, running=[{"operation_id": "ep_9"}]))
+    j = c.post("/commands", json={"text": "where is sample b"}).json()
+    assert j["kind"] == "clarify" and j["stopped"] is True and main.engine.stopped
+    assert j["reply"] == "I stopped. I'm not sure what you meant. Please clarify." and said[-1] == j["reply"]
+    assert "/stop" in fake.calls
+
+
+@pytest.mark.parametrize("reply,spoken", [(ANSWER, ANSWER["reply"]), (TAUGHT, "Got it. I saved that as a new source.")],
+                         ids=["an answer", "a note"])
+def test_a_brain_result_stated_understood_is_acted_on_and_stops_nothing(c, on_brain, said, reply, spoken):
+    fake = on_brain(FakeBrain({**reply, "classification": "understood", "needs_clarification": False},
+                              running=[{"operation_id": "ep_9"}]))
+    j = c.post("/commands", json={"text": "where is sample b"}).json()
+    assert j["kind"] == reply["kind"] and "stopped" not in j and not main.engine.stopped
+    assert said[-1] == spoken and "/stop" not in fake.calls

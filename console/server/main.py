@@ -476,10 +476,11 @@ async def _brain_reply(text: str, source: str, t0: float) -> dict:
         await bus.emit("bundle", bundle=brain.to_bundle(p["memory"]), memory_ms=0)
     kind = p.get("kind")
     out = {"kind": kind, "brain": p, "metrics": metrics}
-    if kind == "proposal" and not _brain_understood(p):
+    if not _brain_understood(p):
         # Unclear or misheard (an unknown object, a time that did not parse, nothing heard): Carter's rule. It is
-        # checked for every proposal before anything is staged: a plan the brain does not state it understood is
-        # never staged, and a refusal it does not state it understood is not an understood refusal.
+        # checked for every result, whatever its kind, before the console acts on it: a plan the brain does not
+        # state it understood is never staged, a refusal it does not state it understood is not an understood
+        # refusal, and an answer, a note or a task it does not state it understood is not taken as one.
         reason = p.get("reason") or "I'm not sure what you meant."
         out["reason"] = reason
         if p.get("operation_id") and p.get("digest"):  # a plan declined here is not staged later from the pending list
