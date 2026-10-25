@@ -284,11 +284,14 @@ class QwenClient:
     def _enter(self, background: bool) -> threading.Event | None:
         """Take the local model. A background call yields to foreground work: it never starts while a foreground call
         runs or waits, and once one arrives its request is closed. A foreground call preempts a background one and waits
-        (bounded) for it to let go; against another foreground call it fails at once, never stacking behind it."""
+        (bounded) for it to let go; against another foreground call, running or already waiting, it fails at once, never
+        stacking behind it."""
         with self._state:
             if background:
                 if self._waiting or not self._lock.acquire(blocking=False): raise ModelUnavailable('local model busy; a foreground request has priority')
                 self._preempt=threading.Event(); return self._preempt
+            # One already waiting goes first, even once the background call let go and before the waiter woke.
+            if self._waiting: raise ModelUnavailable('local model busy; another foreground request is already waiting')
             if self._preempt is None:
                 if not self._lock.acquire(blocking=False): raise ModelUnavailable('local model busy; preserve interactive priority')
                 return None

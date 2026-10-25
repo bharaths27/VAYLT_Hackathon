@@ -171,3 +171,55 @@ def test_an_idle_hypothesis_rests_on_its_whole_prompt_not_on_its_citations(arena
     b.store.revoke_source(quoted)
     assert b.store.derived(h['id'])['status']=='STALE'                               # was: still a candidate
     b.close()
+
+
+# P3-4: a foreground call waits for a background call to let go only while no other foreground call waits; a second one
+# is refused at once, never queued behind the first.
+from engram.cortex.models import ModelUnavailable,QwenClient
+from .test_fix_learn_transport import THINK
+
+def dream_transport(dreaming,release):
+    """A model server whose dream holds the model until `release` (its call cannot be cancelled); a plan answers at once."""
+    def transport(url,body,headers,timeout):
+        if url.endswith('/apply-template'): return {'prompt':'P'+THINK}
+        if url.endswith('/tokenize'): return {'tokens':[1,2,3]}
+        if 'candidates' in json.dumps(body.get('json_schema')): dreaming.set();release.wait(10);return {'model':'m','content':json.dumps({'candidates':[]})}
+        return {'model':'m','content':json.dumps({'steps':[{'op':'gripper_open','args':{}}]})}
+    return transport
+
+class GatedLock:
+    """The model's lock, a waiting call's acquire held back until `gate` opens: as if it had not yet woken."""
+    def __init__(self): self.lock,self.gate,self.held_back=threading.Lock(),threading.Event(),threading.Event()
+    def acquire(self,blocking=True,timeout=-1):
+        if blocking and timeout!=-1: self.held_back.set();self.gate.wait(10)
+        return self.lock.acquire(blocking,timeout)
+    def release(self): self.lock.release()
+
+def test_a_foreground_call_as_the_dream_lets_go_never_jumps_the_one_waiting(monkeypatch):
+    dreaming,release,results=threading.Event(),threading.Event(),{}
+    monkeypatch.setattr(QwenClient,'PREEMPT_WAIT_S',5);q=QwenClient(transport=dream_transport(dreaming,release));q._lock=lock=GatedLock()
+    goal=Goal('primitive',primitive='gripper_open').to_dict()
+    dream=threading.Thread(target=lambda:q.complete('dream',{'rules':[]}),daemon=True);dream.start();assert dreaming.wait(5)
+    first=threading.Thread(target=lambda:results.update(first=q.complete('plan',{},goal=goal)),daemon=True);first.start()
+    assert lock.held_back.wait(5)                                              # the first waits for the model
+    release.set();dream.join(10);assert not dream.is_alive()                   # the dream let go; the first has not woken
+    try:
+        with pytest.raises(ModelUnavailable,match='already waiting'): q.complete('plan',{},goal=goal)   # was: took it first
+    finally:
+        lock.gate.set();first.join(10)
+    assert results['first'].value['steps']==[{'op':'gripper_open','args':{}}]   # the one waiting is served
+
+def test_a_second_foreground_call_during_a_blocked_dream_is_refused_at_once(monkeypatch):
+    dreaming,release,results=threading.Event(),threading.Event(),{}
+    monkeypatch.setattr(QwenClient,'PREEMPT_WAIT_S',5);q=QwenClient(transport=dream_transport(dreaming,release));goal=Goal('primitive',primitive='gripper_open').to_dict()
+    dream=threading.Thread(target=lambda:q.complete('dream',{'rules':[]}),daemon=True);dream.start();assert dreaming.wait(5)
+    first=threading.Thread(target=lambda:results.update(first=q.complete('plan',{},goal=goal)),daemon=True);first.start()
+    end=time.monotonic()+5
+    while not q._waiting and time.monotonic()<end: time.sleep(.01)          # the first waits for the dream to let go
+    try:
+        t0=time.monotonic()
+        with pytest.raises(ModelUnavailable,match='already waiting'): q.complete('plan',{},goal=goal)   # was: queued behind it
+        assert time.monotonic()-t0<1
+    finally:
+        release.set();first.join(10);dream.join(10)
+    assert results['first'].value['steps']==[{'op':'gripper_open','args':{}}]   # the first is served
