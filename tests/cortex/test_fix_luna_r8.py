@@ -48,7 +48,8 @@ def test_a_handling_prohibition_refuses_plans_that_handle_what_it_names_and_only
     assert fetch(brain,'Sample B')['status']=='proposed'
     assert brain.command('Find Sample A',principal='carther')['status']=='proposed'        # looking handles nothing
 
-@pytest.mark.parametrize('sentence',['It is hot today.','Fridge 2 holds Sample A.','Sample A weighs 30 kg.','Sample A is sharp.'])
+@pytest.mark.parametrize('sentence',['It is hot today.','Fridge 2 holds Sample A.','Sample A weighs 30 kg.','Sample A is sharp.',
+                                     'The tray has a handle.'])                       # a noun, not a handling verb
 def test_a_plain_fact_blocks_nothing(brain,sentence):
     assert not brain.store.teach('Note',sentence,owner='carther')['unresolved_rules']
     assert fetch(brain)['status']=='proposed' and brain.command('Go to the shelf b',principal='carther')['status']=='proposed'
@@ -121,6 +122,18 @@ def test_a_foreground_plan_preempts_a_background_dream_on_the_same_client():
     finally:
         release.set();srv.shutdown();srv.server_close()
     assert wait_local_slot_free()
+
+
+def test_a_dream_call_that_yielded_to_foreground_work_is_no_failed_attempt(arena,clock):
+    b=idle_brain(arena,clock);b.store.teach('SOP',SOP,owner='op')
+    class Yielding:
+        def complete(self,purpose,bundle,**kw):
+            self.work=b.activity.foreground();self.work.__enter__()                       # an interactive request arrives
+            raise ModelUnavailable('model request preempted by a foreground request')
+    q=Yielding();b.dreamer.qwen=q
+    r=b.dreamer.cycle();q.work.__exit__(None,None,None)
+    assert r['status']=='yielded' and r['model_pending'] and b.dreamer._model_state()['attempts']==0   # was: 1 attempt
+    b.close()
 
 
 # P3-6: the live-hypothesis cap holds for every accepted candidate, not once per cycle.
