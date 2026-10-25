@@ -14,6 +14,7 @@ import asyncio
 import collections
 import concurrent.futures
 import hashlib
+import json
 import os
 import shutil
 import struct
@@ -433,32 +434,94 @@ def _too_large(path: Path) -> str:
     return f"file too large: {path.stat().st_size} bytes (limit {wav_byte_limit()} bytes)"
 
 
+class _WhisperHTTP:
+    """One long-lived HTTP connection pool for the resident whisper.cpp server, on its own
+    event-loop thread. Every clip reuses it (and its keep-alive connection): building an httpx
+    client per clip cost ~200 ms, most of it loading the CA bundle into a new SSL context.
+
+    It is httpcore's plain pool (httpx only encodes the multipart body), so a plain-http
+    loopback URL creates no TLS context at all; an https one gets one, once, when it first
+    connects. It never reads proxy settings from the environment and never follows a
+    redirect. Each POST runs under ONE overall deadline, with the same limit on each connect,
+    read and write. Created on first use; close() at shutdown."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._pool = None  # touched only on the loop thread
+
+    def _running_loop(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._loop is None:
+                loop = asyncio.new_event_loop()
+                thread = threading.Thread(target=loop.run_forever, name="whisper-http", daemon=True)
+                thread.start()
+                self._loop, self._thread = loop, thread
+            return self._loop
+
+    def post(self, endpoint: str, wav: Path, fields: dict, limit: float) -> tuple[str, str]:
+        """POST the clip; TimeoutError if the whole exchange takes longer than `limit` s."""
+        coro = asyncio.wait_for(self._post(endpoint, wav, fields, limit), limit)
+        return asyncio.run_coroutine_threadsafe(coro, self._running_loop()).result(timeout=limit + 5)
+
+    async def _post(self, endpoint: str, wav: Path, fields: dict, limit: float) -> tuple[str, str]:
+        import httpcore
+        import httpx
+
+        if self._pool is None:
+            self._pool = httpcore.AsyncConnectionPool(max_connections=1)
+        request = httpx.Request("POST", endpoint, data=fields,
+                                files={"file": (wav.name, wav.read_bytes(), "audio/wav")})
+        reply = await self._pool.request("POST", endpoint, headers=request.headers.raw, content=request.read(),
+                                         extensions={"timeout": dict.fromkeys(("connect", "read", "write", "pool"), limit)})
+        if reply.status != 200:  # a redirect included: it is not followed
+            raise ValueError(f"HTTP {reply.status}")
+        text = json.loads(reply.content)["text"]
+        if not isinstance(text, str):
+            raise ValueError("reply has no text")
+        return text.strip(), "ok (whisper server)"
+
+    def close(self) -> None:
+        """Close the pool and stop its loop thread. A later post() starts afresh."""
+        with self._lock:
+            loop, thread, self._loop, self._thread = self._loop, self._thread, None, None
+        if loop is None:
+            return
+
+        async def shut() -> None:
+            pool, self._pool = self._pool, None
+            if pool is not None:
+                await pool.aclose()
+
+        try:
+            asyncio.run_coroutine_threadsafe(shut(), loop).result(timeout=5)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            if not thread.is_alive():
+                loop.close()
+
+
+_WHISPER_HTTP = _WhisperHTTP()
+
+
+def close() -> None:
+    """Shutdown: close the whisper server's connection pool and its loop thread."""
+    _WHISPER_HTTP.close()
+
+
 def _server_transcribe(endpoint: str, wav: Path) -> tuple[str | None, str]:
     """POST the clip to whisper.cpp's /inference under ONE overall deadline, so a server that
     accepts and then trickles or never answers cannot hold the STT worker. (None, reason) on
     any failure; the caller then uses whisper-cli."""
     limit = config.WHISPER_SERVER_TIMEOUT_S
     try:
-        return asyncio.run(asyncio.wait_for(_post_clip(endpoint, wav, limit), limit))
-    except (TimeoutError, asyncio.TimeoutError):
+        return _WHISPER_HTTP.post(endpoint, wav, {"response_format": "json"}, limit)
+    except (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError):
         return None, f"whisper server failed: no answer within {limit:g} s"
     except Exception as e:  # noqa: BLE001 - any failure means: use whisper-cli instead
         return None, f"whisper server failed: {type(e).__name__}: {str(e)[:120]}"
-
-
-async def _post_clip(endpoint: str, wav: Path, limit: float) -> tuple[str, str]:
-    import httpx
-
-    # trust_env=False: never send loopback audio through a proxy named in the environment.
-    # httpx does not follow redirects, so the clip cannot be bounced to another host.
-    async with httpx.AsyncClient(timeout=limit, trust_env=False) as client:
-        r = await client.post(endpoint, files={"file": (wav.name, wav.read_bytes(), "audio/wav")},
-                              data={"response_format": "json"})
-    r.raise_for_status()
-    text = r.json()["text"]
-    if not isinstance(text, str):
-        raise ValueError("reply has no text")
-    return text.strip(), "ok (whisper server)"
 
 
 def _transcribe_job(audio: bytes, suffix: str, details: dict | None = None) -> tuple[str | None, str]:

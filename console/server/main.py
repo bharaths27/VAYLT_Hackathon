@@ -74,6 +74,7 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
+    await asyncio.to_thread(voice.close)  # the whisper server's connection pool
 
 
 # ------------------------------------------------------------------ /stt upload limits

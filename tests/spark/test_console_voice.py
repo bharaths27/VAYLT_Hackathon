@@ -239,6 +239,14 @@ def whisper_server():
                 self.send_response(500)
                 self.end_headers()
                 return
+            if mode == "redirect":  # a 307 elsewhere, with a body that would pass if it were believed
+                reply = b'{"text": "redirected"}'
+                self.send_response(307)
+                self.send_header("Location", "http://127.0.0.1:1/inference")
+                self.send_header("Content-Length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+                return
             reply = {"ok": b'{"text": " hello from the server\\n"}', "slow": b'{"text": "late"}',
                      "nojson": b"<html>busy</html>", "notext": b'{"error": "no model"}'}[mode]
             self.send_response(200)
@@ -287,6 +295,52 @@ def test_localhost_never_waits_on_the_resolver(stt, whisper_server, monkeypatch)
     assert time.monotonic() - start < 2
 
 
+def test_one_connection_pool_serves_every_clip_and_builds_no_tls_context(stt, whisper_server, monkeypatch):
+    import ssl
+
+    import httpcore
+
+    pools, contexts = [], []
+    real_pool, real_new = httpcore.AsyncConnectionPool, ssl.SSLContext.__new__
+
+    class CountedPool(real_pool):
+        def __init__(self, *args, **kwargs):
+            pools.append(1)
+            super().__init__(*args, **kwargs)
+
+    def counted_new(cls, *args, **kwargs):
+        contexts.append(cls)
+        return real_new(cls, *args, **kwargs)
+
+    monkeypatch.setattr(httpcore, "AsyncConnectionPool", CountedPool)
+    monkeypatch.setattr(ssl.SSLContext, "__new__", counted_new)
+    for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")  # a dead proxy: never consulted
+    client = voice._WhisperHTTP()
+    monkeypatch.setattr(voice, "_WHISPER_HTTP", client)
+    monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"])
+    try:
+        for _ in range(3):
+            assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "hello from the server"
+    finally:
+        client.close()
+    assert len(pools) == 1 and len(whisper_server["requests"]) == 3  # one pool for all three clips
+    assert contexts == []  # plain http to loopback: no TLS context was ever built
+    assert stt.calls == []
+
+
+def test_closing_the_pool_stops_its_thread_and_a_later_clip_starts_afresh(stt, whisper_server, monkeypatch):
+    client = voice._WhisperHTTP()
+    monkeypatch.setattr(voice, "_WHISPER_HTTP", client)
+    monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"])
+    assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "hello from the server"
+    thread = client._thread
+    voice.close()
+    assert not thread.is_alive() and client._pool is None and client._loop is None
+    assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "hello from the server"  # started again on use
+    client.close()
+
+
 def test_server_alone_is_enough(stt, whisper_server, monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"])
     monkeypatch.setattr(config, "WHISPER_BIN", str(tmp_path / "no-cli"))
@@ -301,7 +355,7 @@ def _closed_port_url():
     return f"http://127.0.0.1:{port}"
 
 
-@pytest.mark.parametrize("mode", ["500", "nojson", "notext", "slow", "down"])
+@pytest.mark.parametrize("mode", ["500", "nojson", "notext", "slow", "down", "redirect"])
 def test_server_failure_falls_back_to_whisper_cli(stt, whisper_server, monkeypatch, mode):
     whisper_server["mode"] = mode
     monkeypatch.setattr(config, "WHISPER_SERVER_URL", _closed_port_url() if mode == "down" else whisper_server["url"])
@@ -498,6 +552,13 @@ def test_word_error_rate_keeps_real_words_in_parentheses_and_any_script():
     assert voice_probe.words("Ouvre la pince, café crème!") == ["ouvre", "la", "pince", "café", "crème"]
     assert voice_probe.word_error_rate("le café", "le cafe") == 0.5  # an accent is a different word
     assert voice_probe.words("don't stop") == ["don't", "stop"]
+
+
+def test_only_whole_sound_annotations_are_dropped_from_parentheses():
+    assert voice_probe.word_error_rate("I like music", "(I like music)") == 0  # speech, not a sound tag
+    assert voice_probe.words("(upbeat music) open (laughs) the claw (soft music playing)") == ["open", "the", "claw"]
+    assert voice_probe.words("(music) (Laughing) stop (foreign language)") == ["stop"]
+    assert voice_probe.words("(the music stopped) stop") == ["the", "music", "stopped", "stop"]
 
 
 def _clips(tmp_path, **clips):
@@ -859,6 +920,19 @@ def test_stt_upload_is_read_bounded_and_oversize_is_refused(monkeypatch):
 needs_web = pytest.mark.skipif(not _console_web_deps(), reason="python-multipart (console/requirements.txt) not installed")
 BOUNDARY = "vaylt-test-boundary"
 FORM_TYPE = (b"content-type", f"multipart/form-data; boundary={BOUNDARY}".encode())
+
+
+@needs_web
+def test_the_console_closes_the_whisper_pool_on_shutdown(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from console.server import main
+
+    closed = []
+    monkeypatch.setattr(main.voice, "close", lambda: closed.append(1))
+    with TestClient(main.app):
+        assert closed == []
+    assert closed == [1]
 
 
 def multipart(audio: bytes, auto: str = "0") -> bytes:

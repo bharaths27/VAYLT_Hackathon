@@ -32,9 +32,13 @@ from console.server import config, voice  # noqa: E402
 
 
 # Whisper marks non-speech as [BLANK_AUDIO] / [MUSIC] (square brackets) or as a parenthesised sound
-# description like "(upbeat music)" or "(laughs)". Only those are dropped: "(up)" in a reference is a word.
-_SOUND = re.compile(r"\((?:[^()]*\s)?(?:music|laugh\w*|applause|silence|noise|inaudible|cough\w*|sigh\w*|"
-                    r"breath\w*|clap\w*|static|beep\w*|bell\w*|whistl\w*|foreign language)(?:\s[^()]*)?\)")
+# description. A parenthetical is dropped only when the WHOLE of it has that annotation form: an
+# optional single descriptor word, a sound word, an optional "playing" - "(music)", "(upbeat music)",
+# "(laughs)", "(laughing)", "(soft music playing)". Anything else in parentheses is speech and is
+# scored: "(I like music)" keeps its three words, and "(up)" in a reference is a word.
+_SOUND_WORDS = (r"music|laugh\w*|applause|silence|noise|inaudible|cough\w*|sigh\w*|breath\w*|clap\w*|static|"
+                r"beep\w*|bell\w*|whistl\w*|foreign language")
+_SOUND = re.compile(rf"\(\s*(?:[^\W\d_]+\s+)?(?:{_SOUND_WORDS})(?:\s+playing)?\s*\)")
 
 
 def words(text: str) -> list[str]:
