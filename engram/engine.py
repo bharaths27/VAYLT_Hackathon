@@ -21,7 +21,7 @@ from .db import now
 from .executor import Executor
 from .hashes import hash_models
 from .ids import digest, new_id
-from .memory import Memory
+from .memory import Memory, MemoryBundle
 from .planner import PlanResult, RulePlanner, find_zone, refusal, targets_in
 from .prospective import Prospective, normalize, parse_when
 from .robot.base import RobotAdapter
@@ -106,7 +106,10 @@ class Engine:
             return {"kind": "scheduled", "task_id": task_id, "created": created, "trigger": trigger, "request": request}
         return {"kind": "proposal", **self.propose(stripped)}
 
-    def propose(self, request: str) -> dict[str, Any]:
+    def propose(self, request: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
+        """bundle: the memory bundle for this request, if the caller has already retrieved it and memory has not
+        changed since (voice presets prefetch it while the user is still speaking). Without one, or with one
+        retrieved for another request, it is retrieved here."""
         episode_id = new_id("ep")
         why = refusal(request)
         if why:
@@ -114,7 +117,8 @@ class Engine:
             self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", why)
             return {"operation_id": episode_id, "status": "refused", "reason": why}
 
-        bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
+        if bundle is None or bundle.goal != request:
+            bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
         targets = targets_in(request, self.memory)
         zone = find_zone(request, self.zones)
         fixed = self.fixed_requests.get(normalize(request))

@@ -31,7 +31,7 @@ def make_gate(fake, spawn, clock, ctx=None, prefetch=None, **kw):
 
 def test_partials_only_prepare_and_never_return_a_proposal(fake, spawn, clock):
     prefetched = []
-    gate = make_gate(fake, spawn, clock, prefetch=lambda text: prefetched.append(text) or {"goal": text})
+    gate = make_gate(fake, spawn, clock, prefetch=lambda request: prefetched.append(request) or {"goal": request})
     for rev, text in enumerate(["Open...", "Open the", "Open the claw", "Open the claw"]):
         r = gate.on_partial(1, rev, text)
         spawn.run_all()
@@ -39,7 +39,7 @@ def test_partials_only_prepare_and_never_return_a_proposal(fake, spawn, clock):
     assert not hasattr(gate, "engine")
     p = gate.prepared()
     assert p.decision.preset == "open_gripper" and p.key.text == "Open the claw"
-    assert p.bundle == {"goal": "Open the claw"} and prefetched == ["Open the claw"]
+    assert p.bundle == {"goal": "Open the gripper"} and prefetched == ["Open the gripper"]   # the preset's request
     assert all(partial for _, partial in fake.calls)
 
 
@@ -296,16 +296,16 @@ def test_context_and_prefetch_run_only_on_the_callers_thread():
         seen.append(("context", threading.get_ident()))
         return 0
 
-    def prefetch(text):
+    def prefetch(request):
         seen.append(("prefetch", threading.get_ident()))
-        return {"goal": text}
+        return {"goal": request}
 
     gate = SpeculationGate(classifier, prefetch=prefetch, context_version=ctx)   # real worker threads
     for rev, text in enumerate(["Open", "Open the", "Open the claw"]):
         gate.on_partial(1, rev, text)
     assert gate.wait_idle(5)
     gate.on_partial(1, 3, "Open the claw")
-    assert gate.prepared().bundle == {"goal": "Open the claw"}
+    assert gate.prepared().bundle == {"goal": "Open the gripper"}
     assert gate.on_final(1, 4, "Open the claw").action == "propose"
     assert workers and me not in workers                    # the model was asked off-thread
     assert {kind for kind, _ in seen} == {"context", "prefetch"} and {t for _, t in seen} == {me}
@@ -479,10 +479,10 @@ def test_stop_ends_a_final_that_is_waiting_for_the_model():
 def test_stop_during_the_finals_prefetch_discards_the_final(spawn, clock, partial_first):
     entered, release = threading.Event(), threading.Event()
 
-    def slow_prefetch(text):
+    def slow_prefetch(request):
         entered.set()
         assert release.wait(5)
-        return {"goal": text}
+        return {"goal": request}
 
     fake = FakeIntent()
     gate = SpeculationGate(fake, prefetch=slow_prefetch, clock=clock, spawn=spawn)
@@ -506,10 +506,10 @@ def test_a_prediction_that_expires_during_the_prefetch_is_not_acted_on(spawn, cl
                                                                         expected):
     entered, release = threading.Event(), threading.Event()
 
-    def slow_prefetch(text):
+    def slow_prefetch(request):
         entered.set()
         assert release.wait(5)
-        return {"goal": text}
+        return {"goal": request}
 
     fake = FakeIntent()
     gate = SpeculationGate(fake, prefetch=slow_prefetch, clock=clock, spawn=spawn, ttl_s=2.0)
@@ -620,9 +620,9 @@ def test_a_prediction_that_lands_later_is_announced_and_pump_prefetches_it():
     fake = FakeIntent()
     fake.hold()
 
-    def prefetch(text):
-        fetched.append((text, threading.get_ident()))
-        return {"goal": text}
+    def prefetch(request):
+        fetched.append((request, threading.get_ident()))
+        return {"goal": request}
 
     gate = SpeculationGate(fake, prefetch=prefetch, on_prediction=landed.set)    # real worker threads
     gate.on_partial(1, 0, "Open the claw")                      # dispatched; the answer is not there yet
@@ -631,7 +631,7 @@ def test_a_prediction_that_lands_later_is_announced_and_pump_prefetches_it():
     assert landed.wait(2)                                       # the owner is told, from the worker...
     assert fetched == []                                        # ...which never fetches anything itself
     gate.pump()                                                 # the owner prefetches, on its own thread
-    assert fetched == [("Open the claw", me)] and gate.prepared().bundle == {"goal": "Open the claw"}
+    assert fetched == [("Open the gripper", me)] and gate.prepared().bundle == {"goal": "Open the gripper"}
     gate.pump()
     assert len(fetched) == 1                                    # nothing left to do: fetched once
 
@@ -679,7 +679,7 @@ def test_a_rejection_voids_its_own_utterance_and_a_stop_still_voids_everything(f
 
 def test_pump_does_not_fetch_for_a_prediction_the_memory_has_moved_past(fake, spawn, clock):
     ctx, fetched = Ctx(), []
-    gate = make_gate(fake, spawn, clock, ctx=ctx, prefetch=lambda text: fetched.append(text) or {"goal": text})
+    gate = make_gate(fake, spawn, clock, ctx=ctx, prefetch=lambda request: fetched.append(request) or {"goal": request})
     gate.on_partial(1, 0, "Open the claw")
     spawn.run_all()                                             # the prediction lands
     ctx.v += 1                                                  # then the memory changes

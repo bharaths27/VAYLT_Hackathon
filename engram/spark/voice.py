@@ -3,7 +3,8 @@
 The SpeculationGate enforces these rules:
 
 1. A partial transcript may only PREPARE: ask the intent model what it means and pre-fetch
-   the memory bundle. on_partial never returns a proposal, and the gate holds no engine.
+   the memory bundle for the preset's request, the request a final would propose, so the
+   proposal can use it. on_partial never returns a proposal, and the gate holds no engine.
 2. Every prediction is bound to (utterance, revision, exact text, memory-context version) and
    an expiry. A result is kept only if, when it arrives, it still describes what the user has
    said: same utterance, same text with no change since its revision, same context, not
@@ -120,6 +121,9 @@ class GateResult:
     preset: str | None = None
     reason: str = ""
     decision: IntentDecision | None = None
+    # propose: what prefetch returned for the preset's request (None if there is no prefetch or it failed), as
+    # retrieved at the memory-context version on_final read after its last wait. If memory changed after a
+    # partial's prefetch, the prediction was not reused and the final retrieved the bundle again.
     bundle: Any = None
     commitment: str | None = None   # "When <event>, <task>" for action == "schedule"
     reused: bool = False
@@ -309,7 +313,7 @@ class SpeculationGate:
                 return GateResult("clarify", utterance, revision, text,
                                   reason="I could not work out what you meant. Please say it again.")
         if bundle is None and self._actionable(text, decision):
-            bundle = self._fetch_bundle(text)
+            bundle = self._fetch_bundle(decision)
         # Last check, after every wait (the model, the prefetch): act only if nothing moved on meanwhile.
         ctx = self._context()
         with self._cv:
@@ -445,12 +449,12 @@ class SpeculationGate:
                 self.stats.errors += 1
             return None
 
-    def _fetch_bundle(self, text: str) -> Any:
-        """Caller's thread only, lock NOT held."""
+    def _fetch_bundle(self, d: IntentDecision) -> Any:
+        """The memory bundle for the request d's preset would propose. Caller's thread only, lock NOT held."""
         if self._prefetch is None:
             return None
         try:
-            return self._prefetch(text)
+            return self._prefetch(PRESETS[d.preset].request)
         except Exception as e:
             log.warning("memory prefetch failed: %s", type(e).__name__)
             return None
@@ -464,7 +468,7 @@ class SpeculationGate:
             if p is None or p.bundle is not None or not self._valid(p.key) or \
                     not self._actionable(p.key.text, p.decision):
                 return
-        bundle = self._fetch_bundle(p.key.text)
+        bundle = self._fetch_bundle(p.decision)
         if bundle is None:
             return
         ctx = self._context()

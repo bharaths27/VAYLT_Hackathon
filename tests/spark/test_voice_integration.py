@@ -1,5 +1,6 @@
 """Voice presets reach the real Engine only as unapproved proposals or future tasks."""
 
+import json
 import sqlite3
 import threading
 import time
@@ -34,6 +35,25 @@ def nothing_happened(engine):
             and engine.robot.calls == OBSERVED_ONLY)
 
 
+def fetch_spy(engine, monkeypatch):
+    """Every memory bundle retrieval from now on, as (goal, thread)."""
+    fetched = []
+    real = engine.memory.retrieve_memory_bundle
+
+    def spy(goal, *args, **kwargs):
+        fetched.append((goal, threading.get_ident()))
+        return real(goal, *args, **kwargs)
+
+    monkeypatch.setattr(engine.memory, "retrieve_memory_bundle", spy)
+    return fetched
+
+
+def recorded_bundle(engine, operation_id):
+    """The memory bundle the engine stored with a proposal."""
+    row = engine.conn.execute("SELECT evidence_json FROM episode WHERE id = ?", (operation_id,)).fetchone()
+    return json.loads(row["evidence_json"])["bundle"]
+
+
 @pytest.fixture
 def voice(taught, fake, spawn, clock):
     return VoiceIntegration(taught, fake, spawn=spawn, clock=clock)
@@ -56,14 +76,14 @@ def test_prepared_partial_carries_the_prefetched_memory_bundle(voice, spawn):
     voice.on_partial(1, 0, "Open the claw")
     spawn.run_all()
     out = voice.on_partial(1, 0, "Open the claw")
-    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the claw"
+    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the gripper"   # the preset's request
 
 
 def test_a_preset_reaches_engine_propose_and_stays_unapproved(voice, spawn, fake, monkeypatch):
     engine = voice.engine
     asked = []
     real_propose = engine.propose
-    monkeypatch.setattr(engine, "propose", lambda request: asked.append(request) or real_propose(request))
+    monkeypatch.setattr(engine, "propose", lambda request, **kw: asked.append(request) or real_propose(request, **kw))
     voice.on_partial(1, 0, "Open the claw")
     spawn.run_all()
     out = voice.on_final(1, 1, "Open the claw")
@@ -225,7 +245,7 @@ def test_real_threaded_worker_never_touches_a_thread_bound_connection(arena):
     assert voice.on_partial(1, 0, "Open the claw")["status"] == "dispatched"
     assert voice.gate.wait_idle(5)
     out = voice.on_partial(1, 1, "Open the claw")
-    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the claw"
+    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the gripper"
     final = voice.on_final(1, 2, "Open the claw")
     assert final["status"] == "proposed" and final["reused_prediction"] and len(fake.calls) == 1
     assert voice.gate.stats.errors == 0 and engine.robot.calls == OBSERVED_ONLY
@@ -407,14 +427,7 @@ def test_a_reset_during_the_final_never_becomes_a_proposal(taught, spawn, clock)
 
 def test_a_late_prediction_gets_its_memory_bundle_before_the_final(taught, monkeypatch):
     me = threading.get_ident()
-    landed, fetched = threading.Event(), []
-    real = taught.memory.retrieve_memory_bundle
-
-    def spy(goal, *args, **kwargs):
-        fetched.append((goal, threading.get_ident()))
-        return real(goal, *args, **kwargs)
-
-    monkeypatch.setattr(taught.memory, "retrieve_memory_bundle", spy)
+    landed, fetched = threading.Event(), fetch_spy(taught, monkeypatch)
     fake = FakeIntent()
     fake.hold()
     voice = VoiceIntegration(taught, fake, on_prediction=landed.set)          # real worker threads
@@ -423,8 +436,58 @@ def test_a_late_prediction_gets_its_memory_bundle_before_the_final(taught, monke
     fake.release.set()                                          # the classifier answers late
     assert landed.wait(2)                                       # no further transcript event comes
     prepared = voice.pump()                                     # the owner runs the prefetch it was told of
-    assert prepared["preparing"] == "open_gripper" and prepared["memory"]["goal"] == "Open the claw"
-    assert fetched == [("Open the claw", me)]                   # before the final, on the owner thread
+    assert prepared["preparing"] == "open_gripper" and prepared["memory"]["goal"] == "Open the gripper"
+    assert fetched == [("Open the gripper", me)]                # before the final, on the owner thread
     assert count(taught, "episode") == 0                        # preparing only: nothing was proposed
     final = voice.on_final(1, 1, "Open the claw")
     assert final["status"] == "proposed" and final["reused_prediction"]
+    assert fetched == [("Open the gripper", me)] and final["memory"] == prepared["memory"]   # used, not retrieved again
+
+
+# ---- the memory bundle a partial prefetched is the one the final proposes with -------------------------------
+
+HINGE = "Open the gripper slowly: the gripper hinge is loose."             # memory the preset's request finds
+TRAY = "Before you open the gripper, check that the tray below is empty."
+
+
+def test_the_final_proposes_with_the_bundle_its_partial_prefetched(voice, spawn, monkeypatch):
+    voice.engine.teach("Note", HINGE)
+    fetched = fetch_spy(voice.engine, monkeypatch)
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    prepared = voice.pump()                                     # the prefetch, while the user is still speaking
+    before_final = len(fetched)
+    final = voice.on_final(1, 1, "Open the claw")
+    assert final["status"] == "proposed" and final["reused_prediction"]
+    assert len(fetched) == before_final == 1                    # the final retrieved nothing again
+    assert fetched == [("Open the gripper", threading.get_ident())]   # the preset's request, on the owner thread
+    assert final["memory"] == prepared["memory"] == recorded_bundle(voice.engine, final["operation_id"])
+    assert [e["text"] for e in final["memory"]["evidence"]] == [HINGE]
+
+
+def test_a_prefetch_that_went_stale_is_retrieved_again_exactly_once(voice, spawn, fake, monkeypatch):
+    voice.engine.teach("Note", HINGE)
+    fetched = fetch_spy(voice.engine, monkeypatch)
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    prepared = voice.pump()
+    before_final = len(fetched)
+    voice.engine.teach("Note", TRAY)                            # memory moves on after the prefetch
+    final = voice.on_final(1, 1, "Open the claw")
+    assert final["status"] == "proposed" and not final["reused_prediction"] and len(fake.calls) == 2
+    assert len(fetched) == before_final + 1 == 2                # one retrieval at the final, not two
+    assert [goal for goal, _ in fetched] == ["Open the gripper"] * 2
+    assert TRAY not in [e["text"] for e in prepared["memory"]["evidence"]]
+    assert TRAY in [e["text"] for e in final["memory"]["evidence"]]    # the proposal has the fresh bundle
+    assert final["memory"] == recorded_bundle(voice.engine, final["operation_id"])
+
+
+@pytest.mark.parametrize("retrieved_for,retrievals", [("Open the gripper", 0), ("Close the gripper", 1)],
+                         ids=["for this request", "for another request"])
+def test_propose_uses_a_given_bundle_only_if_it_is_for_that_request(voice, monkeypatch, retrieved_for, retrievals):
+    engine = voice.engine                                       # presets registered
+    given = engine.memory.retrieve_memory_bundle(retrieved_for, engine.skills.approved_names())
+    fetched = fetch_spy(engine, monkeypatch)
+    out = engine.propose("Open the gripper", bundle=given)
+    assert out["status"] == "proposed" and len(fetched) == retrievals
+    assert out["memory"]["goal"] == "Open the gripper" == recorded_bundle(engine, out["operation_id"])["goal"]
