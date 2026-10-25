@@ -126,6 +126,11 @@ async function askBrain(text) {
   if (r.error) { $("result").innerHTML = `<b class="FAILED">BRAIN</b> ${esc(r.error)}`; return; }
   if (r.kind === "taught") { $("result").innerHTML = `<b class="SUCCEEDED">REMEMBERED</b> ${esc(r.title || "")}`; speak("Got it, I'll remember that."); return; }
   if (r.kind === "scheduled") { $("result").innerHTML = `<b class="SUCCEEDED">SCHEDULED</b> when ${esc(JSON.stringify(r.trigger))}: ${esc(r.request || "")}`; speak("Okay, I'll do that later."); return; }
+  if (r.reply) {   // the brain's own words: "I stopped. <why> Please clarify." (Carter's rule), or an answer from memory
+    const label = r.needs_clarification === false ? "ANSWER" : r.stopped ? "STOPPED" : "CLARIFY";
+    const cls = label === "ANSWER" ? "SUCCEEDED" : label === "STOPPED" ? "ABORTED" : "UNKNOWN";
+    $("result").innerHTML = `<b class="${cls}">${label}</b> ${esc(r.reply)}`; speak(r.reply); return;
+  }
   if (r.status === "refused") { $("result").innerHTML = `<b class="REJECTED">REFUSED</b> ${esc(r.reason || "")}`; speak("I won't do that. " + (r.reason || "")); return; }
   const steps = (r.plan && r.plan.steps) || [];
   const check = r.check || {};
@@ -164,7 +169,10 @@ function showIntent(text, intent) {
   $("result").textContent = "";
   if (mode === "brain") {
     if (intent.op === "stop") { doStop("voice"); return; }   // stop never waits for the AI
-    if (text && text.trim()) askBrain(text.trim()); else $("result").textContent = intent.say;
+    // Nothing heard: this console has answered it already under Carter's rule ("I stopped. ... Please clarify."),
+    // so it says that, and the brain is not asked about noise.
+    if (intent.clarify || !(text && text.trim())) { $("result").textContent = intent.say; speak(intent.say); return; }
+    askBrain(text.trim());
     return;
   }
   if (!intent.op) { $("proposal").classList.add("hidden"); $("result").textContent = intent.say; speak(intent.say); return; }

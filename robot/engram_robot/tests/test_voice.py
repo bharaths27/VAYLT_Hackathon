@@ -1,5 +1,8 @@
 """Voice console: intent parsing, and the full iPad -> voice server -> robot path against the simulator."""
+import json
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -294,3 +297,26 @@ def test_a_parse_that_does_not_say_it_understood_counts_as_unclear(stack, monkey
     r = transcribe(c)
     assert r["stopped"] is True and svc.safety.estop_latched
     svc.reset("test")
+
+
+# ---- the iPad page in brain mode says the words of the rule: the brain's own reply, or this console's ----------
+
+NODE = shutil.which("node")
+PAGE = Path(__file__).resolve().parents[1] / "voice" / "static" / "index.html"
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed: the page's script needs a JavaScript engine")
+def test_the_page_in_brain_mode_says_the_brains_reply_and_answers_noise_itself():
+    p = subprocess.run([NODE, str(Path(__file__).with_name("page_harness.js")), str(PAGE)],
+                       capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert p.returncode == 0, p.stderr
+    out = json.loads(p.stdout)
+    assert out["stopped"]["spoken"] == ["I stopped. I don't know which object you mean. Please clarify."]
+    assert "STOPPED" in out["stopped"]["html"]
+    assert out["clarify"]["spoken"] == ["I don't know which object you mean. Please clarify."]
+    assert "CLARIFY" in out["clarify"]["html"]
+    assert out["refused"]["spoken"] == [   # an understood refusal: unchanged
+        "I won't do that. I will not do that: 'throw' is not something this robot is allowed to do."]
+    assert out["answer"]["spoken"] == ["Sample B was last seen on shelf A."]
+    assert out["misheard"]["spoken"] == ["I stopped. I didn't catch anything. Please clarify."]
+    assert out["misheard"]["asked"] == []                       # noise is answered here, not sent to the brain
