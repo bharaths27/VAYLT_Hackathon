@@ -11,7 +11,7 @@ from PIL import Image  # noqa: E402
 
 from engram.vision import intent_vision as iv  # noqa: E402
 
-KEY = "sk-test-not-a-real-key-0000"  # a dummy; asserts below check it never leaks
+KEY = "dummy-api-key-for-tests"  # not a real key; asserts below check it never leaks
 
 
 def png(w, h, color=(200, 30, 30)):
