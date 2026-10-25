@@ -19,7 +19,6 @@ from __future__ import annotations
 import base64
 import io
 import json
-import math
 import os
 import threading
 import time
@@ -216,7 +215,7 @@ class VisionClient:
 
 def _unit(x: Any) -> float:
     """A finite number in [0, 1] (not a bool, not a string), or VisionError."""
-    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or not 0.0 <= x <= 1.0:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not 0.0 <= x <= 1.0:  # NaN fails the range too
         raise VisionError("unexpected answer shape")
     return float(x)
 

@@ -154,6 +154,7 @@ def _choice_reply(**overrides):
     {"probabilities": {k: ("0.5" if k == "fist" else 0.01) for k in iv.HAND_SIGNALS}},
     {"probabilities": {k: (2.0 if k == "fist" else 0.01) for k in iv.HAND_SIGNALS}},
     {"choice": 3},
+    {"choice": ["fist"]},
 ])
 def test_out_of_range_or_wrong_type_values_fail_closed(overrides):
     with pytest.raises(iv.VisionError):
