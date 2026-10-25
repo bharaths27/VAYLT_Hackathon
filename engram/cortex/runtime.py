@@ -95,7 +95,10 @@ class Brain:
         return answer
 
     def command(self,request: str,*,principal: str,idempotency_key: str | None=None,cloud_allowed: bool=False) -> dict:
-        request=text(request,'request',2000); principal=text(principal,'principal',100)
+        principal=text(principal,'principal',100)
+        if isinstance(request,str) and not request.strip():  # nothing was heard: misheard, before routing or planning
+            return taken({'kind':'proposal','status':'refused','reason':"I didn't catch anything."},'misheard')
+        request=text(request,'request',2000)
         with self.activity.foreground():
             low=normalize(request)
             if low in {'stop','stop now','halt','emergency stop'}: return taken({'kind':'stop',**self.stop()},'understood')

@@ -217,3 +217,11 @@ def test_a_denial_from_the_parser_is_an_understood_refusal(brain,monkeypatch):
     monkeypatch.setattr(runtime,'parse_goal',deny)
     r=brain.command('Bring Sample A to the bench.',principal='carther')
     assert (r['status'],r['classification'],r['code'])==('refused','understood','DENIED'),r
+
+@pytest.mark.parametrize('blank',['','   '],ids=['empty','spaces'])
+def test_a_blank_command_is_misheard_before_any_routing_or_planning(brain,blank):
+    r=brain.command(blank,principal='carther')
+    assert (r['status'],r['classification'],r['needs_clarification'])==('refused','misheard',True),r
+    assert r['reason']=="I didn't catch anything."
+    assert brain.store.one('SELECT COUNT(*) n FROM cx_decision')['n']==0       # the advisor was never asked
+    assert brain.store.one('SELECT COUNT(*) n FROM episode')['n']==0           # and nothing was planned
