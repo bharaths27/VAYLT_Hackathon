@@ -45,6 +45,28 @@ running() {
 canon() { "$(python_bin)" -c 'import os,sys;print(os.path.realpath(sys.argv[1]).replace(os.sep,"/"))' "$1"; }
 same_file() { "$(python_bin)" -c 'import os,sys;a,b=sys.argv[1:];print("same" if os.path.exists(a) and os.path.exists(b) and os.path.samefile(a,b) else "different")' "$1" "$2"; }
 
+# The responder is OUR Cortex: /health says cortex, our token is accepted and a wrong one refused. Any other
+# service on the port (one that kept it when our uvicorn failed to bind) fails this. The token goes via env, not argv.
+ours() { CORTEX_CHECK_TOKEN="$(cat "$TOKEN_FILE")" "$(python_bin)" -c 'import json,os,sys,urllib.error,urllib.request
+def get(path,token=None):
+    r=urllib.request.Request(sys.argv[1]+path,headers={"Authorization":"Bearer "+token} if token else {})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r,timeout=2) as x:return x.status,x.read()
+    except urllib.error.HTTPError as e:return e.code,b""
+t=os.environ["CORTEX_CHECK_TOKEN"];s,body=get("/health")
+ok=s==200 and json.loads(body or b"{}").get("service")=="cortex" and get("/camera/status",t)[0]==200 and get("/camera/status","not-"+t)[0]==401
+sys.exit(0 if ok else 1)' "$(url)"; }
+# An existing state dir is adopted only if it is a real directory we own with mode 700 (never chmodded here).
+dir_ok() { "$(python_bin)" -c 'import os,stat,sys
+st=os.lstat(sys.argv[1])
+print("ok" if stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and stat.S_IMODE(st.st_mode)==0o700 else "bad")' "$1"; }
+# The token is created exclusively and without following a symlink: an existing path is never written through.
+new_token() { "$(python_bin)" -c 'import os,secrets,sys
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o600)
+os.write(fd,secrets.token_urlsafe(32).encode()+bytes([10]));os.close(fd)' "$1"; }
+# The remote end of the ssh tunnel is the address the sidecar binds (bracketed for IPv6).
+tunnel_host() { case $HOST in *:*) echo "[$HOST]" ;; *) echo "$HOST" ;; esac; }
+
 url() { case $HOST in *:*) echo "http://[$HOST]:$PORT" ;; *) echo "http://$HOST:$PORT" ;; esac; }
 
 health() {
@@ -84,10 +106,15 @@ start() {
     refuse_unsafe_config
     if running; then echo "cortex-sidecar: already running (pid $(cat "$PID_FILE")) at $(url)"; return 0; fi
     py=$(python_bin)
-    mkdir -p "$STATE" && chmod 700 "$STATE"
-    if [ ! -s "$TOKEN_FILE" ]; then
-        (umask 077 && "$py" -c 'import secrets;print(secrets.token_urlsafe(32))' > "$TOKEN_FILE")
+    # A dedicated state directory: created here with mode 700, or an existing one that already is exactly that.
+    if [ -e "$STATE" ] || [ -L "$STATE" ]; then
+        [ "$(dir_ok "$STATE")" = ok ] || die "refusing CORTEX_STATE_DIR=$STATE: an existing path must be a directory you own with mode 700, not a shared or symlinked one; name a new path and the sidecar creates it"
+    else
+        (umask 077 && mkdir -p -- "$STATE") || die "could not create $STATE"
     fi
+    [ ! -L "$TOKEN_FILE" ] || die "refusing $TOKEN_FILE: the token path is a symlink"
+    if [ ! -e "$TOKEN_FILE" ]; then new_token "$TOKEN_FILE" || die "could not create $TOKEN_FILE"; fi
+    [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ] || die "refusing $TOKEN_FILE: not a non-empty regular file"
     chmod 600 "$TOKEN_FILE"
     cd "$REPO"
     # env -i: exactly this configuration; nothing else from the caller's environment leaks in.
@@ -100,12 +127,12 @@ start() {
     echo $! > "$PID_FILE"
     i=0
     while [ $i -lt 30 ]; do
-        if health >/dev/null 2>&1; then
+        kill -0 "$(cat "$PID_FILE")" 2>/dev/null || break      # our process died (e.g. the port was taken): never "started"
+        if ours >/dev/null 2>&1 && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
             echo "cortex-sidecar: started (pid $(cat "$PID_FILE")) at $(url); db $DB; token file $TOKEN_FILE; log $LOG"
-            echo "cortex-sidecar: inspector: ssh -L $PORT:127.0.0.1:$PORT starrasp@star-pi, then http://127.0.0.1:$PORT/cortex"
+            echo "cortex-sidecar: inspector: ssh -L $PORT:$(tunnel_host):$PORT starrasp@star-pi, then http://127.0.0.1:$PORT/cortex"
             return 0
         fi
-        kill -0 "$(cat "$PID_FILE")" 2>/dev/null || break
         sleep 1; i=$((i+1))
     done
     tail -n 20 "$LOG" >&2 || true
