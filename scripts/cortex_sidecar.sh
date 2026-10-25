@@ -123,14 +123,18 @@ refuse_unsafe_config() {
     [ -f "$ARENA" ] || die "lab arena not found at $ARENA"
 }
 
-# One start at a time: an atomic mkdir in the state directory. A lock whose recorded starter is dead is reclaimed;
-# one without a recorded starter yet is another start in progress.
+# One start at a time: an atomic directory creation in the state directory. A lock whose recorded starter is dead
+# is reclaimed; one without a recorded starter yet is another start in progress. mkdir(2) is atomic but not every
+# mkdir(1) is (uutils coreutils 0.8 reports success to both of two concurrent callers), so Python makes it.
+mklock() { "$(python_bin)" -c 'import os,sys
+try: os.mkdir(sys.argv[1])
+except FileExistsError: sys.exit(1)' "$1" 2>/dev/null; }
 start_lock() {
     lock=$STATE/start.lock
-    if ! mkdir "$lock" 2>/dev/null; then
+    if ! mklock "$lock"; then
         holder=$(cat "$lock/pid" 2>/dev/null || true)
         { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } || die "another start is in progress (remove $lock if none is)"
-        rm -rf "$lock"; mkdir "$lock" 2>/dev/null || die "another start is in progress"
+        rm -rf "$lock"; mklock "$lock" || die "another start is in progress"
     fi
     LOCKED=$lock; echo $$ > "$lock/pid"
     trap 'rm -rf "$LOCKED"' EXIT

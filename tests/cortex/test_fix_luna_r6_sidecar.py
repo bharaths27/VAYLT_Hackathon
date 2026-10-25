@@ -38,6 +38,25 @@ def test_concurrent_starts_leave_exactly_one_server(tmp_path):
     finally:
         run(tmp_path,'stop',CORTEX_PORT=port)
 
+def test_a_failing_start_leaves_a_process_it_did_not_start_alone(tmp_path):
+    import json,threading,time
+    from http.server import BaseHTTPRequestHandler,HTTPServer
+    class Squatter(BaseHTTPRequestHandler):                                   # holds the port: our uvicorn fails to bind
+        def log_message(self,*a):pass
+        def do_GET(self):self.send_response(404);self.end_headers()
+    srv=HTTPServer(('127.0.0.1',0),Squatter);port=str(srv.server_port);threading.Thread(target=srv.serve_forever,daemon=True).start()
+    state=private_state(tmp_path);other=subprocess.Popen(['sleep','60'])        # a process this start did not create
+    try:
+        p=subprocess.Popen([SH,str(ROOT/'scripts/cortex_sidecar.sh'),'start'],env=env(tmp_path,CORTEX_PORT=port),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        pidf=state/'cortex.pid';end=time.monotonic()+20
+        while not (pidf.exists() and pidf.read_text().strip()) and time.monotonic()<end:time.sleep(.005)
+        pidf.write_text(str(other.pid))                                         # the PID file now names someone else
+        out,err=p.communicate(timeout=90)
+        assert p.returncode!=0 and 'started' not in out,(out,err)
+        assert other.poll() is None and pidf.read_text().strip()==str(other.pid)  # not killed, not removed
+    finally:
+        other.kill();srv.shutdown();srv.server_close()
+
 def test_guard_a_lock_left_by_a_dead_starter_is_reclaimed(tmp_path):
     state=private_state(tmp_path);lock=state/'start.lock';lock.mkdir()
     dead=subprocess.Popen(['true']);dead.wait();(lock/'pid').write_text(str(dead.pid))
