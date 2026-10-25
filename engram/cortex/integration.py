@@ -18,14 +18,27 @@ class MemoryView:
         return SimpleNamespace(tag_id=o['tag'],last_zone=o['last_zone'],stale=not o['fresh'],name=o['name'])
 
 class GuardedUpstream:
-    def __init__(self,upstream,store):self.upstream,self.store=upstream,store;self._stopped=threading.Event()
+    """Adapter-side half of the STOP interlock. One lock serializes the stop latch, reset and motion submission, and the
+    latch is checked under it at submission: once stop() returns, no motion command can still go out, and a reset
+    that races a newer STOP cannot clear it. stop() first interrupts a command already submitted (without waiting
+    for the lock that submission holds), then latches, then stops again for anything submitted in between."""
+    def __init__(self,upstream,store):
+        self.upstream,self.store=upstream,store;self._lock=threading.Lock();self._stopped=threading.Event();self.stop_generation=0
     def state(self):return self.upstream.state()
-    # Adapter-side half of the STOP interlock: once stop() reached the adapter, motion is refused until reset_stop().
-    def stop(self):self._stopped.set();self.upstream.stop()
-    def reset_stop(self):self.upstream.reset_stop();self._stopped.clear()
+    def stop(self):
+        try:self.upstream.stop()
+        finally:
+            with self._lock:
+                self.stop_generation+=1;self._stopped.set()
+                self.upstream.stop()
+    def reset_stop(self):
+        with self._lock:self.upstream.reset_stop();self._stopped.clear()
     def execute(self,op,args):
         from .planning import PHYSICAL
-        if op in PHYSICAL and self._stopped.is_set():return Result('rejected','stop latched at the adapter; motion refused until the stop is cleared')
+        if op in PHYSICAL:
+            with self._lock:
+                if self._stopped.is_set():return Result('rejected','stop latched at the adapter; motion refused until the stop is cleared')
+                return self._checked(self.upstream.execute(op,args))
         if op=='locate_tag':
             o=next((x for x in self.store.objects() if x['id']==args['object_id']),None)
             if not o or not o['fresh'] or not o['last_observation_id']:return Result('failed','no current source-grounded location')
@@ -36,7 +49,9 @@ class GuardedUpstream:
             r=Result('done','reference to a current sensor observation, not a new camera capture')
             r.location_evidence={o['id']:{'observation_id':o['last_observation_id'],'zone':o['last_zone'],'captured_at':o['last_seen_at']}}
             return r
-        r=self.upstream.execute(op,args)
+        return self._checked(self.upstream.execute(op,args))
+    @staticmethod
+    def _checked(r):
         if 'not sensor checked' in getattr(r,'detail','').lower() or 'E_UNVERIFIED' in getattr(r,'detail',''):
             return Result('unknown','Adapter reported an unverified physical effect; operator reconciliation required.')
         return r

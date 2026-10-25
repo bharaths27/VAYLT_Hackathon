@@ -224,8 +224,10 @@ class Dreamer:
                           'commitments':self.store.rows('SELECT id,status FROM prospective_task ORDER BY created_at DESC LIMIT 16')})
         last=self.store.one("SELECT value FROM meta WHERE key='cx_dream_watermark'")
         backlog=self.store.one("SELECT 1 FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('success','failed','unknown','aborted') AND NOT EXISTS (SELECT 1 FROM cx_consolidated k WHERE k.episode_id=e.id AND k.outcome=e.outcome) LIMIT 1")
-        if not force and not backlog and last and last['value']==watermark: return {'status':'no_new_evidence'}
-        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False; model_pending=model_failed=False
+        wait=self.store.one("SELECT value FROM meta WHERE key='cx_dream_practice_wait'")
+        due=bool(wait) and self.store.clock()>=float(wait['value'])     # practice deferred by the cap may resume now
+        if not force and not backlog and last and last['value']==watermark and not due: return {'status':'no_new_evidence'}
+        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False; model_pending=model_failed=False; practice_wait=None
         with self.store.tx(): self.store.conn.execute('INSERT INTO cx_dream VALUES(?,?,?,?,?)',(run,self.store.clock(),None,'running','{}'))
         def interrupted():
             b,g,_=self.activity.snapshot()
@@ -276,7 +278,11 @@ class Dreamer:
                 if self.store.one('SELECT 1 FROM cx_practice WHERE id=?',(case_id,)): continue
                 # Unpractised goals left for a later cycle are a backlog: the watermark must not hide them.
                 if not still_idle() or len(practiced)>=self.store.policy.dream_batch: leftover=True; break
-                if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(self.store.clock()-self.PRACTICE_WINDOW_S,))['n']>=self.LIVE_CAP: leftover=True; break
+                window=self.store.clock()-self.PRACTICE_WINDOW_S
+                if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(window,))['n']>=self.LIVE_CAP:
+                    # Goals are left but the rolling cap is full: wait, persisted, for its earliest case to leave the
+                    # window, instead of re-running (and logging) a cycle every tick until then.
+                    practice_wait=self.store.one('SELECT MIN(created_at) t FROM cx_practice WHERE created_at>?',(window,))['t']+self.PRACTICE_WINDOW_S; break
                 fixture=compiler.fixture(symbolic=True)
                 try:
                     plan=compiler.compile(goal,fixture); plan['refs']=sorted(set(plan['refs']+refs))
@@ -321,7 +327,7 @@ class Dreamer:
                 # not limited to the presence of a robotics prerequisite rule.
                 declared=self.store.generic_facts()[:4]
                 for f in declared:refs+=['source:'+f['source_id']]
-                recent_sources=self.store.rows("SELECT c.id,c.source_id,c.text FROM source_chunk c JOIN cx_source s ON s.source_id=c.source_id JOIN source v ON v.id=c.source_id WHERE s.status='accepted' ORDER BY v.created_at DESC LIMIT 3")
+                recent_sources=self.store.rows("SELECT c.id,c.source_id,c.text FROM source_chunk c JOIN cx_source s ON s.source_id=c.source_id JOIN source v ON v.id=c.source_id WHERE s.status='accepted' AND v.kind!='future' ORDER BY v.created_at DESC LIMIT 3")
                 for c in recent_sources:refs+=['source:'+c['source_id']]
                 refs+=['episode:'+e['id'] for e in episodes[:2]]
                 live=self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
@@ -363,6 +369,8 @@ class Dreamer:
                 'mode':'SIMULATED_PRACTICE','physical_actions':0,'weights_updated':False}
         with self.store.tx():
             if status=='complete' and not leftover: self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(watermark,))
+            if status=='complete' and practice_wait: self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_practice_wait',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(practice_wait),))
+            elif status=='complete': self.store.conn.execute("DELETE FROM meta WHERE key='cx_dream_practice_wait'")
             self.store.conn.execute('UPDATE cx_dream SET finished_at=?,status=?,summary_json=? WHERE id=?',(self.store.clock(),status,canonical(result),run))
         if status!='yielded': self._backoff(status=='failed' or model_failed)
         return result

@@ -81,9 +81,13 @@ def test_a_station_conditional_requires_clarification_before_planning_there(brai
     assert brain.command('Go to the bench',principal='carther')['status']=='proposed'
 
 def test_a_motion_conditional_naming_nothing_registered_is_scoped_to_everything(brain):
-    brain.store.teach('Note','Lunch is served daily except Sunday.',owner='carther')            # control: benign, scopes nothing
-    assert brain.command('Go to the bench',principal='carther')['status']=='proposed'
     brain.store.teach('Rule','Nothing may be moved unless a supervisor approves.',owner='carther')
+    with pytest.raises(Missing,match='structured review'): brain.command('Go to the bench',principal='carther')
+
+def test_any_conditional_naming_nothing_registered_fails_closed(brain):
+    # Round 5: no wording test tells a harmless exception from a safety one, so every unparsed conditional that
+    # names nothing registered is scoped to everything until a person reviews it.
+    brain.store.teach('Note','Lunch is served daily except Sunday.',owner='carther')
     with pytest.raises(Missing,match='structured review'): brain.command('Go to the bench',principal='carther')
 
 

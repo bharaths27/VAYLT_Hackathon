@@ -39,7 +39,17 @@ SAFETY_RE = re.compile(r"\b(?:must|mustn't|never|should|shouldn't|shall|needs? t
                        r"do not|don't|cannot|can't|may not|only|always|avoid|keep|hazard\w*|danger\w*|caution|warning)\b", re.I)
 # A negated handling statement in any word order ("must never be handled", "should not be moved").
 NEG_HANDLE_RE = re.compile(r"(?:\b(?:never|not|no|cannot)\b|n't\b).*\b(?:move[ds]?|moving|touch\w*|handl\w*|pick\w*|carr\w*|lift\w*|grab\w*|transport\w*)\b", re.I)
-CONDITIONAL_RE = re.compile(r"\b(?:unless|except|exceptions?|only if|provided that)\b", re.I)
+# Conditionals: every if/unless/only-if/provided/except form and approval-gated forms ("when approved", "with permission").
+CONDITIONAL_RE = re.compile(r"\b(?:unless|except|exceptions?|only\s+if|if|provided|providing|as\s+long\s+as|so\s+long\s+as|on\s+condition|in\s+case|"
+                            r"subject\s+to|pending|until\s+(?:\w+\s+){0,3}(?:approv\w*|authori[sz]\w*|clear\w*|permit\w*)|"
+                            r"(?:when|whenever|once|after)\s+(?:\w+\s+){0,3}(?:approv\w*|authori[sz]\w*|permit\w*|allow\w*|clear\w*|signs?\s+off|signed\s+off|supervis\w*)|"
+                            r"with(?:out)?\s+(?:\w+\s+){0,2}(?:approval|permission|authori[sz]ation|supervision|clearance|sign-?off|consent))\b", re.I)
+# A hazard or a permission ("unsafe", "dangerous", "can/cannot/may be used, moved, handled", "not allowed", "requires
+# approval"). Unparsed, it is never accepted silently: it becomes an unresolved constraint, global if it names nothing.
+HAZARD_RE = re.compile(r"\b(?:unsafe|safe(?:ly)?|danger\w*|hazard\w*|toxic|flammable|corrosive|fragile|explosive|volatile|caution|warning|risk\w*|"
+                       r"forbidden|prohibited|banned|restricted|allowed|permitted|authori[sz]ed|approved|permission|approval|"
+                       r"(?:can|could|may|might|must|shall|should|cannot)(?:\s+not|n't)?(?:\s+only)?(?:\s+ever)?\s+be\s+(?:\w+\s+)?"
+                       r"(?:used|moved|handled|touched|picked|carried|lifted|stored|placed|left|opened|taken|brought|transported))\b", re.I)
 # Motion or use wording: a conditional that names nothing registered but speaks of these is scoped to everything.
 MOTION_RE = re.compile(r"\b(?:move[ds]?|moving|bring|take|carry|put|handled?|handling|touch|pick|use[ds]?|using|go|drive|leave|enter)\b", re.I)
 
@@ -63,6 +73,7 @@ class Store:
             if self.path != ':memory:':
                 self.conn.execute('PRAGMA journal_mode=WAL')
                 self.conn.execute('PRAGMA synchronous=FULL')
+                self.conn.execute('PRAGMA secure_delete=ON')   # deleted source text is overwritten, not left in free pages
             migrate(self.conn)
             with self.tx():
                 existing = self.one("SELECT value FROM meta WHERE key='cortex_workspace'")
@@ -128,7 +139,9 @@ class Store:
             for z in zones:
                 text(z, 'zone', 80)
                 existing = self.one('SELECT * FROM cx_station WHERE id=?', (z,))
-                tag = next((int(k) for k, v in arena.get('zone_tags', {}).items() if v == z), None)
+                tags = [k for k, v in arena.get('zone_tags', {}).items() if v == z]
+                if any(not (isinstance(k, str) and k.isdigit() or isinstance(k, int) and not isinstance(k, bool)) for k in tags): raise CortexError('invalid station tag')
+                tag = int(tags[0]) if tags else None
                 self.conn.execute('INSERT INTO cx_station(id,name,aliases_json,tag_id,version) VALUES(?,?,?,?,1) '
                                   'ON CONFLICT(id) DO UPDATE SET tag_id=excluded.tag_id,version=version+CASE WHEN tag_id IS NOT excluded.tag_id THEN 1 ELSE 0 END',
                                   (z, z.replace('_', ' '), canonical([]), tag))
@@ -137,16 +150,19 @@ class Store:
                 tag = obj.get('tag')
                 if tag is not None and (isinstance(tag, bool) or not isinstance(tag, int) or not 0 <= tag <= 99999):
                     raise CortexError('invalid object tag')
+                graspable, width = obj.get('graspable', True), obj.get('width_mm')
+                if not isinstance(graspable, bool): raise CortexError('graspable must be true or false')
+                if width is not None: finite(width, 'object width (mm)', 0, 10000)
                 aliases = obj.get('aliases', [])
                 if not isinstance(aliases, list) or any(not isinstance(a, str) for a in aliases) or len(aliases) > 20:
                     raise CortexError('invalid object aliases')
                 prior = self.one('SELECT * FROM object_binding WHERE object_id=?', (oid,))
                 prior_alias = self.one('SELECT aliases_json FROM cx_entity WHERE object_id=?', (oid,))
-                changed = prior is not None and (prior['name'] != name or prior['tag_id'] != tag or bool(prior['graspable']) != obj.get('graspable', True)
+                changed = prior is not None and (prior['name'] != name or prior['tag_id'] != tag or bool(prior['graspable']) != graspable
                            or (prior_alias and prior_alias['aliases_json'] != canonical(aliases)))
                 self.conn.execute('INSERT INTO object_binding(object_id,name,tag_id,graspable,width_mm) VALUES(?,?,?,?,?) '
                                   'ON CONFLICT(object_id) DO UPDATE SET name=excluded.name,tag_id=excluded.tag_id,graspable=excluded.graspable,width_mm=excluded.width_mm',
-                                  (oid, name, tag, int(bool(obj.get('graspable', True))), obj.get('width_mm')))
+                                  (oid, name, tag, int(graspable), width))
                 self.conn.execute('INSERT INTO cx_entity(object_id,aliases_json,version) VALUES(?,?,1) '
                                   'ON CONFLICT(object_id) DO UPDATE SET aliases_json=excluded.aliases_json,version=version+?',
                                   (oid, canonical(aliases), int(changed)))
@@ -240,6 +256,16 @@ class Store:
                               (zone, at, oid, object_id, at))
         return oid
 
+    def _mask(self, phrase: str) -> str:
+        """The phrase with every registered object and station name replaced by a neutral word, so that wording checks
+        never read a name ("Safety goggles", "Danger zone") as a hazard or condition."""
+        names = sorted({normalize(n) for o in self.objects() for n in [o['id'], o['name']] + o['aliases']} |
+                       {normalize(n) for z in self.rows('SELECT * FROM cx_station') for n in [z['id'], z['name']] + json.loads(z['aliases_json'])}, key=len, reverse=True)
+        out = ' ' + ' '.join(re.findall(r"[A-Za-z0-9']+", phrase)) + ' '
+        for n in filter(None, names):
+            out = re.sub(r'(?<![A-Za-z0-9])' + r'\s+'.join(map(re.escape, n.split())) + r'(?![A-Za-z0-9])', ' entity ', out, flags=re.I)
+        return out
+
     def _template_rule(self, m) -> tuple | None:
         """(subject, prerequisite, station) of one prerequisite-template match, when each resolves to exactly one."""
         pre, subject = self.resolve_objects(m['pre']), self.resolve_objects(m['subject'])
@@ -290,24 +316,28 @@ class Store:
         # the sentence names (else the source); a motion statement naming nothing registered is scoped to everything.
         stored = {(r.get('subject'), r.get('prerequisite'), r.get('required_zone')) for r in extracted if isinstance(r, dict)}
         banned = set(forbidden)
+        # A commitment's text is its owner's: its unresolved reasons do not copy it into shared memory.
+        quote = (lambda s: '(commitment text withheld)') if kind == 'future' else (lambda s: s.strip()[:300])
         for sent in sentences:
             named = self.named(sent) or self.named(body)
+            masked = self._mask(sent)                     # registered names never count as wording ("Safety goggles")
             residual = sent
             for m in RULE_RE.finditer(sent):
-                if self._template_rule(m) in stored and not (SAFETY_RE.search(m['subject']) or CONDITIONAL_RE.search(m['subject'])):
+                if self._template_rule(m) in stored and not (SAFETY_RE.search(m['subject']) or CONDITIONAL_RE.search(self._mask(m['subject']))):
                     residual = residual.replace(m.group(0), ' ')
             if PROHIBIT_RE.search(sent):
                 objs = self.resolve_objects(sent); forbidden.extend(objs)
                 if objs: residual = PROHIBIT_RE.sub(' ', residual)
-            elif NEG_HANDLE_RE.search(sent) and named and set(named) <= banned:
-                residual = ''
-            unscoped = ['*'] if MOTION_RE.search(sent) or SAFETY_RE.search(sent) else []
-            if CONDITIONAL_RE.search(sent):
-                scope = named or unscoped
-                if scope: pending.append(('Conditional exception; structured review required: '+sent.strip()[:300], scope))
-            elif SAFETY_RE.search(residual) or PROHIBIT_RE.search(residual):
-                scope = named or (['*'] if MOTION_RE.search(sent) or PROHIBIT_RE.search(sent) else [])
-                if scope: pending.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], scope))
+            elif (NEG_HANDLE_RE.search(sent) or HAZARD_RE.search(masked)) and named and set(named) <= banned and not CONDITIONAL_RE.search(masked):
+                residual = ''                             # a reviewer's total ban on exactly these objects covers it
+            rest = self._mask(residual)
+            if CONDITIONAL_RE.search(masked):            # a conditional is never resolved: no structured form holds it
+                pending.append(('Conditional exception; structured review required: '+quote(sent), named or ['*']))
+            elif HAZARD_RE.search(rest):                 # a hazard or permission, unparsed: fail closed
+                pending.append(('Unparsed hazard or permission; structured review required: '+quote(sent), named or ['*']))
+            elif SAFETY_RE.search(rest) or PROHIBIT_RE.search(residual):
+                scope = named or (['*'] if MOTION_RE.search(rest) or PROHIBIT_RE.search(residual) else [])
+                if scope: pending.append(('Unparsed safety statement; structured review required: '+quote(sent), scope))
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
@@ -403,6 +433,10 @@ class Store:
                     self.conn.execute('DELETE FROM source_chunk_fts WHERE chunk_id=?', (r['id'],))
                 self.conn.execute("UPDATE source_chunk SET text='[deleted]',end_char=start_char WHERE source_id=?", (sid,))
             self._bump()
+            # A removed instruction cannot wake a pending commitment later; one whose effect started keeps its real
+            # outcome. Withdrawn first, so the invalidation below (which settles commitments too) finds it cancelled.
+            for t in self.rows("SELECT id FROM prospective_task WHERE source_id=? AND status IN ('waiting','fired')", (sid,)):
+                self.withdraw_commitment(t['id'], 'source withdrawn')
             self.invalidate()
             if delete:
                 # Remove retained source-text copies from public memory projections.
@@ -411,17 +445,31 @@ class Store:
                         self.conn.execute("UPDATE cx_derived SET payload_json='{\"redacted\":true}',status='DELETED' WHERE id=?",(d['id'],))
                 for e in self.rows('SELECT id,evidence_json FROM episode WHERE evidence_json IS NOT NULL'):
                     meta=json.loads(e['evidence_json'])
-                    evid=meta.get('bundle',{}).get('evidence',[])
-                    if any(x.get('source_id')==sid for x in evid):
+                    if sid in canonical(meta.get('bundle',{})):        # anywhere in the bundle, not only its evidence list
                         meta['bundle']={'redacted':True,'reason':'source removed'}
                         self.conn.execute('UPDATE episode SET evidence_json=? WHERE id=?',(canonical(meta),e['id']))
                 for k in self.rows("SELECT id,definition_json FROM skill_version WHERE status='REVOKED'"):
                     definition=json.loads(k['definition_json'])
                     if 'source:'+sid in definition.get('refs',[]):
                         self.conn.execute("UPDATE skill_version SET definition_json='{\"redacted\":true}' WHERE id=?",(k['id'],))
-            # A removed instruction cannot wake a pending commitment later; one whose effect started keeps its real outcome.
-            for t in self.rows("SELECT id FROM prospective_task WHERE source_id=? AND status IN ('waiting','fired')", (sid,)):
-                self.withdraw_commitment(t['id'], 'source withdrawn')
+            if delete:
+                # Every other copy of the text goes too: unresolved reasons, declared facts, task aliases, the commitment's
+                # trigger and request, and the requests of the episodes it woke (with their search rows).
+                self.conn.execute('DELETE FROM cx_unresolved WHERE source_id=?', (sid,))
+                self.conn.execute("UPDATE assertion SET subject='[deleted]',predicate='[deleted]',object='[deleted]' WHERE source_id=? AND id IN (SELECT assertion_id FROM cx_fact)", (sid,))
+                self.conn.execute('DELETE FROM cx_goal WHERE source_id=?', (sid,))
+                woke = [r['proposal_id'] for r in self.rows('SELECT proposal_id FROM prospective_task WHERE source_id=? AND proposal_id IS NOT NULL', (sid,))]
+                self.conn.execute("UPDATE prospective_task SET trigger='[deleted]',goal='[deleted]',request='[deleted]' WHERE source_id=?", (sid,))
+                for ep in woke:
+                    self.conn.execute("UPDATE episode SET request='[deleted]',evidence_json=NULL WHERE id=?", (ep,))
+                    self.conn.execute('DELETE FROM cx_episode_fts WHERE episode_id=?', (ep,))
+        if delete:
+            # ...and no residue stays on disk: full-text segments rebuilt without it, freed pages zeroed (secure_delete),
+            # the write-ahead log checkpointed and truncated.
+            with self.tx():
+                self.conn.execute("INSERT INTO source_chunk_fts(source_chunk_fts) VALUES('optimize')")
+                self.conn.execute("INSERT INTO cx_episode_fts(cx_episode_fts) VALUES('optimize')")
+            if self.path != ':memory:' and self._depth == 0: self.conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
 
     def settle(self, ep: str, outcome: str, allowed: tuple, failure: str | None = None) -> bool:
         """The one guarded episode transition; the linked commitment follows in the same transaction."""
@@ -498,11 +546,13 @@ class Store:
         payload['prohibitions'] = self.prohibitions(ids)
         return digest(payload)
 
-    def evidence(self, chunk_id: str, *, history: bool = False) -> dict:
-        r = self.one('SELECT c.*,s.title,x.status,x.revision,x.cloud_ok FROM source_chunk c JOIN source s ON s.id=c.source_id '
+    def evidence(self, chunk_id: str, *, history: bool = False, principal: str | None = None) -> dict:
+        r = self.one('SELECT c.*,s.title,s.kind,s.origin,x.status,x.revision,x.cloud_ok FROM source_chunk c JOIN source s ON s.id=c.source_id '
                      'JOIN cx_source x ON x.source_id=s.id WHERE c.id=? AND x.workspace=?', (chunk_id, self.workspace))
         if not r or r['status'] in {'deleted','revoked'} or (not history and r['status'] != 'accepted'):
             raise Missing('evidence is unavailable, revoked or superseded')
+        if principal is not None and r['kind'] == 'future' and r['origin'] != principal:
+            raise Missing('evidence is unavailable, revoked or superseded')    # another owner's commitment
         return r
 
     def search(self, query: str, limit: int = 5) -> list[dict]:
@@ -512,7 +562,7 @@ class Store:
         q = ' OR '.join('"'+t+'"' for t in tokens)
         return self.rows("SELECT c.id chunk_id,c.source_id,c.text,c.start_char,c.end_char,s.title,x.revision,x.cloud_ok,bm25(source_chunk_fts) score "
                          "FROM source_chunk_fts f JOIN source_chunk c ON c.id=f.chunk_id JOIN source s ON s.id=c.source_id "
-                         "JOIN cx_source x ON x.source_id=s.id WHERE source_chunk_fts MATCH ? AND x.workspace=? AND x.status='accepted' ORDER BY score,c.id LIMIT ?",
+                         "JOIN cx_source x ON x.source_id=s.id WHERE source_chunk_fts MATCH ? AND x.workspace=? AND x.status='accepted' AND s.kind!='future' ORDER BY score,c.id LIMIT ?",
                          (q, self.workspace, min(max(int(limit),1),20)))
 
     def bundle(self, request: str, goal: Goal | None = None, *, principal: str | None = None) -> dict:
@@ -554,7 +604,7 @@ class Store:
         prospective=self.rows("SELECT p.id,p.request,p.trigger,p.status FROM prospective_task p LEFT JOIN cx_commitment c ON c.id=p.id WHERE p.status IN ('waiting','fired','unknown') AND (? IS NULL OR c.owner=?) ORDER BY p.created_at DESC LIMIT 3",(principal,principal))
         approved=self.rows("SELECT v.id,v.name,v.digest FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' AND c.goal_key=? LIMIT 3",(goal.key() if goal else '',))
         related_derived=[]
-        for d in self.derived()[-32:]:
+        for d in self.derived(limit=32):
             if d['status']=='VERIFIED' and self.refs_valid(d['refs']) and (not goal or d['basis_hash']==self.basis(goal)):
                 related_derived.append({'id':d['id'],'kind':d['kind'],'payload':d['payload'],'refs':d['refs']})
         optional={'related_episodes':episodes,'prospective':prospective,'applicable_skills':approved,'derived':related_derived[:3],
@@ -638,13 +688,14 @@ class Store:
                               (did,kind,'VERIFIED' if verified else 'CANDIDATE',canonical(payload),canonical(sorted(set(refs))),basis,fp,origin,verifier,self.clock()))
         return self.derived(did)
 
-    def derived(self, did: str | None = None, *, include_stale: bool = False) -> dict | list[dict]:
+    def derived(self, did: str | None = None, *, include_stale: bool = False, limit: int | None = None) -> dict | list[dict]:
         sql, args = 'SELECT * FROM cx_derived', ()
         if did:
             sql += ' WHERE id=?'; args=(did,)
         elif not include_stale:
             sql += " WHERE status IN ('CANDIDATE','VERIFIED')"
-        rows = self.rows(sql+' ORDER BY created_at,id', args)
+        if limit is None: rows = self.rows(sql+' ORDER BY created_at,id', args)
+        else: rows = self.rows(sql+' ORDER BY created_at DESC,id DESC LIMIT ?', (*args, int(limit)))[::-1]   # the newest, oldest first
         for r in rows:
             r['payload']=json.loads(r.pop('payload_json')); r['refs']=json.loads(r.pop('refs_json'))
         if did:
@@ -673,7 +724,7 @@ class Store:
                 try:
                     p=json.loads(r['plan_json']); valid=(not r['skill_id'] or r['skill_status']=='APPROVED') and self.refs_valid(p['refs']) and p['basis']==self.basis(Goal.from_dict(p['goal']))
                 except (CortexError,KeyError,TypeError,ValueError): valid=False
-                if not valid:self.conn.execute("UPDATE episode SET outcome='invalidated',failure='dependency changed',finished_at=? WHERE id=?",(self.clock(),r['id']))
+                if not valid:self.settle(r['id'],'invalidated',('proposed',),'dependency changed')   # the commitment follows in this transaction
 
     def decision(self, stage: str, provider: str, model: str | None, accepted: bool, detail: str) -> None:
         with self.tx():

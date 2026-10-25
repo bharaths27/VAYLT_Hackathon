@@ -288,7 +288,7 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.get('/memory/derived')
     def derived(principal=Depends(operator)):return b.store.derived()
     @app.get('/evidence/{cid}')
-    def evidence(cid:str,principal=Depends(operator)):return b.store.evidence(cid)
+    def evidence(cid:str,principal=Depends(operator)):return b.store.evidence(cid,principal=principal)
     @app.post('/observations/operator')
     def observe(body:Observation,principal=Depends(operator)):
         if b.mode=='PHYSICAL':raise Denied('physical sensor observations must enter through the reviewed hardware integration, not a browser assertion')
