@@ -2,8 +2,9 @@
 
 PcmWindow keeps every sample of the current utterance, in order, up to a maximum duration.
 It never drops the start to make room: the first word may be "don't". When the window is
-full, append() raises AudioOverflow and the window refuses all further audio until reset(),
-so the caller must end the utterance instead of transcribing a clipped one. snapshot()
+full, append() raises AudioOverflow and the utterance is invalid: the window refuses all
+further audio AND every snapshot() until reset(), so nothing can transcribe a clipped
+utterance (the words cut off could be "no, don't"); it must be said again. snapshot()
 returns a 16 kHz mono 16-bit WAV of everything so far, ready for a partial transcript.
 
 WhisperServerClient talks to a resident whisper.cpp server (its HTTP server example,
@@ -99,9 +100,20 @@ class PcmWindow:
         with self._lock:
             return self._size / (SAMPLE_RATE * SAMPLE_WIDTH)
 
-    def snapshot(self) -> bytes:
-        """A complete WAV file of everything heard so far, from the very first sample."""
+    @property
+    def overflowed(self) -> bool:
+        """True once audio was refused for overflow: the utterance is invalid until reset()."""
         with self._lock:
+            return self._full
+
+    def snapshot(self) -> bytes:
+        """A complete WAV file of everything heard so far, from the very first sample.
+
+        Raises AudioOverflow once the utterance overflowed: what was kept is only a prefix of what
+        was said, and must never be transcribed or acted on."""
+        with self._lock:
+            if self._full:
+                raise AudioOverflow("this utterance overflowed the window; it must be said again, not transcribed")
             pcm = b"".join(self._chunks)
         return wav_bytes(pcm)
 
@@ -169,11 +181,31 @@ class WhisperServerClient:
         return " ".join(text.split())
 
 
-_NOISE = re.compile(r"\[[^\]]*\]|\([^)]*\)")   # whisper's non-speech markers: [BLANK_AUDIO], (silence)
+# Whisper marks non-speech as [BLANK_AUDIO] / [MUSIC] or as a parenthesised sound description. A tag
+# is dropped only when the WHOLE of it is such a marker: [BLANK_AUDIO], or an optional known
+# descriptor, a known sound word and an optional "playing" ("[MUSIC]", "(upbeat music)", "(laughs)",
+# "(soft music playing)"). Every word allowed here is checked by a test never to be a negation,
+# correction, stop or deferral cue. Anything else in brackets or parentheses is speech and is kept:
+# "(don't)", "[stop]", "(no, I mean close it)" reach the gate. Same shape as the console's
+# voice_probe sound-tag rule, with the descriptor slot and square brackets allowlisted as well.
+SOUND_DESCRIPTORS = ("upbeat", "soft", "gentle", "light", "dramatic", "loud", "quiet", "calm", "slow",
+                     "tense", "suspenseful", "cheerful", "sad", "mellow", "eerie", "peaceful", "faint",
+                     "distant", "background", "intense", "ambient", "instrumental", "classical", "electronic",
+                     "piano", "guitar", "orchestral", "funky", "jazzy", "somber", "ominous", "bright")
+SOUND_WORDS = ("music", "laugh", "laughs", "laughing", "laughter", "applause", "silence", "noise",
+               "inaudible", "cough", "coughs", "coughing", "sigh", "sighs", "sighing", "breath", "breathing",
+               "breathes", "clap", "claps", "clapping", "static", "beep", "beeps", "beeping", "bell", "bells",
+               "whistle", "whistles", "whistling", "sound", "sounds", "typing", "footsteps", "wind",
+               "foreign language", "blank_audio", "blank audio")
+_DESCRIPTOR_RX = "|".join(SOUND_DESCRIPTORS)
+_SOUND_RX = "|".join(w.replace(" ", r"\s+") for w in SOUND_WORDS)
+_TAG_BODY = rf"\s*(?:(?:{_DESCRIPTOR_RX})\s+)?(?:{_SOUND_RX})(?:\s+playing)?\s*"
+_SOUND_TAG = re.compile(rf"\[{_TAG_BODY}\]|\({_TAG_BODY}\)", re.IGNORECASE)
 
 
 def speech_only(text: str) -> str:
-    return " ".join(_NOISE.sub(" ", text).split())
+    """The transcript without whisper's non-speech markers. Every other word, bracketed or not, is kept."""
+    return " ".join(_SOUND_TAG.sub(" ", text).split())
 
 
 class LiveTranscriber:
@@ -195,6 +227,10 @@ class LiveTranscriber:
     (not cancelled: about 0.47/0.37/0.27 s). The step in progress, mostly the encoder pass, which
     is full size even for short audio, still runs; only the work after it is skipped. For a final
     that never waits behind a partial, give it its own server instance: final_client.
+
+    An utterance whose audio overflowed the window is invalid: from the overflow on, no partial is
+    sent or handed out, and finish() raises AudioOverflow without transcribing anything, so the
+    caller asks for a repeat (VoiceIntegration.finish_live does) and nothing is proposed.
     """
 
     def __init__(self, client: WhisperServerClient, window: PcmWindow, min_audio_s: float = 0.5,
@@ -218,22 +254,28 @@ class LiveTranscriber:
         self._thread.start()
 
     def poll(self) -> tuple[int, str] | None:
-        """The newest partial (revision, text) not taken yet, or None. Never one after finish()."""
+        """The newest partial (revision, text) not taken yet, or None. Never one after finish(), and
+        never one of an utterance that overflowed."""
         with self._lock:
             p, self._slot = self._slot, None
-            return None if self._ended.is_set() else p
+            return None if self._ended.is_set() or self._window.overflowed else p
 
     def finish(self, join_s: float = 1.0) -> str:
-        """End of speech: stop and cancel partials, then transcribe everything heard."""
+        """End of speech: stop and cancel partials, then transcribe everything heard.
+
+        Raises AudioOverflow, sending nothing, if the utterance overflowed the window."""
         with self._lock:
             self._ended.set()      # from now on: no new partial, and poll() hands out nothing
             token = self._token
         if token is not None:
             token.cancel()
-        text = speech_only(self._final_client.transcribe(self._window.snapshot()))
-        if self._thread is not None:
-            self._thread.join(join_s)
-        return text
+        try:
+            if self._window.overflowed:
+                raise AudioOverflow("the utterance overflowed the window; it must be said again")
+            return speech_only(self._final_client.transcribe(self._window.snapshot()))
+        finally:
+            if self._thread is not None:
+                self._thread.join(join_s)
 
     def _loop(self) -> None:
         heard = 0.0
@@ -254,6 +296,8 @@ class LiveTranscriber:
                 with self._lock:
                     self.cancelled += 1
                 break
+            except AudioOverflow:      # snapshot() refuses an overflowed utterance: no more partials
+                break
             except WhisperError:
                 text = ""
             finally:
@@ -261,7 +305,7 @@ class LiveTranscriber:
                     self._token = None
             heard = dur
             with self._lock:
-                if self._ended.is_set():
+                if self._ended.is_set() or self._window.overflowed:
                     break
                 if text:
                     self._revision += 1

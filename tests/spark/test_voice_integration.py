@@ -1,6 +1,7 @@
 """Voice presets reach the real Engine only as unapproved proposals or future tasks."""
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from engram.db import SCHEMA
 from engram.engine import Engine, EngineError
 from engram.planner import refusal
 from engram.robot.mock import MockRobot
+from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscriber, PcmWindow
 from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
 from engram.spark.voice_integration import VoiceIntegration, memory_version
@@ -227,3 +229,50 @@ def test_fixed_requests_only_exist_once_registered(engine, fake):
     assert engine.command("open the gripper.")["status"] == "proposed"
     assert engine.command("Don't open the gripper")["status"] == "refused"
     assert engine.robot.calls == OBSERVED_ONLY
+
+
+class _InstantWhisper:
+    """Transcribes every window as the same words, instantly."""
+
+    def __init__(self, text="Open the claw"):
+        self.text, self.calls = text, []
+
+    def transcribe(self, wav, cancel=None):
+        self.calls.append("partial" if cancel is not None else "final")
+        return self.text
+
+
+def _live_partials(voice, utterance, window, stt, spawn):
+    """Feed 0.6 s of audio, take the first partial through the gate, let the gate classify it."""
+    window.append(b"\x01\x00" * int(0.6 * SAMPLE_RATE))
+    tr = LiveTranscriber(stt, window, poll_s=0.005)
+    tr.start()
+    end, got = time.monotonic() + 2.0, None
+    while got is None and time.monotonic() < end:
+        got = tr.poll()
+        time.sleep(0.005)
+    assert got is not None
+    voice.on_partial(utterance, got[0], got[1])
+    spawn.run_all()
+    return tr
+
+
+def test_an_overflowed_utterance_can_never_reach_a_proposal(taught, spawn, clock):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=1.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)
+    assert voice.gate.prepared().decision.preset == "open_gripper"   # the partials prepared a preset
+    with pytest.raises(AudioOverflow):
+        window.append(b"\x01\x00" * int(0.6 * SAMPLE_RATE))           # "...no, don't" never fits
+    out = voice.finish_live(1, 99, tr)
+    assert out["kind"] == "clarify" and "say it again" in out["reason"]
+    assert stt.calls.count("final") == 0                              # no final transcript at all
+    assert voice.gate.prepared() is None                              # what the partials prepared is void
+    assert voice.on_final(1, 100, "Open the claw")["kind"] == "ignored"   # and can never be reused
+    assert nothing_happened(taught)
+    # Control: the next utterance, which fits, still becomes a proposal through the same path.
+    stt2, window2 = _InstantWhisper(), PcmWindow(max_seconds=1.0)
+    tr2 = _live_partials(voice, 2, window2, stt2, spawn)
+    done = voice.finish_live(2, 99, tr2)
+    assert done["kind"] == "proposal" and done["status"] == "proposed" and done["reused_prediction"]
+    assert taught.robot.calls == OBSERVED_ONLY

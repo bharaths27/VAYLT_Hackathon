@@ -12,10 +12,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import pytest
 
 from engram.spark import _http
+from engram.planner import FUTURE_HINTS, NEGATION
 from engram.spark.audio_windows import (
-    SAMPLE_RATE, AudioOverflow, Cancelled, CancelToken, LiveTranscriber, OutOfOrder, PcmWindow,
-    WhisperError, WhisperServerClient,
+    SAMPLE_RATE, SOUND_DESCRIPTORS, SOUND_WORDS, AudioOverflow, Cancelled, CancelToken, LiveTranscriber, OutOfOrder,
+    PcmWindow, WhisperError, WhisperServerClient, speech_only,
 )
+from engram.spark.voice import CORRECTION, STOP_WORDS
 
 
 def pcm(*samples):
@@ -41,15 +43,19 @@ def test_empty_snapshot_is_still_a_valid_wav():
     assert read_wav(PcmWindow().snapshot()) == (16000, 1, 2, b"")
 
 
-def test_overflow_is_refused_and_the_start_of_the_utterance_is_kept():
+def test_overflow_never_drops_the_start_and_makes_the_utterance_invalid():
     w = PcmWindow(max_seconds=0.001)               # 16 samples
     w.append(pcm(*range(10)))                      # e.g. "don't"
+    assert read_wav(w.snapshot())[3] == pcm(*range(10)) and not w.overflowed
     with pytest.raises(AudioOverflow):
-        w.append(pcm(*range(10)))
+        w.append(pcm(*range(10)))                  # the rest, e.g. "...no, never mind", does not fit
+    assert w.overflowed
     with pytest.raises(AudioOverflow):              # full from now on: no hole in the middle of the utterance
         w.append(pcm(1))
-    assert read_wav(w.snapshot())[3] == pcm(*range(10))
+    with pytest.raises(AudioOverflow):              # and the prefix that was kept is never transcribed
+        w.snapshot()
     w.reset()
+    assert not w.overflowed
     w.append(pcm(7))
     assert read_wav(w.snapshot())[3] == pcm(7)
 
@@ -384,3 +390,85 @@ def test_no_partial_starts_after_end_of_speech_even_when_none_was_in_flight():
     _speech(window, 1.0)                                        # new audio after the end of speech
     time.sleep(0.15)
     assert fake.calls.count('partial') == 1 and tr.cancelled == 0
+
+
+# ---- whisper's noise tags: only known markers are dropped --------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "Open the claw (don't)",
+    "Open the claw [don't]",
+    "Open the claw (do not)",
+    "Open the claw (no, I mean close it)",
+    "Open the claw [actually, close it]",
+    "Open the claw (stop)",
+    "[STOP] Open the claw",
+    "Open the claw (after calibration)",
+    "Open the claw (later)",
+    "Open the claw (no music)",          # "no" is a cue, not a sound descriptor
+    "Open the claw (stop music)",
+    "(don't laugh) Open the claw",
+    "(upbeat music and don't)",          # a tag is dropped only as a whole
+    "(I like music)",
+])
+def test_speech_inside_brackets_or_parentheses_is_kept(text):
+    assert speech_only(text) == text
+
+
+@pytest.mark.parametrize("text,clean", [
+    ("[BLANK_AUDIO]", ""),
+    ("[BLANK_AUDIO] Open the claw.", "Open the claw."),
+    ("Open the claw. [MUSIC]", "Open the claw."),
+    ("(upbeat music) Open the claw", "Open the claw"),
+    ("Open (laughs) the claw", "Open the claw"),
+    ("( soft music playing ) Close the claw", "Close the claw"),
+    ("[ Silence ] Look around", "Look around"),
+    ("Open the claw (applause)", "Open the claw"),
+    ("(wind) Open the claw (coughing)", "Open the claw"),
+    ("[Music] [BLANK_AUDIO]", ""),
+])
+def test_known_noise_tags_are_dropped(text, clean):
+    assert speech_only(text) == clean
+
+
+def test_no_word_the_noise_rule_can_drop_is_a_safety_cue():
+    words = [w for phrase in SOUND_DESCRIPTORS + SOUND_WORDS + ("playing",) for w in phrase.split()]
+    for w in words:
+        for rx in (NEGATION, FUTURE_HINTS, CORRECTION, STOP_WORDS):
+            assert not rx.search(w), (w, rx.pattern)
+
+
+# ---- an overflowed utterance is invalid ------------------------------------------------------------------------
+
+
+def test_an_overflowed_utterance_never_yields_a_final_transcript():
+    fake, window = _FakeWhisper(), PcmWindow(max_seconds=1.0)
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.started.acquire(timeout=2)                      # a partial of the first 0.6 s is in flight
+    with pytest.raises(AudioOverflow):
+        _speech(window, 0.6)                                    # the rest does not fit
+    fake.release.set()                                          # the partial answers after the overflow...
+    time.sleep(0.1)
+    assert tr.poll() is None                                    # ...and is never handed out
+    with pytest.raises(AudioOverflow):
+        tr.finish()                                             # no final transcript of the kept prefix
+    assert fake.calls == ["partial"]                            # nothing more was sent
+
+
+def test_partials_stop_once_the_utterance_overflowed(monkeypatch):
+    crashed = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: crashed.append(args.exc_type))
+    fake, window = _FakeWhisper(), PcmWindow(max_seconds=1.0)
+    fake.release.set()
+    _speech(window, 0.6)
+    with pytest.raises(AudioOverflow):
+        _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    time.sleep(0.15)
+    assert fake.calls == [] and tr.poll() is None               # the overflowed window is never sent
+    with pytest.raises(AudioOverflow):
+        tr.finish()
+    assert fake.calls == [] and crashed == []                   # and the worker ended cleanly
