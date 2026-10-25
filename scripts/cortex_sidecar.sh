@@ -63,8 +63,9 @@ try:
 except OSError:pass
 print("ours" if inodes and mine else "not-ours")' "$1" "$PORT"; }
 # The responder is OUR Cortex: /health says cortex, our token is accepted and a wrong one refused. Called only once
-# owns_port showed the listener is our child; redirects are not followed. The token goes via env, not argv.
-ours() { CORTEX_CHECK_TOKEN="$(cat "$TOKEN_FILE")" "$(python_bin)" -c 'import json,os,sys,urllib.error,urllib.request
+# owns_port showed the listener is our child; redirects are not followed. The token is read from its file here,
+# never placed on a command line.
+ours() { "$(python_bin)" -c 'import json,os,sys,urllib.error,urllib.request
 class N(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*a,**k):return None
 def get(path,token=None):
@@ -72,9 +73,9 @@ def get(path,token=None):
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({}),N()).open(r,timeout=2) as x:return x.status,x.read()
     except urllib.error.HTTPError as e:return e.code,b""
-t=os.environ["CORTEX_CHECK_TOKEN"];s,body=get("/health")
+t=open(sys.argv[2],encoding="utf-8").read().strip();s,body=get("/health")
 ok=s==200 and json.loads(body or b"{}").get("service")=="cortex" and get("/camera/status",t)[0]==200 and get("/camera/status","not-"+t)[0]==401
-sys.exit(0 if ok else 1)' "$(url)"; }
+sys.exit(0 if ok else 1)' "$(url)" "$TOKEN_FILE"; }
 # An existing state dir is adopted only if it is a real directory we own with mode 700 (never chmodded here).
 dir_ok() { "$(python_bin)" -c 'import os,stat,sys
 st=os.lstat(sys.argv[1])
@@ -136,9 +137,10 @@ start() {
     [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ] || die "refusing $TOKEN_FILE: not a non-empty regular file"
     chmod 600 "$TOKEN_FILE"
     cd "$REPO"
-    # env -i: exactly this configuration; nothing else from the caller's environment leaks in.
+    # env -i: exactly this configuration; nothing else from the caller's environment leaks in. The token itself is
+    # never an argument (ps, /proc/<pid>/cmdline): the server reads it from the private token file.
     env -i HOME="$HOME" PATH="$PATH" LANG="${LANG:-C.UTF-8}" \
-        CORTEX_API_TOKEN="$(cat "$TOKEN_FILE")" CORTEX_OPERATOR="${CORTEX_OPERATOR:-carther}" \
+        CORTEX_API_TOKEN_FILE="$TOKEN_FILE" CORTEX_OPERATOR="${CORTEX_OPERATOR:-carther}" \
         CORTEX_DB="$DB" ENGRAM_ARENA="$ARENA" \
         CORTEX_LIVE=0 CORTEX_CLOUD=0 CORTEX_QWEN=0 CORTEX_IDLE=1 \
         nohup "$py" -m uvicorn engram.cortex.api:create_app --factory --host "$HOST" --port "$PORT" \
