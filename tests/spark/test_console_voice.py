@@ -1103,7 +1103,7 @@ def test_probe_reports_what_the_path_actually_did(stt, monkeypatch, tmp_path, ca
     voice_probe.main([str(folder)])
     a, b, c, d = json.loads(capsys.readouterr().out)["clips"]
     assert (a["conversion"], b["conversion"], c["conversion"]) == ("native", "native-stripped", "ffmpeg")
-    assert (d["conversion"], d["reason"]) == (None, "audio too long: 3.0 s (limit 2 s)")  # stopped before
+    assert (d["conversion"], d["reason"]) == ("native", "audio too long: 3.0 s (limit 2 s)")  # native, refused on length
 
 
 

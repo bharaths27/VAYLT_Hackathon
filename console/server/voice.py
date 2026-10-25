@@ -409,6 +409,8 @@ def _transcribe_job(audio: bytes, suffix: str, details: dict | None = None) -> t
         src.write_bytes(audio)
         native = _native_data(src)  # reads only the chunk headers
         if native is not None:  # 16 kHz mono 16-bit PCM: never through ffmpeg
+            if details is not None:
+                details["conversion"] = "native"  # recognized as native: ffmpeg is skipped even if it is refused below
             seconds = native[1] / 32000
             if seconds > config.STT_MAX_SECONDS:
                 return None, _too_long(seconds)  # its data chunk alone is too long
