@@ -19,6 +19,7 @@ class Frame:
     captured_at:float|None
     digest:str
     received_mono:float  # receipt on the monotonic clock: what freshness is judged on (a wall clock can step back)
+    capture_age_at_receipt:float|None=None  # wall clock at receipt minus capture time; it then grows on the monotonic clock
 
 class FrameHub:
     """Polls the camera only while someone is watching: a streaming viewer (watch) or a recent
@@ -35,7 +36,8 @@ class FrameHub:
         if captured_at is not None: captured_at=finite(captured_at,'capture time',0,now+1)
         with self.condition:
             self.sequence+=1
-            self.current=Frame(self.sequence,jpeg,now,captured_at,hashlib.sha256(jpeg).hexdigest(),self.monotonic())
+            self.current=Frame(self.sequence,jpeg,now,captured_at,hashlib.sha256(jpeg).hexdigest(),self.monotonic(),
+                               None if captured_at is None else max(0.0,now-captured_at))
             self.error=None;self.condition.notify_all()
     def receipt_age(self,f:Frame)->float:
         return self.monotonic()-f.received_mono
@@ -77,10 +79,12 @@ class FrameHub:
             return f if f and f.seq>after else None
     def metadata(self):
         with self.condition:
-            f=self.current; now=self.clock()
+            f=self.current
             return {'available':f is not None,'seq':f.seq if f else None,'error':self.error,
                 'receipt_age_s':self.receipt_age(f) if f else None,
-                'capture_age_s':max(0,now-f.captured_at) if f and f.captured_at is not None else None,
+                # Its age when it arrived, then advanced on the monotonic clock: a wall clock stepped back never makes an
+                # old frame read as new.
+                'capture_age_s':f.capture_age_at_receipt+self.receipt_age(f) if f and f.capture_age_at_receipt is not None else None,
                 'freshness_basis':'capture' if f and f.captured_at is not None else 'receipt_only_capture_unknown',
                 'buffered_frames':1 if f else 0,'configured_poll_fps':self.fps,'polling':self._viewers>0 or time.monotonic()<self._lease,'viewers':self._viewers}
 

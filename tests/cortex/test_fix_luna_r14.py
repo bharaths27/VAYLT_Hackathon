@@ -223,3 +223,22 @@ def test_a_second_foreground_call_during_a_blocked_dream_is_refused_at_once(monk
     finally:
         release.set();first.join(10);dream.join(10)
     assert results['first'].value['steps']==[{'op':'gripper_open','args':{}}]   # the first is served
+
+
+# P3-5: a frame's capture age is its age when it arrived, advanced on the monotonic clock: a wall clock stepped back
+# never makes an old frame read as new.
+from engram.cortex.media import FrameHub
+
+def test_guard_a_frame_stamped_ahead_of_the_host_clock_ages_from_zero():
+    wall,mono=[1700000000.0],[100.0]
+    hub=FrameHub(lambda:None,clock=lambda:wall[0]);hub.monotonic=lambda:mono[0]
+    hub.publish(bytes([0xff,0xd8])+bytes(16)+bytes([0xff,0xd9]),captured_at=wall[0]+.5)    # the camera's clock runs ahead
+    mono[0]+=2
+    assert hub.metadata()['capture_age_s']==2                                               # never negative
+
+def test_a_wall_clock_stepped_back_never_makes_an_old_frame_read_as_new():
+    wall,mono=[1700000000.0],[100.0]
+    hub=FrameHub(lambda:None,clock=lambda:wall[0]);hub.monotonic=lambda:mono[0]
+    hub.publish(bytes([0xff,0xd8])+bytes(16)+bytes([0xff,0xd9]),captured_at=wall[0]-30)    # thirty seconds old on arrival
+    wall[0]-=3600;mono[0]+=10                                                               # the wall clock steps back an hour
+    m=hub.metadata();assert m['capture_age_s']==40 and m['receipt_age_s']==10,m            # was: 0, an old frame read as new
