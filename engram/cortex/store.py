@@ -709,7 +709,9 @@ class Store:
                          "JOIN cx_source x ON x.source_id=s.id WHERE source_chunk_fts MATCH ? AND x.workspace=? AND x.status='accepted' AND s.kind!='future' ORDER BY score,c.id LIMIT ?",
                          (q, self.workspace, min(max(int(limit),1),20)))
 
-    def bundle(self, request: str, goal: Goal | None = None, *, principal: str | None = None, held: frozenset = frozenset()) -> dict:
+    def bundle(self, request: str, goal: Goal | None = None, *, principal: str | None = None, held: frozenset = frozenset(),
+               episode: str | None = None) -> dict:
+        """The planning packet for a request; `episode` is that request's own, never one of its related episodes."""
         rules = self.related_rules(goal, held) if goal else []
         ids = set(goal.targets if goal else self.resolve_objects(request)) | set(held) | {r['object'] for r in rules}
         objects = [o for o in self.objects() if o['id'] in ids]
@@ -749,8 +751,8 @@ class Store:
             # its cost must not grow with the episode history.
             episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM (SELECT f.episode_id,bm25(cx_episode_fts) score '
                                'FROM cx_episode_fts f JOIN cx_episode c ON c.id=f.episode_id WHERE cx_episode_fts MATCH ? AND c.owner=? '
-                               'ORDER BY f.rowid DESC LIMIT 32) w JOIN episode e ON e.id=w.episode_id JOIN cx_episode c ON c.id=e.id '
-                               'ORDER BY w.score LIMIT 3',(q,principal))
+                               'AND f.episode_id IS NOT ? ORDER BY f.rowid DESC LIMIT 32) w JOIN episode e ON e.id=w.episode_id '
+                               'JOIN cx_episode c ON c.id=e.id ORDER BY w.score LIMIT 3',(q,principal,episode))
         prospective=self.rows("SELECT p.id,p.request,p.trigger,p.status FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.status IN ('waiting','fired','unknown') AND c.owner=? ORDER BY p.created_at DESC LIMIT 3",(principal,))
         approved=self.approved_skills(principal,goal_key=goal.key() if goal else '',limit=3,fields=('id','name','digest'))
         related_derived=[]
@@ -844,6 +846,18 @@ class Store:
                 return False
         return True
 
+    def identity(self, refs: list[str]) -> list[str]:
+        """Refs as identity, for deduplication only (stored refs keep every episode): each episode stands for its owner, so
+        one operator's derivations from different requests of theirs are one, and another operator's never the same."""
+        out = set()
+        for r in refs:
+            if r.startswith('episode:'):
+                o = self.one('SELECT owner FROM cx_episode WHERE id=?', (r[len('episode:'):],))
+                out.add('owner:' + o['owner'] if o else r)
+            else:
+                out.add(r)
+        return sorted(out)
+
     def derive(self, kind: str, payload: dict, refs: list[str], *, origin: str,
                verified: bool = False, verifier: str | None = None, basis: str = '') -> dict:
         """Internal API. Models can call propose_candidate, not set verified=True."""
@@ -855,7 +869,7 @@ class Store:
             raise Stale('derived memory evidence is no longer valid')
         if verified and verifier not in {'symbolic-verifier-v1','dependency-closure-v1','episodic-summary-v1'}:
             raise Denied('only named code verifiers may mark a derivation verified')
-        fp = digest({'kind':kind,'payload':payload,'refs':sorted(set(refs)),'basis':basis})
+        fp = digest({'kind':kind,'payload':payload,'refs':self.identity(refs),'basis':basis})
         with self.tx():
             row = self.one('SELECT * FROM cx_derived WHERE fingerprint=?', (fp,))
             if row:

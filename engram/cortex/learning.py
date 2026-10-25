@@ -22,6 +22,11 @@ from .types import Conflict, CortexError, Denied, Goal, Missing, Stale, canonica
 class Skills:
     def __init__(self, store: Store): self.store=store
 
+    def digest(self, definition: dict) -> str:
+        """A procedure's identity: its definition, each episode it rests on standing for that episode's owner (Store.identity).
+        One operator's repeats are one procedure; another operator's is never the same one."""
+        return digest({**definition,'refs':self.store.identity(definition['refs'])}) if 'refs' in definition else digest(definition)
+
     def get(self, sid: str) -> dict:
         r=self.store.one('SELECT v.*,c.goal_key,c.basis_hash,c.policy_hash,c.validation_json,c.mode FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.id=?',(sid,))
         if not r: raise Missing('skill not found in the Cortex registry')
@@ -41,7 +46,7 @@ class Skills:
         definition={k:plan[k] for k in ('goal','steps','rules_used','evidence','refs','basis','policy_hash')}
         definition['refs']=self.identity_refs(goal,refs)
         definition['effect_contract']='Only the exact typed goal; physical execution always needs current approval.'
-        d=digest(definition)
+        d=self.digest(definition)
         with self.store.tx():
             old=self.store.one("SELECT id FROM skill_version WHERE digest=? AND status!='REVOKED'",(d,))
             if old: return self.get(old['id'])
@@ -55,7 +60,7 @@ class Skills:
     def test(self, sid: str, fixture: dict | None=None) -> dict:
         s=self.get(sid); d=s['definition']; g=Goal.from_dict(d['goal'])
         if s['status'] not in {'CANDIDATE','TESTED'}: raise Conflict('only a candidate/tested skill may be validated')
-        if digest(d)!=s['digest'] or not self.store.refs_valid(d['refs']): raise Stale('skill or its evidence changed')
+        if self.digest(d)!=s['digest'] or not self.store.refs_valid(d['refs']): raise Stale('skill or its evidence changed')
         compiler=Compiler(self.store)
         f=copy.deepcopy(fixture or compiler.fixture(symbolic=True))
         # Validate on multiple controlled arrangements, not merely its authored example.
@@ -106,7 +111,7 @@ class Skills:
             s=self.get(sid); d=s['definition']; g=Goal.from_dict(d['goal'])
             if s['status']!='TESTED' or not s['validation'] or not s['validation']['ok']:
                 raise Denied('independent verification must pass before publication')
-            if supplied_digest!=s['digest'] or digest(d)!=s['digest']: raise Conflict('skill digest changed')
+            if supplied_digest!=s['digest'] or self.digest(d)!=s['digest']: raise Conflict('skill digest changed')
             if self.store.basis(g)!=d['basis'] or d['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(d['refs']):
                 raise Stale('skill dependencies changed')
             self.store.conn.execute("UPDATE skill_version SET status='APPROVED',approved_at=?,approved_by=? WHERE id=?",(self.store.clock(),principal,sid))
@@ -121,10 +126,11 @@ class Skills:
             self.store.invalidate()
 
     def identity_refs(self, goal: Goal, refs: list[str]) -> list[str]:
-        """The refs that identify a procedure: the sources and rules it rests on, which revocation follows. What only
-        entered the prompt changes with every request: episodes are dropped, and a derived memory (often this very
-        system's last recipe) is replaced by the sources and rules it cites, so revoking those still reaches the
-        procedure. A goal with no other provenance keeps its anchor, the first request that asked for it."""
+        """The refs that identify a procedure: everything it rests on, which revocation, purging and privacy follow. A
+        derived memory (often this very system's last recipe) is replaced by what it cites, so revoking that still reaches
+        the procedure. Every episode stays: one an operator's plan rests on (a goal's anchor, a past request the model was
+        shown) keeps the procedure that operator's (Store.visible) and revokes it when purged. Nothing in the refs changes
+        with each request: the request's own episode is never among them (Store.bundle leaves it out)."""
         core,todo,seen=set(),list(refs),set()
         while todo:
             r=todo.pop()
@@ -133,20 +139,12 @@ class Skills:
             if r.startswith('derived:'):
                 row=self.store.one('SELECT refs_json FROM cx_derived WHERE id=?',(r[8:],))
                 todo+=json.loads(row['refs_json']) if row else [r]
-            elif not r.startswith('episode:'): core.add(r)
-        if core: return sorted(core)
-        anchors=[r for r in refs if r.startswith('episode:') and self._anchor(goal,r[len('episode:'):])]
-        return sorted(set(anchors)) if anchors else sorted(set(refs))
+            else: core.add(r)
+        return sorted(core)
 
     @staticmethod
     def _anchor_key(goal: Goal, principal: str) -> str:
         return 'cx_goal_anchor:'+principal+':'+goal.key()
-
-    def _anchor(self, goal: Goal, episode_id: str) -> bool:
-        """Whether this episode is its owner's anchor for the goal (that owner's first request for it)."""
-        o=self.store.one('SELECT owner FROM cx_episode WHERE id=?',(episode_id,))
-        a=o and self.store.one('SELECT value FROM meta WHERE key=?',(self._anchor_key(goal,o['owner']),))
-        return bool(a) and a['value']==episode_id
 
     def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None, *, principal: str) -> list[str]:
         """Refs a command adds to its plan. Commands are episodes, not sources, so a recipe or
@@ -168,7 +166,7 @@ class Skills:
         # Hot path: an indexed lookup by goal, each candidate validated below; no vault rescan.
         for r in self.store.rows("SELECT c.id FROM cx_skill c JOIN skill_version s ON s.id=c.id WHERE c.goal_key=? AND s.status='APPROVED' ORDER BY s.approved_at DESC",(goal.key(),)):
             s=self.get(r['id']); d=s['definition']
-            if (digest(d)==s['digest'] and d['basis']==self.store.basis(goal) and d['policy_hash']==self.store.policy.fingerprint()
+            if (self.digest(d)==s['digest'] and d['basis']==self.store.basis(goal) and d['policy_hash']==self.store.policy.fingerprint()
                     and s['validation'] and s['validation']['definition_digest']==s['digest'] and self.store.refs_valid(d['refs'])
                     and self.store.visible(d['refs'],principal)):
                 return s

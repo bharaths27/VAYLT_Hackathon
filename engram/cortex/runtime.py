@@ -171,7 +171,7 @@ class Brain:
             try:
                 # A command is an episode, not a source: it is never recalled as knowledge.
                 refs=self.skills.provenance(goal,ep,extra_refs,principal=principal)
-                bundle=self.store.bundle(request,goal,principal=principal,held=held)
+                bundle=self.store.bundle(request,goal,principal=principal,held=held,episode=ep)
                 # Optional relevance advice ranks only explicitly cloud-permitted evidence.
                 shareable=[e for e in bundle['evidence'] if e.get('cloud_ok')]
                 if shareable:

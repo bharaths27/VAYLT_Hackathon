@@ -67,3 +67,32 @@ def test_guard_a_stop_the_adapter_does_not_confirm_on_restart_keeps_the_latch(tm
     assert robot.stops==1 and b.store.one(LATCH) and b._stopped.is_set()
     assert b.store.one(LAST_STOP)['status']=='requested'                                    # recorded as unconfirmed
     b.close()
+
+
+# P1-2 (class B): a procedure keeps the owner-scoped episodes it rests on. Alice's model plan was shown her private
+# episode and a shared SOP: Bob can never find or be offered the procedure, and purging her episode revokes it.
+from .test_fix_learn_verifier import GOOD_B,_model_brain
+SOP='Safety goggles must be at the ppe station before handling Sample B.'
+
+def test_a_procedure_resting_on_her_episode_and_a_shared_rule_stays_hers(arena,clock):
+    b,_=_model_brain(arena,clock,GOOD_B);s=b.store                                         # model first, auto-publish
+    s.teach('SOP',SOP,owner='alice')
+    routine=s.teach('Routine','Visiting the shelf is part of the round.',owner='alice',goal_definitions={'visit the shelf':{'kind':'goto','zone':'shelf_b'}})['source_id']
+    first=b.command('visit the shelf',principal='alice');b.reject(first['operation_id'],principal='alice')   # her own episode
+    p=b.command('Bring Sample B to the bench.',principal='alice')
+    assert p['source']=='model' and 'episode:'+first['operation_id'] in p['plan']['refs']   # it was in her prompt
+    goal=Goal('fetch',('sample_b',),'bench');skill=b.skills.find(goal,'alice')
+    assert skill and 'episode:'+first['operation_id'] in skill['definition']['refs']      # was: only the SOP's refs
+    assert b.skills.find(goal,'bob') is None                                               # was: Bob found and reused it
+    assert not s.bundle('Bring Sample B to the bench',goal,principal='bob')['applicable_skills']
+    s.revoke_source(routine,delete=True)                                                   # her episode is purged
+    assert b.skills.get(skill['id'])['status']=='REVOKED'                                  # was: still approved
+    b.close()
+
+def test_guard_a_requests_own_episode_is_never_among_its_related_episodes(store):
+    with store.tx():
+        for ep in ('ep_old','ep_now'):
+            store.conn.execute('INSERT INTO episode(id,goal,request,outcome,started_at) VALUES(?,?,?,?,?)',(ep,'{}','Bring Sample B to bench','rejected',1))
+            store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',(ep,'SIMULATED','{}','','','{}',None,'',0,'op'))
+    related=store.bundle('Bring Sample B to bench',Goal('fetch',('sample_b',),'bench'),principal='op',episode='ep_now')['related_episodes']
+    assert [e['id'] for e in related]==['ep_old']

@@ -86,16 +86,19 @@ def test_a_hard_linked_vault_is_refused(tmp_path):
         with pytest.raises(Conflict,match='hard link'):Store(p)
 
 
-# P2-5: prompt episodes are no part of a procedure's identity: repeats reuse one candidate and one recipe.
+# P2-5: repeats do not grow the procedures and recipes. Since round 13 a prompt episode is part of a procedure (it keeps
+# it its owner's) and of its identity as that owner (Store.identity): the first request, no episode of its owner in its
+# prompt, makes a shared candidate; every repeat after it reuses one candidate and one recipe resting on the owner's.
 def test_repeated_model_first_requests_reuse_one_candidate_and_recipe(arena,clock):
     b,calls=_model_brain(arena,clock,GOOD_B,policy=Policy())                       # no auto-publish: the model is asked every time
     src=b.store.teach('Lab rule',RULE_TEXT,owner='op')
-    for _ in range(3):
+    for _ in range(4):
         p=b.command('Bring Sample B to bench',principal='op');assert p['source']=='model'
         b.reject(p['operation_id'],principal='op');clock.advance(1)
-    assert sum(1 for url,_ in calls if url.endswith('/completion'))==3
-    assert b.store.one('SELECT COUNT(*) n FROM skill_version')['n']==1
-    assert b.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='task_recipe'")['n']==1
-    k=b.store.one('SELECT definition_json FROM skill_version')['definition_json']
-    assert 'source:'+src['source_id'] in k and 'episode:' not in k                # revocation still follows the source
+    assert sum(1 for url,_ in calls if url.endswith('/completion'))==4
+    assert b.store.one('SELECT COUNT(*) n FROM skill_version')['n']==2                # shared, then the owner's: no growth
+    assert b.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='task_recipe'")['n']==2
+    defs=[r['definition_json'] for r in b.store.rows('SELECT definition_json FROM skill_version ORDER BY created_at')]
+    assert all('source:'+src['source_id'] in k for k in defs)                         # revocation still follows the source
+    assert 'episode:' not in defs[0] and 'episode:' in defs[1]                        # the second rests on its owner's episodes
     b.close()
