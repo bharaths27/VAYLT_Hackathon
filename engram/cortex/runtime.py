@@ -39,9 +39,13 @@ class Brain:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
         if self.mode=='PHYSICAL' and synthetic_seed_present(store):
             raise Denied('this vault contains synthetic seed data (scripts/cortex_seed.py); a physical runtime must start on a separate, unseeded vault (set CORTEX_DB to a new file)')
-        store.runtime_mode=self.mode   # only a runtime that actually starts owns the vault's mode (load_seed checks it)
         if acquire_lock and store.path!=':memory:' and store.file_lock is None:
             self._file_lock=vault_lock.acquire(store.path)
+        # Unresolved physical effects must survive a restart, and one process must own the robot: a physical runtime
+        # needs a file-backed vault that this process holds the exclusive lock of.
+        if self.mode=='PHYSICAL' and (store.path==':memory:' or not (store.file_lock or self._file_lock)):
+            raise Denied('a physical runtime needs a durable vault it holds the exclusive lock of: open a file-backed Store (CORTEX_DB)')
+        store.runtime_mode=self.mode   # only a runtime that actually starts owns the vault's mode (load_seed checks it)
         self.recover()
         if qwen: store.manifest('qwen','parametric',qwen.manifest())
         store.manifest('intent','parametric',{'model':self.intent.model or None,'enabled':store.policy.cloud_enabled,
@@ -172,7 +176,7 @@ class Brain:
                     if plan is None:
                         plan=self.compiler.compile(goal,fixture); source='fallback' if calls else 'composed'
                     plan['refs']=sorted(set(plan['refs']+refs))
-                    d=self.store.derive('task_recipe',{'task':goal.to_dict(),'steps':plan['steps'],'mode':'SIMULATED_VERIFICATION'},plan['refs'],
+                    d=self.store.derive('task_recipe',{'task':goal.to_dict(),'steps':plan['steps'],'mode':'SIMULATED_VERIFICATION'},self.skills.identity_refs(goal,plan['refs']),
                         origin='new_task_synthesis',verified=True,verifier='symbolic-verifier-v1',basis=plan['basis'])
                     derived_id=d['id']
                     # Re-read the newly acquired task recipe: it is the execution input,

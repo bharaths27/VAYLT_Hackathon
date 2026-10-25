@@ -312,14 +312,14 @@ class Store:
         # own wording only: a prerequisite-template clause whose rule is stored as written (a reviewer's rule or an
         # extracted one, its clause carrying nothing else), a prohibition whose objects are prohibited, or a negated
         # handling sentence about reviewer-prohibited objects alone. A conditional is never resolved: no structured
-        # form expresses its exception. Whatever safety wording remains is an unresolved constraint, scoped to what
-        # the sentence names (else the source); a motion statement naming nothing registered is scoped to everything.
+        # form expresses its exception. Whatever safety wording remains is an unresolved constraint, scoped by the
+        # names in its OWN sentence; with none of its own it is global (nothing is inherited from the document).
         stored = {(r.get('subject'), r.get('prerequisite'), r.get('required_zone')) for r in extracted if isinstance(r, dict)}
         banned = set(forbidden)
         # A commitment's text is its owner's: its unresolved reasons do not copy it into shared memory.
         quote = (lambda s: '(commitment text withheld)') if kind == 'future' else (lambda s: s.strip()[:300])
         for sent in sentences:
-            named = self.named(sent) or self.named(body)
+            named = self.named(sent)                      # its own names only
             masked = self._mask(sent)                     # registered names never count as wording ("Safety goggles")
             residual = sent
             for m in RULE_RE.finditer(sent):
@@ -336,8 +336,7 @@ class Store:
             elif HAZARD_RE.search(rest):                 # a hazard or permission, unparsed: fail closed
                 pending.append(('Unparsed hazard or permission; structured review required: '+quote(sent), named or ['*']))
             elif SAFETY_RE.search(rest) or PROHIBIT_RE.search(residual):
-                scope = named or (['*'] if MOTION_RE.search(rest) or PROHIBIT_RE.search(residual) else [])
-                if scope: pending.append(('Unparsed safety statement; structured review required: '+quote(sent), scope))
+                pending.append(('Unparsed safety statement; structured review required: '+quote(sent), named or ['*']))
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
@@ -459,6 +458,9 @@ class Store:
                 self.conn.execute("UPDATE assertion SET subject='[deleted]',predicate='[deleted]',object='[deleted]' WHERE source_id=? AND id IN (SELECT assertion_id FROM cx_fact)", (sid,))
                 self.conn.execute('DELETE FROM cx_goal WHERE source_id=?', (sid,))
                 woke = [r['proposal_id'] for r in self.rows('SELECT proposal_id FROM prospective_task WHERE source_id=? AND proposal_id IS NOT NULL', (sid,))]
+                # The events that woke it carry its trigger, and a failed wake its error text.
+                self.conn.execute("UPDATE cx_event SET trigger='[deleted]' WHERE id IN (SELECT w.event_id FROM cx_wake w JOIN prospective_task p ON p.id=w.task_id WHERE p.source_id=?)", (sid,))
+                self.conn.execute("UPDATE cx_wake SET error=NULL WHERE task_id IN (SELECT id FROM prospective_task WHERE source_id=?)", (sid,))
                 self.conn.execute("UPDATE prospective_task SET trigger='[deleted]',goal='[deleted]',request='[deleted]' WHERE source_id=?", (sid,))
                 for ep in woke:
                     self.conn.execute("UPDATE episode SET request='[deleted]',evidence_json=NULL WHERE id=?", (ep,))

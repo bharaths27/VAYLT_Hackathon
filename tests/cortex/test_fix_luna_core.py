@@ -12,14 +12,14 @@ class PhysicalLike(FakeRobot):
 
 def approve(b,p): return b.approve(p['operation_id'],p['digest'],principal='carther')
 
-def physical(arena,clock,path=':memory:'):
+def physical(arena,clock,path):     # a physical runtime needs a durable vault
     s=Store(path,policy=Policy(live_enabled=True),clock=clock);s.register_arena(arena)
     return Brain(s,PhysicalLike(arena))
 
 
 # P1 runtime: a dispatched motion step that then failed is an unverified partial effect, not a settled failure.
-def test_partial_physical_effect_blocks_rearm_until_reconciled(arena,clock):
-    b=physical(arena,clock)
+def test_partial_physical_effect_blocks_rearm_until_reconciled(tmp_path,arena,clock):
+    b=physical(arena,clock,tmp_path/'live.db')
     p=b.command('Go to the shelf b',principal='carther'); b.robot.faults['go_to_zone']='failed'
     r=approve(b,p)
     assert r['status']=='unknown' and 'motion step was dispatched' in r['failure']

@@ -14,7 +14,13 @@ from .types import Conflict
 
 
 def acquire(db_path: str):
-    handle=open(os.path.realpath(db_path)+'.cortex.lock','a+')
+    path=os.path.realpath(db_path)
+    # The lock is named from the path, so every name of the file must be the same name: a hard link (a second name
+    # for the same inode, which also gets its own SQLite journal) is refused instead of locked separately.
+    try: links=os.stat(path).st_nlink
+    except FileNotFoundError: links=1
+    if links>1: raise Conflict('this vault file has another hard link; one vault needs exactly one name so one lock guards it')
+    handle=open(path+'.cortex.lock','a+')
     try:
         if os.name=='nt':
             import msvcrt

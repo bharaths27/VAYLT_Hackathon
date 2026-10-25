@@ -103,10 +103,10 @@ def test_stop_revokes_pending_and_does_not_resume(brain):
     with pytest.raises(Conflict): approve(brain,p)
     assert not brain.robot.calls
 
-def test_physical_ack_requires_independent_observation(arena,clock):
+def test_physical_ack_requires_independent_observation(tmp_path,arena,clock):
     class PhysicalLike(FakeRobot):
         def state(self): return {**super().state(),'adapter':'test-physical'}
-    s=Store(policy=Policy(live_enabled=True),clock=clock); s.register_arena(arena)
+    s=Store(tmp_path/'live.db',policy=Policy(live_enabled=True),clock=clock); s.register_arena(arena)
     b=Brain(s,PhysicalLike(arena))
     p=b.command('Open the claw',principal='carther'); r=approve(b,p)
     assert r['status']=='needs_verification'

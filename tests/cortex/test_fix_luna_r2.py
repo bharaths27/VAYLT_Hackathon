@@ -111,8 +111,8 @@ def test_what_do_you_see_is_a_question_not_an_observe_proposal(brain):
 
 
 # LEARN P2: the vault's actual runtime decides; a store a PHYSICAL brain runs on is never seeded.
-def test_seed_is_refused_on_a_store_a_physical_brain_runs_on(arena,clock):
-    s=Store(policy=Policy(live_enabled=True),clock=clock);s.register_arena(arena);b=Brain(s,PhysicalLike(arena))
+def test_seed_is_refused_on_a_store_a_physical_brain_runs_on(tmp_path,arena,clock):
+    s=Store(tmp_path/'live.db',policy=Policy(live_enabled=True),clock=clock);s.register_arena(arena);b=Brain(s,PhysicalLike(arena))
     with pytest.raises(Denied,match='PHYSICAL runtime'): load_seed(s,SEED,principal='reviewer')
     assert not synthetic_seed_present(s)
     b.close()

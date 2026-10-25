@@ -15,12 +15,12 @@ def test_seeded_sources_are_marked_synthetic(store):
     kinds={x['kind'] for x in store.rows('SELECT kind FROM source WHERE id IN (%s)'%','.join('?'*len(r['source_ids'])),tuple(r['source_ids'].values()))}
     assert kinds and all(k.startswith('synthetic:') for k in kinds) and r['synthetic'] is True
 
-def test_physical_brain_refuses_a_vault_with_synthetic_seed(arena,clock):
+def test_physical_brain_refuses_a_vault_with_synthetic_seed(tmp_path,arena,clock):
     class PhysicalLike(FakeRobot):
         def state(self): return {**super().state(),'adapter':'test-physical'}
-    clean=Store(policy=Policy(live_enabled=True),clock=clock);clean.register_arena(arena)
+    clean=Store(tmp_path/'clean.db',policy=Policy(live_enabled=True),clock=clock);clean.register_arena(arena)
     Brain(clean,PhysicalLike(arena)).close()                                   # control: unseeded vault starts
-    s=Store(policy=Policy(live_enabled=True),clock=clock);s.register_arena(arena);load_seed(s,SEED,principal='reviewer')
+    s=Store(tmp_path/'seeded.db',policy=Policy(live_enabled=True),clock=clock);s.register_arena(arena);load_seed(s,SEED,principal='reviewer')
     with pytest.raises(Denied,match='separate, unseeded vault'): Brain(s,PhysicalLike(arena))
     for src in load_seed(s,SEED,principal='reviewer')['source_ids'].values(): s.revoke_source(src,delete=True)
     with pytest.raises(Denied): Brain(s,PhysicalLike(arena))                    # still a seeded vault

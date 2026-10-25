@@ -38,6 +38,7 @@ class Skills:
         refs=plan.get('refs',[])
         if not refs or not self.store.refs_valid(refs): raise Missing('skill needs valid provenance')
         definition={k:plan[k] for k in ('goal','steps','rules_used','evidence','refs','basis','policy_hash')}
+        definition['refs']=self.identity_refs(goal,refs)
         definition['effect_contract']='Only the exact typed goal; physical execution always needs current approval.'
         d=digest(definition)
         with self.store.tx():
@@ -109,6 +110,24 @@ class Skills:
     def revoke(self,sid: str):
         self.get(sid)
         with self.store.tx(): self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
+
+    def identity_refs(self, goal: Goal, refs: list[str]) -> list[str]:
+        """The refs that identify a procedure: the sources and rules it rests on, which revocation follows. What only
+        entered the prompt changes with every request: episodes are dropped, and a derived memory (often this very
+        system's last recipe) is replaced by the sources and rules it cites, so revoking those still reaches the
+        procedure. A goal with no other provenance keeps its anchor, the first request that asked for it."""
+        core,todo,seen=set(),list(refs),set()
+        while todo:
+            r=todo.pop()
+            if r in seen or len(seen)>self.store.policy.max_nodes: continue
+            seen.add(r)
+            if r.startswith('derived:'):
+                row=self.store.one('SELECT refs_json FROM cx_derived WHERE id=?',(r[8:],))
+                todo+=json.loads(row['refs_json']) if row else [r]
+            elif not r.startswith('episode:'): core.add(r)
+        if core: return sorted(core)
+        anchor=self.store.one('SELECT value FROM meta WHERE key=?',('cx_goal_anchor:'+goal.key(),))
+        return ['episode:'+anchor['value']] if anchor and 'episode:'+anchor['value'] in refs else sorted(set(refs))
 
     def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None) -> list[str]:
         """Refs a command adds to its plan. Commands are episodes, not sources, so a recipe or

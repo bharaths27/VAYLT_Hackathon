@@ -80,10 +80,10 @@ def test_fix_core_legacy_running_episode_does_not_block_rearm(brain):
     assert approve(brain, p)['status'] == 'success'
 
 
-def test_fix_core_unverified_live_effect_names_blocker_and_api_reconciles(arena, clock):
+def test_fix_core_unverified_live_effect_names_blocker_and_api_reconciles(tmp_path, arena, clock):
     class PhysicalLike(FakeRobot):
         def state(self): return {**super().state(), 'adapter': 'test-physical'}
-    s = Store(policy=Policy(live_enabled=True), clock=clock); s.register_arena(arena)
+    s = Store(tmp_path/'live.db', policy=Policy(live_enabled=True), clock=clock); s.register_arena(arena)   # physical needs a durable vault
     b = Brain(s, PhysicalLike(arena))
     token = 'synthetic-test-operator-token-32-characters'
     with TestClient(create_app(b, tokens={token: 'carther'}, start_idle=False)) as c:
