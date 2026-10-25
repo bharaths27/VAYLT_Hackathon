@@ -185,3 +185,43 @@ def test_a_request_the_advisor_finds_ambiguous_states_unclear(arena,clock):
     r=b.command('Bring Sample A to the bench.',principal='carther')
     assert (r['status'],r['classification'],r['needs_clarification'])==('refused','unclear',True)
     b.close()
+
+@pytest.mark.parametrize('utterance,cls',[
+    ("Do not move Sample A to the bench.",'understood'),("Don't move sample A to bench.",'understood'),
+    ("Don"+chr(0x2019)+"t move sample A to bench.",'understood'),("Never pick Sample A.",'understood'),
+    ("Dump Sample A in the trash.",'understood'),("Hold on, move Sample A to the bench.",'unclear'),
+    ("Move sample A to bench tomorrow.",'unclear'),("Bring the gizmo to the bench.",'unclear')],
+    ids=['do not','dont','a curly apostrophe','never','an action it may not do','a cancellation','tomorrow',
+         'a word it does not know'])
+def test_a_clear_dont_or_a_refused_action_is_understood_and_the_rest_unclear(brain,utterance,cls):
+    r=brain.command(utterance,principal='carther')
+    assert (r['status'],r['classification'],r['needs_clarification'])==('refused',cls,cls!='understood'),r
+
+class Negating(Unsure):
+    """An intent advisor that finds every request negated, and none ambiguous."""
+    def route(self,request,*,disclosure_allowed=False): return {'status':'ok','scores':{'negated':0.9,'ambiguous':0.1}}
+
+@pytest.mark.parametrize('utterance,cls',[("Don't bring Sample A to the bench.",'understood'),
+                                          ("Bring Sample A to the bench.",'unclear')],ids=['a clear dont','no clear dont'])
+def test_the_advisors_negated_signal_is_understood_only_for_a_clear_dont(arena,clock,utterance,cls):
+    s=Store(clock=clock); s.register_arena(arena); b=Brain(s,FakeRobot(arena),intent=Negating())
+    r=b.command(utterance,principal='carther')
+    assert (r['status'],r['classification'])==('refused',cls),r
+    assert r['reason']==('Negative or cancelled instruction: no physical proposal.' if cls=='understood'
+                         else 'Intent needs clarification; advisory signal is not permission.')
+    b.close()
+
+def test_a_denial_from_the_parser_is_an_understood_refusal(brain,monkeypatch):
+    import engram.cortex.runtime as runtime
+    def deny(request,store): raise Denied('That is not allowed here.')
+    monkeypatch.setattr(runtime,'parse_goal',deny)
+    r=brain.command('Bring Sample A to the bench.',principal='carther')
+    assert (r['status'],r['classification'],r['code'])==('refused','understood','DENIED'),r
+
+@pytest.mark.parametrize('blank',['','   '],ids=['empty','spaces'])
+def test_a_blank_command_is_misheard_before_any_routing_or_planning(brain,blank):
+    r=brain.command(blank,principal='carther')
+    assert (r['status'],r['classification'],r['needs_clarification'])==('refused','misheard',True),r
+    assert r['reason']=="I didn't catch anything."
+    assert brain.store.one('SELECT COUNT(*) n FROM cx_decision')['n']==0       # the advisor was never asked
+    assert brain.store.one('SELECT COUNT(*) n FROM episode')['n']==0           # and nothing was planned

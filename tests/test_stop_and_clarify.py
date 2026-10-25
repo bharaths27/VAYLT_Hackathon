@@ -113,7 +113,7 @@ def test_a_stop_word_is_unchanged(lab):
     r = lab.command("Stop.", "test")
     lab.robot.release.set()
     t.join(10)
-    assert r["kind"] == "stopped" and r["stopped"] is True and "needs_clarification" not in r
+    assert r["kind"] == "stopped" and r["stopped"] is True and r["needs_clarification"] is False
     assert outcome(lab, oid) == "aborted"
 
 
@@ -216,7 +216,7 @@ def lessons(engine):
     return engine.conn.execute("SELECT COUNT(*) FROM negative_memory").fetchone()[0]
 
 
-@pytest.mark.parametrize("status", ["unknown", "failed"])
+@pytest.mark.parametrize("status", ["unknown", "failed", "done"])   # done: the step finished in spite of the stop
 @pytest.mark.parametrize("which", ["the only step", "the final step"])
 def test_a_stop_during_a_step_ends_the_run_as_stopped(arena, which, status):
     hold_on = "go_to_zone" if which == "the only step" else "speak"
@@ -233,6 +233,68 @@ def test_a_stop_during_a_step_ends_the_run_as_stopped(arena, which, status):
     assert r["stopped"] is True
     assert (out["run"]["outcome"], out["run"]["stopped"], out["run"]["failure"]) == ("aborted", True, "stop was pressed")
     assert lessons(eng) == before                            # a stopped step is no lesson about the step
+
+
+class StopsAfterTheCheck(MockRobot):
+    """A stop lands just after the executor saw that the robot was not stopped, before the next step starts: the
+    state it hands back is the one from before the stop."""
+
+    def __init__(self, arena):
+        super().__init__(arena)
+        self.engine, self.executed, self.fired = None, [], False
+
+    def execute(self, op, args):
+        self.executed.append(op)
+        return super().execute(op, args)
+
+    def state(self):
+        seen = super().state()
+        if self.engine is not None and self.executed and not self.fired:
+            self.fired = True
+            self.engine.stop()
+        return seen
+
+
+def test_a_stop_between_the_check_and_the_step_ends_the_run_as_stopped(arena):
+    eng = Engine(connect(":memory:"), StopsAfterTheCheck(arena), set(arena["zones"]))
+    eng.load_arena(arena)
+    eng.overhead_scan()
+    eng.teach("SOP 004", (ROOT / "fixtures/lab/SOP_004.md").read_text())
+    p = eng.command(REQUEST, "test")
+    before = lessons(eng)
+    eng.robot.engine, eng.robot.executed = eng, []           # armed: fires in the check before the second step
+    run = eng.approve_and_run(p["operation_id"], p["digest"], "tester")
+    assert eng.robot.fired
+    assert (run["outcome"], run["stopped"], run["failure"]) == ("aborted", True, "stop was pressed")
+    assert len(run["steps"]) == 2 and lessons(eng) == before   # the second step met a stopped robot: no lesson
+
+
+class LatchesItself(MockRobot):
+    """The robot's own STOP button: it latches without the engine counting a stop, here as soon as a step is done."""
+
+    armed = False
+
+    def execute(self, op, args):
+        out = super().execute(op, args)
+        if self.armed:
+            self.stopped = True
+        return out
+
+
+@pytest.mark.parametrize("when", ["before the run", "between steps"])
+def test_a_robot_stopped_on_its_own_ends_the_run_as_stopped(arena, when):
+    eng = Engine(connect(":memory:"), LatchesItself(arena), set(arena["zones"]))
+    eng.load_arena(arena)
+    eng.overhead_scan()
+    eng.teach("SOP 004", (ROOT / "fixtures/lab/SOP_004.md").read_text())
+    p = eng.command(REQUEST, "test")
+    if when == "before the run":
+        eng.robot.stop()                                      # latched already: the first step's check sees it
+    else:
+        eng.robot.armed = True                                # latches once the first step is done
+    run = eng.approve_and_run(p["operation_id"], p["digest"], "tester")
+    assert (run["outcome"], run["stopped"], run["failure"]) == ("aborted", True, "stop was pressed")
+    assert len(run["steps"]) == (0 if when == "before the run" else 1)
 
 
 # ---- every command result states its classification; the console reads it, never the words or a missing flag --
@@ -254,8 +316,7 @@ def test_a_stop_during_a_step_ends_the_run_as_stopped(arena, which, status):
 def test_every_command_result_states_its_classification(lab, text, kind, cls):
     r = lab.command(text, "test")
     assert (r["kind"], r["classification"]) == (kind, cls), r
-    if kind == "proposal":
-        assert r["needs_clarification"] is (cls != "understood")
+    assert r["needs_clarification"] is (cls != "understood")   # stated both ways, whatever the kind
 
 
 # ---- a planner states how it took every request; the engine fails closed on anything but "understood" ---------
@@ -322,10 +383,11 @@ class Model:
     """A local stand-in for the llama.cpp server (no model runs): every completion is the plan the test sets."""
 
     def __init__(self):
-        fake, self.plan = self, None
+        fake, self.plan, self.calls = self, None, 0
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
+                fake.calls += 1
                 self.rfile.read(int(self.headers["Content-Length"]))
                 data = json.dumps({"content": json.dumps(fake.plan)}).encode()
                 self.send_response(200)
@@ -383,3 +445,69 @@ def test_a_model_plan_that_resolves_is_the_model_s(lab, model):
     lab.planner = LlamaCppPlanner(lab.zones, model.url, timeout_s=5)
     r = lab.command("Bring the beaker to the bench", "test")
     assert (r["status"], r["source"], r["classification"]) == ("proposed", "model", "understood"), r
+
+
+# ---- a place that is not a zone is unclear: the planner asks which place, and never guesses the bench ---------
+
+
+def zones_of(proposal):
+    return {s["args"]["zone"] for s in proposal["plan"]["steps"] if s["op"] == "place_at_zone"}
+
+
+@pytest.mark.parametrize("text", ["Bring the beaker to the kitchen", "Bring the beaker over here",
+                                  "Bring the beaker from shelf A to the kitchen"],
+                         ids=["a room it does not know", "here", "from a zone to a place it does not know"])
+def test_a_place_that_is_not_a_zone_while_a_plan_runs_stops_it_and_asks_which(lab, text):
+    oid, t, out = start_plan(lab)
+    r = lab.command(text, "test")
+    lab.robot.release.set()
+    t.join(10)
+    assert (r["status"], r["classification"], r["stopped"]) == ("refused", "unclear", True), r
+    assert r["reply"] == "I stopped. Which place do you mean? Please clarify."
+    assert outcome(lab, oid) == "aborted"
+
+
+def test_a_place_that_is_not_a_zone_with_nothing_running_asks_which_and_stops_nothing(lab):
+    r = lab.command("Bring the beaker to the kitchen", "test")
+    assert (r["status"], r["classification"], r["stopped"]) == ("refused", "unclear", False), r
+    assert r["reply"] == "Which place do you mean? Please clarify."
+
+
+def test_a_time_it_cannot_schedule_and_no_zone_is_never_planned_now(lab):
+    r = lab.command("Bring the beaker in a minute", "test")     # not a task for later it can parse, and no zone
+    assert (r["status"], r["classification"]) == ("refused", "unclear"), r
+
+
+@pytest.mark.parametrize("text,zone", [("Bring the beaker to shelf B", "shelf_B"),
+                                       ("Bring the beaker from shelf A to the bench", "bench"),
+                                       ("Bring the beaker", "bench")],
+                         ids=["a zone it knows", "where it comes from is not where it goes", "no place at all"])
+def test_a_zone_it_knows_or_no_place_at_all_is_planned(lab, text, zone):
+    r = lab.command(text, "test")
+    assert r["status"] == "proposed" and zones_of(r) == {zone}, r
+
+
+def test_a_learned_skill_never_takes_a_place_that_is_not_a_zone_to_the_bench(lab, monkeypatch):
+    skill = {"id": "skl_bench", "definition": {"steps": bring("beaker")["steps"], "evidence": [], "rules_used": []}}
+    monkeypatch.setattr(lab.skills, "find", lambda targets, zone: skill)   # a skill for any place it is asked about
+    assert lab.command("Bring the beaker to the bench", "test")["source"] == "skill"
+    r = lab.command("Bring the beaker to the kitchen", "test")
+    assert (r["status"], r["classification"], r["reason"]) == ("refused", "unclear", "Which place do you mean?"), r
+
+
+def test_the_model_planner_is_not_asked_to_pick_a_place_that_is_not_a_zone(lab, model):
+    model.plan = bring("beaker")                                # it would quietly take it to the bench
+    lab.planner = LlamaCppPlanner(lab.zones, model.url, timeout_s=5)
+    r = lab.command("Bring the beaker to the kitchen", "test")
+    assert (r["status"], r["classification"], r["reason"]) == ("refused", "unclear", "Which place do you mean?"), r
+    assert model.calls == 0
+
+
+def test_a_model_plan_naming_a_place_that_is_not_a_zone_goes_to_the_rules(lab, model):
+    plan = bring("beaker")
+    plan["steps"][2]["args"]["zone"] = "workbench"
+    model.plan = plan
+    lab.planner = LlamaCppPlanner(lab.zones, model.url, timeout_s=5)
+    r = lab.command("Bring the beaker to the bench", "test")
+    assert (r["status"], r["source"]) == ("proposed", "fallback") and zones_of(r) == {"bench"}, r
+    assert "model plan names a place that is not a zone: 'workbench'" in r["planner_note"]

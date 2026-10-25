@@ -14,7 +14,7 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
-from .planning import CAPS,PHYSICAL,RECALL,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,FORBIDDEN,PHYSICAL,RECALL,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
@@ -28,6 +28,19 @@ def taken(result: dict,classification: str) -> dict:
     ('understood', 'unclear' or 'misheard') and needs_clarification. The console stages a plan only when both say
     understood, and stops a running task for anything else."""
     return {**result,'classification':classification,'needs_clarification':classification!='understood'}
+
+
+# A clear "don't": the explicit negations among the safety check's NEGATED words, which also has cancellations
+# such as "wait" or "hold on" (those are not one).
+CLEAR_DONT=re.compile(r"\b(do not|don't|dont|never|no need to|must not|mustn't)\b",re.I)
+
+
+def refusal_taken(request: str,error: CortexError | None=None) -> str:
+    """How a refused request was taken. Understood: a clear "don't", an action the robot may not do (both refused by
+    parse_goal's safety check: saying it again would not help), or a denial. Unclear: everything else, a
+    cancellation ("wait", "never mind") and an advisory signal on its own included, which err toward the stop."""
+    t=request.replace(chr(0x2019),"'")
+    return 'understood' if isinstance(error,Denied) or CLEAR_DONT.search(t) or FORBIDDEN.search(t) else 'unclear'
 
 
 class Brain:
@@ -82,7 +95,10 @@ class Brain:
         return answer
 
     def command(self,request: str,*,principal: str,idempotency_key: str | None=None,cloud_allowed: bool=False) -> dict:
-        request=text(request,'request',2000); principal=text(principal,'principal',100)
+        principal=text(principal,'principal',100)
+        if isinstance(request,str) and not request.strip():  # nothing was heard: misheard, before routing or planning
+            return taken({'kind':'proposal','status':'refused','reason':"I didn't catch anything."},'misheard')
+        request=text(request,'request',2000)
         with self.activity.foreground():
             low=normalize(request)
             if low in {'stop','stop now','halt','emergency stop'}: return taken({'kind':'stop',**self.stop()},'understood')
@@ -105,11 +121,11 @@ class Brain:
             advice=self.intent.route(request,disclosure_allowed=bool(cloud_allowed and self.store.policy.cloud_enabled))
             self.store.decision('route',advice.get('provider','local'),advice.get('model'),advice['status']=='ok',advice['status'])
             if advice['status']=='ok' and (advice['scores'].get('negated',0)>=0.5 or advice['scores'].get('ambiguous',0)>=0.8):
-                return taken({'kind':'proposal','status':'refused','reason':'Intent needs clarification; advisory signal is not permission.'},'unclear')
-            # A goal that does not parse needs more input (NEEDS_INPUT): unclear. That includes a safety refusal, which
-            # parse_goal does not tell apart from the rest, so it errs toward the stop.
+                taken_as=refusal_taken(request)
+                reason=safety_reason(request) if taken_as=='understood' else 'Intent needs clarification; advisory signal is not permission.'
+                return taken({'kind':'proposal','status':'refused','reason':reason},taken_as)
             try: goal=parse_goal(request,self.store)
-            except CortexError as e: return taken({'kind':'proposal','status':'refused','reason':str(e),'code':e.code},'unclear')
+            except CortexError as e: return taken({'kind':'proposal','status':'refused','reason':str(e),'code':e.code},refusal_taken(request,e))
             alias_source=self.store.one("SELECT g.source_id FROM cx_goal g JOIN cx_source s ON s.source_id=g.source_id WHERE g.name=? AND s.status='accepted'",(normalize(request),))
             alias_refs=['source:'+alias_source['source_id']] if alias_source else []
             return taken({'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,cloud_allowed=cloud_allowed)},'understood')
