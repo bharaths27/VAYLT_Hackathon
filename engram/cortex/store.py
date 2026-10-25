@@ -70,7 +70,15 @@ class Store:
                 raise
             else:
                 self._depth -= 1
-                self.conn.execute('COMMIT' if root else f'RELEASE {savepoint}')
+                if not root:
+                    self.conn.execute(f'RELEASE {savepoint}')
+                    return
+                try:
+                    self.conn.execute('COMMIT')
+                except BaseException:
+                    # A refused COMMIT (e.g. a deferred constraint) leaves the transaction open; never wedge the shared connection.
+                    if self.conn.in_transaction: self.conn.rollback()
+                    raise
 
     def rows(self, sql: str, args=()) -> list[dict]:
         with self.lock:
