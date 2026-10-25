@@ -275,13 +275,14 @@ def whisper_server_endpoint() -> str | None:
 _NATIVE_FMT = (1, 1, 16000, 2, 16)
 
 
-def _native_seconds(path: Path) -> float | None:
-    """Length in seconds if the file is exactly what whisper.cpp reads: a RIFF/WAVE file whose
-    fmt chunk says PCM (tag 1), 16 bits per sample, 1 channel, 16000 Hz. Else None, and the clip
-    goes through ffmpeg. The fmt chunk is read here directly, with small bounded reads: the wave
-    module only reports whole bytes per sample, so 12-bit audio in 2-byte samples would pass it.
-    WAVE_FORMAT_EXTENSIBLE (and anything else) is not native. The length comes from the data
-    chunk, counting only the bytes actually in the file. Judged from the bytes, not the name."""
+def _native_data(path: Path) -> tuple[int, int] | None:
+    """(offset, size) of the audio in the data chunk if the file is exactly what whisper.cpp
+    reads: a RIFF/WAVE file whose fmt chunk says PCM (tag 1), 16 bits per sample, 1 channel,
+    16000 Hz. Else None, and the clip goes through ffmpeg. The fmt chunk is read here directly,
+    with small bounded reads: the wave module only reports whole bytes per sample, so 12-bit
+    audio in 2-byte samples would pass it. WAVE_FORMAT_EXTENSIBLE (and anything else) is not
+    native. The size counts only whole samples actually in the file. Judged from the bytes,
+    not the name."""
     try:
         with open(path, "rb") as f:
             file_size = os.fstat(f.fileno()).st_size
@@ -304,7 +305,7 @@ def _native_seconds(path: Path) -> float | None:
                 elif cid == b"data":
                     if fmt != _NATIVE_FMT:  # also None: data before any fmt chunk
                         return None
-                    return min(size, file_size - f.tell()) // 2 / 16000
+                    return f.tell(), min(size, file_size - f.tell()) // 2 * 2
                 else:
                     f.seek(size + (size & 1), os.SEEK_CUR)  # chunks are padded to even sizes
     except OSError:
@@ -312,9 +313,31 @@ def _native_seconds(path: Path) -> float | None:
     return None
 
 
-def is_native_pcm(path: Path) -> bool:
-    """True for exactly what whisper.cpp reads: 16 kHz, mono, 16-bit PCM WAV."""
-    return _native_seconds(path) is not None
+def _native_seconds(path: Path) -> float | None:
+    """Length of a native clip (see _native_data), from its data chunk alone; None if not native."""
+    data = _native_data(path)
+    return None if data is None else data[1] / 32000
+
+
+_COPY_BLOCK = 64 * 1024
+
+
+def _strip_to_data(src: Path, offset: int, size: int, dst: Path) -> None:
+    """Write a native clip as a plain WAV: a 44-byte header, then its data chunk copied in
+    bounded blocks (never read whole into memory). Drops every other chunk (metadata)."""
+    header = (b"RIFF" + struct.pack("<I", 36 + size) + b"WAVE"
+              + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
+              + b"data" + struct.pack("<I", size))
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        fout.write(header)
+        fin.seek(offset)
+        left = size
+        while left:
+            block = fin.read(min(left, _COPY_BLOCK))
+            if not block:
+                raise OSError(f"{src.name} ended inside its data chunk")
+            fout.write(block)
+            left -= len(block)
 
 
 def wav_byte_limit() -> int:
@@ -374,7 +397,7 @@ async def _post_clip(endpoint: str, wav: Path, limit: float) -> tuple[str, str]:
     return text.strip(), "ok (whisper server)"
 
 
-def _transcribe_job(audio: bytes, suffix: str) -> tuple[str | None, str]:
+def _transcribe_job(audio: bytes, suffix: str, details: dict | None = None) -> tuple[str | None, str]:
     st = stt_status()
     server = whisper_server_endpoint()
     cli = st["whisper_bin"] and st["whisper_model"]
@@ -384,15 +407,18 @@ def _transcribe_job(audio: bytes, suffix: str) -> tuple[str | None, str]:
         # Different names: an upload called *.wav must never be the file ffmpeg writes.
         src = Path(d) / f"upload{suffix}"
         src.write_bytes(audio)
-        native = _native_seconds(src)  # reads only the chunk headers
-        if native is not None and native > config.STT_MAX_SECONDS:
-            return None, _too_long(native)  # its data chunk alone is too long: nothing to convert
-        if native is not None and src.stat().st_size <= wav_byte_limit():
-            wav = src  # already what whisper reads; no ffmpeg
+        native = _native_data(src)  # reads only the chunk headers
+        if native is not None:  # 16 kHz mono 16-bit PCM: never through ffmpeg
+            seconds = native[1] / 32000
+            if seconds > config.STT_MAX_SECONDS:
+                return None, _too_long(seconds)  # its data chunk alone is too long
+            if src.stat().st_size <= wav_byte_limit():
+                wav, conversion = src, "native"  # already what whisper reads
+            else:  # only extra chunks (metadata) make the file too big: keep just the audio
+                wav, conversion = Path(d) / "stripped-16k-mono.wav", "native-stripped"
+                _strip_to_data(src, *native, wav)
         elif st["ffmpeg"]:
-            # Anything else, and a native clip that only extra chunks (metadata) make too big:
-            # ffmpeg rewrites it without them (-map_metadata -1).
-            wav = Path(d) / "converted-16k-mono.wav"
+            wav, conversion = Path(d) / "converted-16k-mono.wav", "ffmpeg"
             # Bound the DECODED audio while ffmpeg writes it (-t length, -fs file size): a small,
             # long compressed clip must not grow into a WAV that fills memory or /tmp. ffmpeg may
             # write one second past the limit so the check below can tell "too long" from
@@ -403,10 +429,10 @@ def _transcribe_job(audio: bytes, suffix: str) -> tuple[str | None, str]:
                                   capture_output=True, timeout=20)
             if conv.returncode != 0:
                 return None, "ffmpeg failed: " + conv.stderr.decode()[-200:]
-        elif native is not None:
-            return None, _too_large(src)  # would need ffmpeg to drop its extra chunks
         else:
             return None, f"STT not installed: {st}"
+        if details is not None:
+            details["conversion"] = conversion  # what this clip actually went through
         problem = _wav_problem(wav)  # before the server or whisper-cli reads a byte of it
         if problem:
             return None, problem
@@ -422,8 +448,10 @@ def _transcribe_job(audio: bytes, suffix: str) -> tuple[str | None, str]:
         return p.stdout.decode().strip(), f"ok (whisper-cli; {server_why})" if server_why else "ok"
 
 
-async def transcribe(audio: bytes, suffix: str) -> tuple[str | None, str]:
+async def transcribe(audio: bytes, suffix: str, details: dict | None = None) -> tuple[str | None, str]:
+    """(text, reason). If a dict is given as details, details["conversion"] is set to what the
+    clip went through: "native", "native-stripped" (metadata dropped) or "ffmpeg"."""
     try:
-        return await _STT.run(_transcribe_job, audio, suffix, size=len(audio))
+        return await _STT.run(_transcribe_job, audio, suffix, details, size=len(audio))
     except VoiceBusy as e:
         return None, str(e)

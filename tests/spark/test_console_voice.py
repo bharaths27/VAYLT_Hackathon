@@ -490,8 +490,8 @@ def test_probe_reports_what_stt_heard(stt, tmp_path, capsys):
     assert report == json.loads((tmp_path / "probe.json").read_text())
     a, b = report["clips"]
     assert a["transcript"] == "Pick up a beaker." and a["reference"] == "pick up the beaker"
-    assert a["wer"] == 0.25 and a["native_pcm"] is True and a["latency_s"] >= 0
-    assert b["transcript"] == "Pick up a beaker." and b["wer"] is None and b["native_pcm"] is False
+    assert a["wer"] == 0.25 and a["conversion"] == "native" and a["latency_s"] >= 0
+    assert b["transcript"] == "Pick up a beaker." and b["wer"] is None and b["conversion"] == "ffmpeg"
     assert stt.tools() == ["whisper-cli", "ffmpeg", "whisper-cli"]  # the server's own STT path ran
     assert report["summary"]["transcribed"] == 2 and report["summary"]["mean_wer"] == 0.25 and code == 0
 
@@ -510,11 +510,11 @@ def test_probe_never_fills_in_the_reference(stt, tmp_path, capsys, monkeypatch):
 def _fail_second(real):
     calls = []
 
-    async def transcribe(audio, suffix):
+    async def transcribe(audio, suffix, details=None):
         calls.append(1)
         if len(calls) == 2:
             return None, "STT not installed: {}"
-        return await real(audio, suffix)
+        return await real(audio, suffix, details)
 
     return transcribe
 
@@ -865,6 +865,7 @@ def test_long_clip_is_cut_short_by_ffmpeg_and_refused(stt, monkeypatch):
     assert (text, why) == (None, "audio too long: 3.0 s (limit 2 s)")
     ((_, cmd),) = stt.calls
     assert cmd[cmd.index("-t") + 1] == "3" and int(cmd[cmd.index("-fs") + 1]) == voice.wav_byte_limit()
+    assert cmd[cmd.index("-map_metadata") + 1] == "-1"  # metadata is not copied into the output
     assert stt.ffmpeg_wrote <= voice.wav_byte_limit()  # ffmpeg stopped at -t
     assert stt.tools() == ["ffmpeg"]  # whisper never ran
 
@@ -946,11 +947,11 @@ def test_12_bit_audio_in_2_byte_samples_is_converted(stt, tmp_path):
     clip.write_bytes(twelve)
     with wave.open(str(clip), "rb") as w:  # what fooled the old check: 2 bytes per sample
         assert (w.getsampwidth(), w.getnchannels(), w.getframerate()) == (2, 1, 16000)
-    assert not voice.is_native_pcm(clip)
+    assert voice._native_seconds(clip) is None
     text, _ = run(voice.transcribe(twelve, ".wav"))
     assert text == "pick up the beaker"
     assert stt.tools() == ["ffmpeg", "whisper-cli"] and stt.whisper_saw == CONVERTED
-    assert voice_probe.probe_clip(clip)["native_pcm"] is False
+    assert voice_probe.probe_clip(clip)["conversion"] == "ffmpeg"
 
 
 @pytest.mark.parametrize("audio", [
@@ -999,8 +1000,9 @@ REAL_FFMPEG = _real_ffmpeg()
 @pytest.mark.parametrize("upload,expected", [
     (wav_bytes(rate=44100, channels=2, frames=int(44100 * 1.5)), ("pick up the beaker", "ok")),
     (wav_bytes(rate=44100, channels=2, frames=44100 * 5), (None, "audio too long: 3.0 s (limit 2 s)")),
-    (riff(fmt(), info_list(200_000), (b"data", PCM_1S)), ("pick up the beaker", "ok")),
-], ids=["1.5s-44k-stereo", "5s-44k-stereo", "1s-native-with-200KB-metadata"])
+    (riff(fmt(channels=2, rate=44100, align=4), info_list(200_000), (b"data", b"\x10\x20" * 2 * 44100)),
+     ("pick up the beaker", "ok")),
+], ids=["1.5s-44k-stereo", "5s-44k-stereo", "1s-44k-stereo-with-200KB-metadata"])
 def test_real_ffmpeg_output_passes_the_native_check(stt, monkeypatch, upload, expected):
     monkeypatch.setattr(config, "FFMPEG_BIN", REAL_FFMPEG)
     monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
@@ -1020,29 +1022,62 @@ def test_real_ffmpeg_output_passes_the_native_check(stt, monkeypatch, upload, ex
         assert len(stt.whisper_saw) <= voice.wav_byte_limit() and b"ICMT" not in stt.whisper_saw
 
 
-# ------------------------------------------------------------------ length vs file size (review fix 8)
+# ------------------------------------------------------------------ length vs file size (review fixes 8, 9)
+@pytest.mark.parametrize("ffmpeg", ["installed", "absent"])
 @pytest.mark.parametrize("comment", [1000, 200_000], ids=["under-the-file-cap", "over-the-file-cap"])
-def test_a_short_native_clip_with_big_metadata_is_transcribed(stt, monkeypatch, comment):
+def test_a_short_native_clip_with_big_metadata_never_needs_ffmpeg(stt, monkeypatch, comment, ffmpeg):
     monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    if ffmpeg == "absent":
+        stt.installed.clear()
     clip = riff(fmt(), info_list(comment), (b"data", PCM_1S))  # 1 s of audio
     over_cap = len(clip) > voice.wav_byte_limit()
     assert over_cap == (comment == 200_000)
-    assert run(voice.transcribe(clip, ".wav"))[0] == "pick up the beaker"
-    if over_cap:  # ffmpeg rewrites it without the metadata, and its output is checked as usual
-        (_, cmd), _ = stt.calls
-        assert stt.tools() == ["ffmpeg", "whisper-cli"] and cmd[cmd.index("-map_metadata") + 1] == "-1"
-        assert stt.whisper_saw == CONVERTED
+    details = {}
+    assert run(voice.transcribe(clip, ".wav", details=details))[0] == "pick up the beaker"
+    assert stt.tools() == ["whisper-cli"]  # ffmpeg was never run
+    if over_cap:  # the metadata is dropped here: a plain 44-byte header and the same audio
+        assert details == {"conversion": "native-stripped"}
+        assert stt.whisper_saw == riff(fmt(), (b"data", PCM_1S))
     else:
-        assert stt.tools() == ["whisper-cli"] and stt.whisper_saw == clip
+        assert details == {"conversion": "native"} and stt.whisper_saw == clip
 
 
-def test_a_native_clip_too_big_only_through_metadata_needs_ffmpeg(stt, monkeypatch):
-    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
-    stt.installed.clear()  # no ffmpeg to drop the metadata with
-    clip = riff(fmt(), info_list(200_000), (b"data", PCM_1S))
-    expected = f"file too large: {len(clip)} bytes (limit {voice.wav_byte_limit()} bytes)"
-    assert run(voice.transcribe(clip, ".wav")) == (None, expected)
-    assert stt.calls == []
+def test_a_stray_odd_byte_is_not_counted_as_audio(tmp_path):
+    clip = tmp_path / "odd.wav"
+    clip.write_bytes(riff(fmt(), (b"data", PCM_1S + b"")))  # half a sample at the end
+    offset, size = voice._native_data(clip)
+    assert (offset, size) == (44, len(PCM_1S)) and voice._native_seconds(clip) == 1.0
+
+
+def test_stripping_reads_the_audio_in_bounded_blocks(stt, monkeypatch):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 5.0)
+    audio = PCM_1S * 3  # 96 000 bytes: more than one copy block
+    clip = riff(fmt(), info_list(300_000), (b"data", audio))
+    assert len(clip) > voice.wav_byte_limit() and len(audio) > voice._COPY_BLOCK
+    reads = []
+
+    class Watched:
+        def __init__(self, f):
+            self.f = f
+
+        def read(self, n=-1):
+            reads.append(n)
+            return self.f.read(n)
+
+        def __getattr__(self, name):
+            return getattr(self.f, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.f.__exit__(*exc)
+
+    monkeypatch.setattr(voice, "open", lambda *a, **k: Watched(open(*a, **k)), raising=False)
+    details = {}
+    assert run(voice.transcribe(clip, ".wav", details=details))[0] == "pick up the beaker"
+    assert details == {"conversion": "native-stripped"} and stt.whisper_saw == riff(fmt(), (b"data", audio))
+    assert reads and all(0 < n <= voice._COPY_BLOCK for n in reads)  # never "read it all"
 
 
 def test_an_oversized_native_clip_whose_audio_is_too_long_is_refused_unread(stt, monkeypatch):
@@ -1059,6 +1094,17 @@ def test_an_oversized_native_clip_whose_audio_is_too_long_is_refused_unread(stt,
     monkeypatch.setattr(Path, "read_bytes", spy)
     assert run(voice.transcribe(clip, ".wav")) == (None, "audio too long: 10.0 s (limit 2 s)")
     assert reads == [] and stt.calls == []  # judged from its chunk headers alone
+
+
+def test_probe_reports_what_the_path_actually_did(stt, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(config, "STT_MAX_SECONDS", 2.0)
+    folder = _clips(tmp_path, a=(wav_bytes(), None), b=(riff(fmt(), info_list(200_000), (b"data", PCM_1S)), None),
+                    c=(wav_bytes(rate=44100), None), d=(wav_bytes(frames=48000), None))
+    voice_probe.main([str(folder)])
+    a, b, c, d = json.loads(capsys.readouterr().out)["clips"]
+    assert (a["conversion"], b["conversion"], c["conversion"]) == ("native", "native-stripped", "ffmpeg")
+    assert (d["conversion"], d["reason"]) == (None, "audio too long: 3.0 s (limit 2 s)")  # stopped before
+
 
 
 # ------------------------------------------------------------------ probe reference (review fix 5)

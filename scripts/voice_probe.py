@@ -6,7 +6,9 @@
 Each WAV goes through console.server.voice.transcribe, the same path the console's /stt uses
 (whisper.cpp server on loopback when ENGRAM_WHISPER_SERVER_URL is set, else whisper-cli; ffmpeg
 only when the clip is not already 16 kHz mono 16-bit PCM). Optional reference text sits next to
-the clip with the same name and .txt (clips/pick.wav -> clips/pick.txt).
+the clip with the same name and .txt (clips/pick.wav -> clips/pick.txt). "conversion" is what
+that path actually did with the clip: "native", "native-stripped" (metadata dropped), "ffmpeg",
+or null when it stopped before deciding.
 
 Per clip it records the ACTUAL transcript (null when STT failed or raised, e.g. a whisper timeout;
 the reference is never used in its place), the word error rate against the reference when there
@@ -56,10 +58,10 @@ def probe_clip(path: Path) -> dict:
             reference = ref_path.read_text(encoding="utf-8").strip()
     except (OSError, ValueError) as e:  # unreadable or not UTF-8: no WER for this clip; go on
         reference_error = f"{type(e).__name__}: {str(e)[:200]}"
-    native = voice.is_native_pcm(path)
+    details: dict = {}
     started = time.perf_counter()
     try:
-        text, reason = asyncio.run(voice.transcribe(path.read_bytes(), ".wav"))
+        text, reason = asyncio.run(voice.transcribe(path.read_bytes(), ".wav", details=details))
     except Exception as e:  # noqa: BLE001 - record it against this clip and go on to the next
         text, reason = None, f"error: {type(e).__name__}: {str(e)[:200]}"
     latency = time.perf_counter() - started
@@ -67,7 +69,7 @@ def probe_clip(path: Path) -> dict:
     return {"file": path.name, "transcript": text if ok else None, "ok": ok, "reason": reason,
             "reference": reference, "reference_error": reference_error,
             "wer": word_error_rate(reference, text) if ok and reference is not None else None,
-            "latency_s": round(latency, 3), "native_pcm": native}
+            "latency_s": round(latency, 3), "conversion": details.get("conversion")}
 
 
 def probe(folder: Path) -> dict:
