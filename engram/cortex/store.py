@@ -601,9 +601,9 @@ class Store:
                     valid=False
                 if not valid:
                     self.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(r['id'],))
-            for r in self.rows("SELECT e.id,e.plan_json FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome='proposed'"):
+            for r in self.rows("SELECT e.id,e.plan_json,e.skill_id,v.status skill_status FROM episode e JOIN cx_episode c ON c.id=e.id LEFT JOIN skill_version v ON v.id=e.skill_id WHERE e.outcome='proposed'"):
                 try:
-                    p=json.loads(r['plan_json']); valid=self.refs_valid(p['refs']) and p['basis']==self.basis(Goal.from_dict(p['goal']))
+                    p=json.loads(r['plan_json']); valid=(not r['skill_id'] or r['skill_status']=='APPROVED') and self.refs_valid(p['refs']) and p['basis']==self.basis(Goal.from_dict(p['goal']))
                 except (CortexError,KeyError,TypeError,ValueError): valid=False
                 if not valid:self.conn.execute("UPDATE episode SET outcome='invalidated',failure='dependency changed',finished_at=? WHERE id=?",(self.clock(),r['id']))
 

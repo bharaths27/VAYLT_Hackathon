@@ -235,6 +235,10 @@ class Brain:
                         recipe=self.store.derived(r['derived_memory_id'])
                         if recipe['status']!='VERIFIED' or recipe['payload'].get('steps')!=plan['steps'] or not self.store.refs_valid(recipe['refs']):
                             raise Stale('execution recipe changed or lost its evidence')
+                    if r['skill_id']:
+                        skill=self.store.one('SELECT status,definition_json FROM skill_version WHERE id=?',(r['skill_id'],))
+                        if not skill or skill['status']!='APPROVED' or json.loads(skill['definition_json']).get('steps')!=plan['steps']:
+                            raise Stale('procedure was revoked or changed after proposal')
                     if plan['basis']!=self.store.basis(goal) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
                         raise Stale('rule, binding, source or policy changed after proposal')
                     if self.store.prohibitions(set(goal.targets)|{r['object'] for r in self.store.related_rules(goal)}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
