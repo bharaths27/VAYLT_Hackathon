@@ -32,6 +32,13 @@ def private_state(tmp):
     token=state/'token';token.write_text('synthetic-test-operator-token-for-the-sidecar-0123456789'+chr(10));os.chmod(token,0o600)
     return state
 
+def hold_lock(state):
+    """A live start in progress: a process holding the start lock (flock on the state directory's sidecar.lock)."""
+    p=subprocess.Popen([sys.executable,'-c',"import fcntl,sys,time;f=open(sys.argv[1],'a');fcntl.flock(f,fcntl.LOCK_EX);print('held',flush=True);time.sleep(60)",
+                        str(state/'sidecar.lock')],stdout=subprocess.PIPE,text=True)
+    assert p.stdout.readline().strip()=='held'
+    return p
+
 
 # P2-7: two starts at once leave exactly one server, named by the PID file, and the other start never kills it.
 def test_concurrent_starts_leave_exactly_one_server(tmp_path):
@@ -68,14 +75,13 @@ def test_a_failing_start_leaves_a_process_it_did_not_start_alone(tmp_path):
         other.kill();srv.shutdown();srv.server_close();kill_port_servers(port)
 
 def test_a_start_while_another_holds_the_lock_refuses_and_spawns_nothing(tmp_path):
-    state=private_state(tmp_path);lock=state/'start.lock';lock.mkdir();port=free_port()
-    holder=subprocess.Popen(['sleep','30']);(lock/'pid').write_text(str(holder.pid))   # a live start in progress
+    state=private_state(tmp_path);port=free_port();holder=hold_lock(state)               # a live start in progress
     try:
         r=run(tmp_path,'start',CORTEX_PORT=port)
         assert r.returncode==1 and 'another start is in progress' in r.stderr,r.stdout+r.stderr
-        assert not (state/'cortex.pid').exists() and lock.exists()
+        assert not (state/'cortex.pid').exists()
     finally:
-        holder.kill();kill_port_servers(port)
+        holder.kill();holder.wait();kill_port_servers(port)
 
 def test_guard_start_with_captured_output_returns_and_the_daemon_holds_no_caller_pipe(tmp_path):
     port=free_port()
@@ -89,21 +95,18 @@ def test_guard_start_with_captured_output_returns_and_the_daemon_holds_no_caller
         run(tmp_path,'stop',CORTEX_PORT=port);kill_port_servers(port)
 
 def test_the_start_lock_admits_exactly_one_of_two_racers(tmp_path):
-    state=private_state(tmp_path);lock=state/'start.lock'
+    private_state(tmp_path)
     racer='. "'+str(ROOT/'scripts/cortex_sidecar.sh')+'"; start_lock && echo GOT && sleep .3'   # holds the lock briefly
     for i in range(30):
-        shutil.rmtree(lock,ignore_errors=True)
         ps=[subprocess.Popen([SH,'-c',racer],env=env(tmp_path,CORTEX_SIDECAR_LIB='1'),stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True) for _ in range(2)]
         outs=[p.communicate(timeout=30) for p in ps]
         assert sum('GOT' in o for o,_ in outs)==1,(i,outs)
 
-def test_guard_a_lock_left_by_a_dead_starter_is_reclaimed(tmp_path):
-    state=private_state(tmp_path);lock=state/'start.lock';lock.mkdir()
-    dead=subprocess.Popen(['true']);dead.wait();(lock/'pid').write_text(str(dead.pid))
+def test_guard_a_lock_file_left_behind_does_not_block_a_start(tmp_path):
+    state=private_state(tmp_path);(state/'sidecar.lock').touch()                         # left by an earlier start
     port=free_port()
     try:
         r=run(tmp_path,'start',CORTEX_PORT=port);assert r.returncode==0 and 'started' in r.stdout,r.stdout+r.stderr
-        assert not lock.exists()
     finally:
         run(tmp_path,'stop',CORTEX_PORT=port);kill_port_servers(port)
 

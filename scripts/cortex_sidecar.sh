@@ -17,6 +17,7 @@ REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 STATE=${CORTEX_STATE_DIR:-$HOME/.cortex-sidecar}
 TOKEN_FILE=$STATE/token
 PID_FILE=$STATE/cortex.pid
+CONF=$STATE/cortex.conf
 LOG=$STATE/cortex.log
 HOST=${CORTEX_HOST:-127.0.0.1}
 PORT=${CORTEX_PORT:-8010}
@@ -92,7 +93,7 @@ url() { case $HOST in *:*) echo "http://[$HOST]:$PORT" ;; *) echo "http://$HOST:
 health() {
     "$(python_bin)" -c 'import sys,urllib.request
 try:print(urllib.request.urlopen(sys.argv[1]+"/health",timeout=2).read().decode())
-except Exception as e:sys.exit(1)' "$(url)"
+except Exception as e:sys.exit(1)' "$1"
 }
 
 refuse_unsafe_config() {
@@ -119,25 +120,20 @@ refuse_unsafe_config() {
         "$repo"/*) die "refusing CORTEX_STATE_DIR=$STATE (resolves to $state): the token must live outside the repository" ;;
     esac
     # From here on only canonical paths: start() changes directory, so a relative path would move.
-    STATE=$state; DB=$db; TOKEN_FILE=$STATE/token; PID_FILE=$STATE/cortex.pid; LOG=$STATE/cortex.log
+    STATE=$state; DB=$db; TOKEN_FILE=$STATE/token; PID_FILE=$STATE/cortex.pid; CONF=$STATE/cortex.conf; LOG=$STATE/cortex.log
     [ -f "$ARENA" ] || die "lab arena not found at $ARENA"
 }
 
-# One start at a time: an atomic directory creation in the state directory. A lock whose recorded starter is dead
-# is reclaimed; one without a recorded starter yet is another start in progress. mkdir(2) is atomic but not every
-# mkdir(1) is (uutils coreutils 0.8 reports success to both of two concurrent callers), so Python makes it.
-mklock() { "$(python_bin)" -c 'import os,sys
-try: os.mkdir(sys.argv[1])
-except FileExistsError: sys.exit(1)' "$1" 2>/dev/null; }
+# One start at a time: an OS lock, flock(2) on $STATE/sidecar.lock, taken by Python on this shell's own descriptor 9.
+# The kernel holds it exactly as long as this shell runs and releases it however the shell ends, so no lock is ever
+# stale and none is ever removed or reclaimed by a starter. The server is started with descriptor 9 closed. (A local
+# state directory, as the default under $HOME: NFS emulates flock per process, which would end with the Python call.)
 start_lock() {
-    lock=$STATE/start.lock
-    if ! mklock "$lock"; then
-        holder=$(cat "$lock/pid" 2>/dev/null || true)
-        { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } || die "another start is in progress (remove $lock if none is)"
-        rm -rf "$lock"; mklock "$lock" || die "another start is in progress"
-    fi
-    LOCKED=$lock; echo $$ > "$lock/pid"
-    trap 'rm -rf "$LOCKED"' EXIT
+    [ ! -L "$STATE/sidecar.lock" ] || die "refusing $STATE/sidecar.lock: the lock path is a symlink"
+    exec 9>>"$STATE/sidecar.lock"
+    "$(python_bin)" -c 'import fcntl,sys
+try: fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError: sys.exit(1)' || die "another start is in progress"
 }
 
 start() {
@@ -150,7 +146,11 @@ start() {
         (umask 077 && mkdir -p -- "$STATE") || die "could not create $STATE"
     fi
     start_lock
-    if running; then echo "cortex-sidecar: already running (pid $(cat "$PID_FILE")) at $(url)"; return 0; fi
+    # Already running: only as exactly this configuration (recorded when it started); otherwise say where it really runs.
+    if running; then
+        [ "$(cat "$CONF" 2>/dev/null || true)" = "$(url) $DB" ] || die "already running (pid $(cat "$PID_FILE")) as $(cat "$CONF" 2>/dev/null || echo 'an unrecorded configuration'), not as requested ($(url) $DB): stop it first to change CORTEX_HOST, CORTEX_PORT or CORTEX_DB"
+        echo "cortex-sidecar: already running (pid $(cat "$PID_FILE")) at $(url)"; return 0
+    fi
     [ ! -L "$TOKEN_FILE" ] || die "refusing $TOKEN_FILE: the token path is a symlink"
     if [ ! -e "$TOKEN_FILE" ]; then new_token "$TOKEN_FILE" || die "could not create $TOKEN_FILE"; fi
     [ -f "$TOKEN_FILE" ] && [ -s "$TOKEN_FILE" ] || die "refusing $TOKEN_FILE: not a non-empty regular file"
@@ -163,8 +163,8 @@ start() {
         CORTEX_DB="$DB" ENGRAM_ARENA="$ARENA" \
         CORTEX_LIVE=0 CORTEX_CLOUD=0 CORTEX_QWEN=0 CORTEX_IDLE=1 \
         nohup "$py" -m uvicorn engram.cortex.api:create_app --factory --host "$HOST" --port "$PORT" \
-        >>"$LOG" 2>&1 </dev/null &
-    child=$!; echo "$child" > "$PID_FILE"
+        >>"$LOG" 2>&1 </dev/null 9>&- &
+    child=$!; echo "$child" > "$PID_FILE"; echo "$(url) $DB" > "$CONF"
     i=0
     while [ $i -lt 30 ]; do
         kill -0 "$child" 2>/dev/null || break      # our process died (e.g. the port was taken): never "started"
@@ -178,25 +178,26 @@ start() {
     tail -n 20 "$LOG" >&2 || true
     # Only our own child, and only the PID file that still names it.
     kill "$child" 2>/dev/null || true
-    [ "$(cat "$PID_FILE" 2>/dev/null || true)" != "$child" ] || rm -f "$PID_FILE"
+    [ "$(cat "$PID_FILE" 2>/dev/null || true)" != "$child" ] || rm -f "$PID_FILE" "$CONF"
     die "did not become healthy; see $LOG"
 }
 
 stop() {
-    if ! running; then rm -f "$PID_FILE"; echo "cortex-sidecar: not running"; return 0; fi
+    if ! running; then rm -f "$PID_FILE" "$CONF"; echo "cortex-sidecar: not running"; return 0; fi
     pid=$(cat "$PID_FILE")
     kill "$pid"
     i=0
     while kill -0 "$pid" 2>/dev/null && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done
     if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid"; echo "cortex-sidecar: did not exit in 15 s; killed"; fi
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$CONF"
     echo "cortex-sidecar: stopped (pid $pid)"
 }
 
 status() {
     if running; then
-        echo "cortex-sidecar: running (pid $(cat "$PID_FILE")) at $(url); db $DB"
-        health || echo "cortex-sidecar: process alive but /health did not answer"
+        conf=$(cat "$CONF" 2>/dev/null || echo "$(url) $DB")       # where it really runs, as recorded when it started
+        echo "cortex-sidecar: running (pid $(cat "$PID_FILE")) at ${conf%% *}; db ${conf#* }"
+        health "${conf%% *}" || echo "cortex-sidecar: process alive but /health did not answer"
     else
         echo "cortex-sidecar: not running"; return 3
     fi
