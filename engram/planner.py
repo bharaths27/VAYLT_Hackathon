@@ -41,6 +41,11 @@ log = logging.getLogger("engram.planner")
 @dataclass
 class PlanResult:
     plan: dict[str, Any] | None
+    # How the planner took the request, stated by every result: "understood" (planned, or refused as something the
+    # robot may not do), "unclear" (what was meant is not clear, so the person must say it another way) or
+    # "misheard". No default: a result that does not say cannot be made, and the engine fails closed on anything
+    # else (unclear), for a plan as for a refusal.
+    classification: str
     refused: str | None = None
     planner_calls: int = 0
     planning_ms: float = 0.0
@@ -48,15 +53,14 @@ class PlanResult:
     note: str = ""                 # why the model was not used, or the start of its raw reply
     targets: list[str] = field(default_factory=list)
     zone: str | None = None
-    unclear: bool = False          # a refusal that asks the person to clarify (see classify_refusal)
 
 
-def classify_refusal(request: str, future_ok: bool = False) -> tuple[str, bool] | None:
-    """(why this request must not be planned, whether it needs clarifying), or None.
+def classify_refusal(request: str, future_ok: bool = False) -> tuple[str, str] | None:
+    """(why this request must not be planned, how it was taken), or None. Each refusal states its classification.
 
-    Needs clarifying (True): what was meant is not clear, so the person is asked to say it another
-    way. Understood (False): it was understood and is refused, and saying it again would not help:
-    an action the robot is not allowed to do, or "don't".
+    "unclear": what was meant is not clear, so the person is asked to say it another way.
+    "understood": it was understood and is refused, and saying it again would not help: an action
+    the robot is not allowed to do, or "don't".
 
     future_ok=True is for a request that is being saved as a future task ("... after
     calibration finishes"): its deferral wording is expected, so only that check is skipped.
@@ -65,15 +69,15 @@ def classify_refusal(request: str, future_ok: bool = False) -> tuple[str, bool] 
     low = request.lower()
     for w in REFUSE_WORDS:
         if re.search(rf"\b{re.escape(w)}\b", low):
-            return f"I will not do that: '{w}' is not something this robot is allowed to do.", False
+            return f"I will not do that: '{w}' is not something this robot is allowed to do.", "understood"
     neg = NEGATION.search(low.replace("\u2019", "'"))
     if neg:
         return (f"You said '{neg.group(1)}', so I will not move anything. "
-                "To make it a rule, say 'Remember that ...'."), False
+                "To make it a rule, say 'Remember that ...'."), "understood"
     hint = None if future_ok else FUTURE_HINTS.search(low)
     if hint:
         return (f"That sounds like something to do later ('{hint.group(1)}'), so I will not move now. "
-                "Say it as 'When <event>, <task>' and I will schedule it."), True
+                "Say it as 'When <event>, <task>' and I will schedule it."), "unclear"
     return None
 
 
@@ -105,10 +109,10 @@ class RulePlanner:
         t0 = time.perf_counter()
         cls = classify_refusal(request)
         if cls:
-            return PlanResult(None, refused=cls[0], unclear=cls[1])
+            return PlanResult(None, classification=cls[1], refused=cls[0])
         targets = targets_in(request, memory)
         if not targets:
-            return PlanResult(None, refused="I don't know which object you mean.", unclear=True,
+            return PlanResult(None, classification="unclear", refused="I don't know which object you mean.",
                               planner_calls=1, planning_ms=(time.perf_counter() - t0) * 1000)
         zone = find_zone(request, self.zones)
         rules = [f for f in memory.current_facts() if f["predicate"] == "requires_before"]
@@ -139,8 +143,8 @@ class RulePlanner:
             "evidence": [e["chunk_id"] for e in bundle.evidence],
             "rules_used": [r["id"] for r in rules if r["subject"] in order],
         }
-        return PlanResult(plan, planner_calls=1, planning_ms=(time.perf_counter() - t0) * 1000,
-                          source="rules", targets=targets, zone=zone)
+        return PlanResult(plan, classification="understood", planner_calls=1,
+                          planning_ms=(time.perf_counter() - t0) * 1000, source="rules", targets=targets, zone=zone)
 
 
 PLAN_SCHEMA = {
@@ -188,7 +192,7 @@ class LlamaCppPlanner:
     def plan(self, request: str, bundle: MemoryBundle, memory: Memory) -> PlanResult:
         cls = classify_refusal(request)
         if cls:
-            return PlanResult(None, refused=cls[0], unclear=cls[1])
+            return PlanResult(None, classification=cls[1], refused=cls[0])
         t0 = time.perf_counter()
         # json_schema makes llama.cpp stop as soon as the plan object closes; without it the model
         # kept writing prose until n_predict (measured on the Pi 5: 512 tokens, 100 s wasted).
@@ -214,5 +218,6 @@ class LlamaCppPlanner:
                 res.source = "fallback"
             res.note = f"{why}; reply starts: {text[:200]!r}" if text else why
             return res
-        return PlanResult(plan, planner_calls=1, planning_ms=ms, source="model", note=f"reply starts: {text[:200]!r}",
-                          targets=targets_in(request, memory), zone=find_zone(request, self.zones))
+        return PlanResult(plan, classification="understood", planner_calls=1, planning_ms=ms, source="model",
+                          note=f"reply starts: {text[:200]!r}", targets=targets_in(request, memory),
+                          zone=find_zone(request, self.zones))

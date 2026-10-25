@@ -54,8 +54,13 @@ def clarify_reply(reason: str, stopped: bool) -> str:
     return ("I stopped. " if stopped else "") + (reason + " " if reason else "") + "Please clarify."
 
 
-def _classified(classification: str) -> dict[str, Any]:
-    """How a command was taken, as every proposal result states it: understood, unclear or misheard."""
+CLASSIFICATIONS = ("understood", "unclear", "misheard")
+
+
+def _classified(classification: Any) -> dict[str, Any]:
+    """How a command was taken, as every proposal result states it: understood, unclear or misheard. Fails closed:
+    a value that is none of the three (None, a misspelling, another word) is unclear."""
+    classification = classification if classification in CLASSIFICATIONS else "unclear"
     return {"classification": classification, "needs_clarification": classification != "understood"}
 
 
@@ -143,7 +148,7 @@ class Engine:
     def _refuse(self, request: str, reason: str, classification: str) -> dict[str, Any]:
         """A command refused before planning, recorded as a refused episode like propose()'s refusals."""
         episode_id = new_id("ep")
-        self._episode(episode_id, request, None, {}, "refused", reason, PlanResult(None))
+        self._episode(episode_id, request, None, {}, "refused", reason, PlanResult(None, classification))
         self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", reason)
         return {"kind": "proposal", "operation_id": episode_id, "status": "refused", "reason": reason,
                 **_classified(classification)}
@@ -185,15 +190,15 @@ class Engine:
         classification, stated on every result: "unclear" when the request was refused because what was meant
         is not clear (an unknown object, a time that did not parse), so the person must say it another way;
         "understood" when it was planned, or refused as something the robot may not do. needs_clarification
-        says the same as a bool: true for anything but "understood"."""
+        says the same as a bool: true for anything but "understood". It is what the planner states: a result it
+        did not state understood (a plan included) is refused as unclear, and never proposed."""
         episode_id = new_id("ep")
         cls = classify_refusal(request)
         if cls:
-            why, unclear = cls
-            self._episode(episode_id, request, None, {}, "refused", why, PlanResult(None))
+            why, classification = cls
+            self._episode(episode_id, request, None, {}, "refused", why, PlanResult(None, classification))
             self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", why)
-            return {"operation_id": episode_id, "status": "refused", "reason": why,
-                    **_classified("unclear" if unclear else "understood")}
+            return {"operation_id": episode_id, "status": "refused", "reason": why, **_classified(classification)}
 
         if bundle is None or bundle.goal != request:
             bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
@@ -203,22 +208,23 @@ class Engine:
         skill = self.skills.find(targets, zone) if targets and fixed is None else None
         if fixed is not None:
             plan = {"goal": request, "steps": copy.deepcopy(fixed), "evidence": [], "rules_used": []}
-            res = PlanResult(plan, planner_calls=0, source="fixed", targets=targets, zone=None)
+            res = PlanResult(plan, classification="understood", planner_calls=0, source="fixed", targets=targets,
+                             zone=None)
         elif skill:
             t0 = time.perf_counter()
             plan = {"goal": request, "steps": skill["definition"]["steps"],
                     "evidence": skill["definition"]["evidence"], "rules_used": skill["definition"]["rules_used"],
                     "skill_id": skill["id"]}
-            res = PlanResult(plan, planner_calls=0, planning_ms=(time.perf_counter() - t0) * 1000,
-                             source="skill", targets=targets, zone=zone)
+            res = PlanResult(plan, classification="understood", planner_calls=0,
+                             planning_ms=(time.perf_counter() - t0) * 1000, source="skill", targets=targets, zone=zone)
         else:
             res = self.planner.plan(request, bundle, self.memory)
 
-        if res.plan is None:
-            self._episode(episode_id, request, None, {"bundle": bundle.to_dict()}, "refused", res.refused, res)
-            return {"operation_id": episode_id, "status": "refused", "reason": res.refused,
-                    **_classified("unclear" if res.unclear else "understood"), "memory": bundle.to_dict(),
-                    "planner_calls": res.planner_calls}
+        if res.plan is None or res.classification != "understood":  # refused, or a plan not stated understood
+            why = res.refused or "I'm not sure what you meant."
+            self._episode(episode_id, request, None, {"bundle": bundle.to_dict()}, "refused", why, res)
+            return {"operation_id": episode_id, "status": "refused", "reason": why,
+                    **_classified(res.classification), "memory": bundle.to_dict(), "planner_calls": res.planner_calls}
 
         check = check_plan(res.plan, self.memory, self.zones)
         plan_digest = digest(res.plan)
@@ -242,7 +248,7 @@ class Engine:
         """
         episode_id = new_id("ep")
         plan = {"goal": goal, "steps": steps, "evidence": [], "rules_used": []}
-        res = PlanResult(plan, planner_calls=0, source=source)
+        res = PlanResult(plan, classification="understood", planner_calls=0, source=source)
         check = check_plan(plan, self.memory, self.zones)
         plan_digest = digest(plan)
         status = "proposed" if check.ok else "rejected"

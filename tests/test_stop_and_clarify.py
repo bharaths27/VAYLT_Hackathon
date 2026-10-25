@@ -14,6 +14,7 @@ from conftest import REQUEST, ROOT
 from engram.api import create_app
 from engram.db import connect
 from engram.engine import Engine, clarify_reply
+from engram.planner import PlanResult
 from engram.robot.base import ActionResult
 from engram.robot.mock import MockRobot
 
@@ -253,3 +254,60 @@ def test_every_command_result_states_its_classification(lab, text, kind, cls):
     assert (r["kind"], r["classification"]) == (kind, cls), r
     if kind == "proposal":
         assert r["needs_clarification"] is (cls != "understood")
+
+
+# ---- a planner states how it took every request; the engine fails closed on anything but "understood" ---------
+
+
+class Says:
+    """A planner that returns the result the test gives it."""
+
+    def __init__(self, res):
+        self.res = res
+
+    def plan(self, request, bundle, memory):
+        return self.res
+
+
+GO = {"goal": "go", "steps": [{"op": "go_to_zone", "args": {"zone": "bench"}}], "evidence": [], "rules_used": []}
+
+
+def test_a_planner_result_cannot_be_made_without_its_classification():
+    with pytest.raises(TypeError):
+        PlanResult(None, refused="I don't know which object you mean.")   # a refusal that does not classify itself
+    with pytest.raises(TypeError):
+        PlanResult(GO)
+
+
+@pytest.mark.parametrize("stated", [None, "", "maybe", "Understood"], ids=["none", "empty", "another word", "capital"])
+def test_a_planner_refusal_that_states_no_known_classification_is_unclear_and_stops_the_plan(lab, stated):
+    oid, t, out = start_plan(lab)
+    lab.planner = Says(PlanResult(None, classification=stated, refused="The planner could not resolve it."))
+    r = lab.command("Bring the gizmo to the bench", "test")
+    lab.robot.release.set()
+    t.join(10)
+    assert (r["status"], r["classification"], r["needs_clarification"], r["stopped"]) == ("refused", "unclear", True, True)
+    assert r["reply"] == "I stopped. The planner could not resolve it. Please clarify."
+    assert outcome(lab, oid) == "aborted"
+
+
+@pytest.mark.parametrize("stated", ["unclear", "misheard", None], ids=["unclear", "misheard", "none"])
+def test_a_plan_the_planner_does_not_state_understood_is_refused_and_stops_the_plan(lab, stated):
+    oid, t, out = start_plan(lab)
+    lab.planner = Says(PlanResult(GO, classification=stated))
+    r = lab.command("Go over there", "test")
+    lab.robot.release.set()
+    t.join(10)
+    assert (r["status"], r["classification"], r["stopped"]) == ("refused", stated or "unclear", True)
+    assert "digest" not in r and "plan" not in r and lab.pending() == []      # never proposed, so never approvable
+    assert r["reply"] == "I stopped. I'm not sure what you meant. Please clarify."
+
+
+def test_a_refusal_the_planner_states_understood_while_a_plan_runs_does_not_stop_it(lab):
+    oid, t, out = start_plan(lab)
+    lab.planner = Says(PlanResult(None, classification="understood", refused="That cannot be done as said."))
+    r = lab.command("Bring the gizmo to the bench", "test")
+    lab.robot.release.set()
+    t.join(10)
+    assert (r["status"], r["classification"], r["needs_clarification"]) == ("refused", "understood", False)
+    assert "stopped" not in r and out["run"]["outcome"] == "success"
