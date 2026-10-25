@@ -445,6 +445,33 @@ def test_stop_during_the_finals_prefetch_discards_the_final(spawn, clock, partia
     assert len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("partial_first", [True, False], ids=["reused prediction", "fresh final"])
+@pytest.mark.parametrize("advance,expected", [(0.0, "propose"), (2.5, "clarify")], ids=["in time", "expired"])
+def test_a_prediction_that_expires_during_the_prefetch_is_not_acted_on(spawn, clock, partial_first, advance,
+                                                                        expected):
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_prefetch(text):
+        entered.set()
+        assert release.wait(5)
+        return {"goal": text}
+
+    fake = FakeIntent()
+    gate = SpeculationGate(fake, prefetch=slow_prefetch, clock=clock, spawn=spawn, ttl_s=2.0)
+    if partial_first:
+        gate.on_partial(1, 0, "Open the claw")
+        spawn.run_all()                                  # valid prediction, bundle not fetched yet
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 1, "Open the claw")))
+    t.start()
+    assert entered.wait(5)                               # the final chose its answer and is now prefetching
+    clock.advance(advance)                               # 2.5 s is past the 2 s TTL
+    release.set()
+    t.join(5)
+    assert out["r"].action == expected and len(fake.calls) == 1
+    assert gate.stats.expired == (1 if expected == "clarify" else 0)
+
+
 def test_stop_wins_even_with_malformed_ids(fake, spawn, clock):
     gate = make_gate(fake, spawn, clock)
     assert gate.on_partial(-1, True, "Stop").action == "stop"

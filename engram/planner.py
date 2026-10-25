@@ -50,7 +50,13 @@ class PlanResult:
     zone: str | None = None
 
 
-def refusal(request: str) -> str | None:
+def refusal(request: str, future_ok: bool = False) -> str | None:
+    """Why this request must not be planned, or None.
+
+    future_ok=True is for a request that is being saved as a future task ("... after
+    calibration finishes"): its deferral wording is expected, so only that check is skipped.
+    Refused actions and negations still refuse.
+    """
     low = request.lower()
     for w in REFUSE_WORDS:
         if re.search(rf"\b{re.escape(w)}\b", low):
@@ -59,7 +65,7 @@ def refusal(request: str) -> str | None:
     if neg:
         return (f"You said '{neg.group(1)}', so I will not move anything. "
                 "To make it a rule, say 'Remember that ...'.")
-    hint = FUTURE_HINTS.search(low)
+    hint = None if future_ok else FUTURE_HINTS.search(low)
     if hint:
         return (f"That sounds like something to do later ('{hint.group(1)}'), so I will not move now. "
                 "Say it as 'When <event>, <task>' and I will schedule it.")

@@ -308,6 +308,10 @@ class SpeculationGate:
                 self.stats.stale_dropped += 1
                 return GateResult("none", utterance, revision, text,
                                   reason="Things changed while I was listening. Please say it again.")
+            if self._clock() >= key.expires_at:   # with _current above, this is _valid(): TTL included
+                self.stats.expired += 1
+                return GateResult("clarify", utterance, revision, text,
+                                  reason="That took too long to work out. Please say it again.")
             return self._decide(key, decision, bundle, reused=reused)
 
     # ---- internals (lock held unless noted) ------------------------------------

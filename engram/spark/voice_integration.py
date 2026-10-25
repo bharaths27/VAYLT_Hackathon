@@ -22,7 +22,9 @@ from ..engine import Engine
 from ..planner import refusal
 from ..skills import APPROVED
 from .presets import PRESETS
-from .voice import Classifier, SpeculationGate
+from .voice import Classifier, GateResult, SpeculationGate
+
+ACTING = ("propose", "schedule")   # gate actions that lead to an engine proposal, now or when a trigger fires
 
 
 def memory_version(engine: Engine) -> Hashable:
@@ -49,6 +51,16 @@ class VoiceIntegration:
         self.gate = SpeculationGate(classifier, prefetch=self._prefetch,
                                     context_version=lambda: memory_version(engine), **gate_options)
 
+    @staticmethod
+    def _precheck(r: GateResult) -> str | None:
+        """The one check every branch that acts on a preset, now or later, goes through first.
+
+        The engine's own refusal rules applied to what was actually SAID: the preset's canonical
+        text ("Open the gripper") would hide a refused or negated part of the transcript. The
+        only difference between branches is that a scheduled task may contain its deferral.
+        """
+        return refusal(r.text, future_ok=(r.action == "schedule"))
+
     def _prefetch(self, text: str) -> dict[str, Any]:
         return self.engine.memory.retrieve_memory_bundle(text, self.engine.skills.approved_names()).to_dict()
 
@@ -66,11 +78,11 @@ class VoiceIntegration:
         base = {"heard": r.text, "utterance": r.utterance, "revision": r.revision}
         if r.action == "stop":
             return {"kind": "stop", **base, "state": self.engine.stop()}
-        if r.action == "propose":
-            # The engine's own word rules, applied to what was actually said, not just to the preset text.
-            why = refusal(r.text)
+        if r.action in ACTING:
+            why = self._precheck(r)
             if why:
                 return {"kind": "none", **base, "reason": why}
+        if r.action == "propose":
             preset = PRESETS[r.preset]
             return {**self.engine.command(preset.request, who="voice"), **base, "preset": preset.name,
                     "reused_prediction": r.reused}

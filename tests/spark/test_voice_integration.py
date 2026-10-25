@@ -9,6 +9,7 @@ from engram.checker import check_plan
 from engram.capabilities import CAPABILITIES
 from engram.db import SCHEMA
 from engram.engine import Engine, EngineError
+from engram.planner import refusal
 from engram.robot.mock import MockRobot
 from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
@@ -110,6 +111,32 @@ def test_engine_refusal_words_still_apply_to_what_was_said(taught, spawn, clock)
     out = voice.on_final(1, 0, text)
     assert out["kind"] == "none" and "throw" in out["reason"]
     assert nothing_happened(taught)
+
+
+@pytest.mark.parametrize("text,said", [
+    ("Open the claw and throw the beaker", decision("open_gripper")),                         # act now
+    ("Throw the beaker and open the claw after calibration finishes",                         # act later
+     decision("open_gripper", future=0.95)),
+])
+def test_one_precheck_guards_both_proposing_and_scheduling(taught, spawn, clock, text, said):
+    voice = VoiceIntegration(taught, FakeIntent({text: said}), spawn=spawn, clock=clock)
+    out = voice.on_final(1, 0, text)
+    assert out["kind"] == "none" and "throw" in out["reason"]
+    assert taught.prospective.list() == [] and nothing_happened(taught)
+
+
+def test_a_clean_deferred_preset_is_still_scheduled(taught, spawn, clock):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    out = voice.on_final(1, 0, "Open the claw after calibration finishes")
+    assert out["kind"] == "scheduled" and out["request"] == "Open the gripper"
+    assert [t["request"] for t in taught.prospective.list()] == ["Open the gripper"]
+
+
+def test_refusal_future_ok_skips_only_the_deferral_check():
+    assert "later" in refusal("Open the claw after calibration finishes")
+    assert refusal("Open the claw after calibration finishes", future_ok=True) is None
+    assert "throw" in refusal("Throw it after calibration finishes", future_ok=True)
+    assert "will not move" in refusal("Don't open the claw after calibration", future_ok=True)
 
 
 def test_stop_stops_at_once_without_asking_the_model(voice, fake, spawn):
