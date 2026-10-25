@@ -159,3 +159,29 @@ def test_only_one_process_owner(tmp_path,arena):
     pth=tmp_path/'db'; s=Store(pth); s.register_arena(arena); b=Brain(s,FakeRobot(arena))
     with pytest.raises(Conflict): Store(pth)  # refused before it can migrate or register an arena
     b.close()
+
+
+# ---- every command result states how it was taken, as the console reads it: only "understood" stages a plan ----
+
+class Unsure:
+    """An intent advisor that finds every request materially ambiguous."""
+    model='test-advisor'
+    def route(self,request,*,disclosure_allowed=False): return {'status':'ok','scores':{'ambiguous':0.9}}
+    def evaluate(self,stage,state,questions,*,disclosure_allowed=False): return {'status':'local_only','stage':stage,'scores':{}}
+
+@pytest.mark.parametrize('utterance,kind,cls',[
+    ('stop','stop','understood'),('What happened to Sample A?','answer','understood'),
+    ('Is Sample A on the bench?','answer','understood'),('Remember that the bench is wet.','taught','understood'),
+    ('When calibration ends, bring Sample A to the bench.','scheduled','understood'),
+    ('Bring Sample A to the bench.','proposal','understood'),('Bring the gizmo to the bench.','proposal','unclear')],
+    ids=['stop','recalled','a question','taught','scheduled','planned','a goal that does not parse'])
+def test_every_command_result_states_its_classification(brain,utterance,kind,cls):
+    r=brain.command(utterance,principal='carther')
+    assert (r['kind'],r['classification'],r['needs_clarification'])==(kind,cls,cls!='understood'),r
+    if utterance.startswith('Bring Sample A'): assert r['status']=='proposed' and r['digest']
+
+def test_a_request_the_advisor_finds_ambiguous_states_unclear(arena,clock):
+    s=Store(clock=clock); s.register_arena(arena); b=Brain(s,FakeRobot(arena),intent=Unsure())
+    r=b.command('Bring Sample A to the bench.',principal='carther')
+    assert (r['status'],r['classification'],r['needs_clarification'])==('refused','unclear',True)
+    b.close()
