@@ -18,12 +18,13 @@ class Frame:
     received_at:float
     captured_at:float|None
     digest:str
+    received_mono:float  # receipt on the monotonic clock: what freshness is judged on (a wall clock can step back)
 
 class FrameHub:
     """Polls the camera only while someone is watching: a streaming viewer (watch) or a recent
     single-frame request (touch). Idle_s after the last viewer leaves, polling stops."""
     def __init__(self,fetch:Callable,*,fps:float=10,max_bytes:int=1_000_000,clock=time.time,idle_s:float=5):
-        self.fetch=fetch;self.fps=finite(fps,'display polling rate',1,30);self.max_bytes=max_bytes;self.clock=clock
+        self.fetch=fetch;self.fps=finite(fps,'display polling rate',1,30);self.max_bytes=max_bytes;self.clock=clock;self.monotonic=time.monotonic
         self.idle_s=finite(idle_s,'viewer grace',0,60)
         self.condition=threading.Condition();self.current=None;self.error=None;self.sequence=0
         self._stop=threading.Event();self._wake=threading.Event();self._thread=None;self._viewers=0;self._lease=0.0
@@ -34,8 +35,10 @@ class FrameHub:
         if captured_at is not None: captured_at=finite(captured_at,'capture time',0,now+1)
         with self.condition:
             self.sequence+=1
-            self.current=Frame(self.sequence,jpeg,now,captured_at,hashlib.sha256(jpeg).hexdigest())
+            self.current=Frame(self.sequence,jpeg,now,captured_at,hashlib.sha256(jpeg).hexdigest(),self.monotonic())
             self.error=None;self.condition.notify_all()
+    def receipt_age(self,f:Frame)->float:
+        return self.monotonic()-f.received_mono
     def touch(self):
         """A viewer wants frames now; keep polling for idle_s more seconds."""
         with self.condition:self._lease=max(self._lease,time.monotonic()+self.idle_s)
@@ -76,7 +79,7 @@ class FrameHub:
         with self.condition:
             f=self.current; now=self.clock()
             return {'available':f is not None,'seq':f.seq if f else None,'error':self.error,
-                'receipt_age_s':max(0,now-f.received_at) if f else None,
+                'receipt_age_s':self.receipt_age(f) if f else None,
                 'capture_age_s':max(0,now-f.captured_at) if f and f.captured_at is not None else None,
                 'freshness_basis':'capture' if f and f.captured_at is not None else 'receipt_only_capture_unknown',
                 'buffered_frames':1 if f else 0,'configured_poll_fps':self.fps,'polling':self._viewers>0 or time.monotonic()<self._lease,'viewers':self._viewers}
@@ -89,7 +92,8 @@ class LocalJPEG:
         self.timeout=finite(timeout_s,'camera timeout',.1,5)
     def __call__(self):
         request=urllib.request.Request(self.url,headers={'Accept':'image/jpeg','Cache-Control':'no-cache'},method='GET')
-        with urllib.request.build_opener(NoRedirect).open(request,timeout=self.timeout) as response:
+        # ProxyHandler({}): never through HTTP(S)_PROXY; a proxy could serve a fabricated frame as the local camera.
+        with urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect).open(request,timeout=self.timeout) as response:
             data=response.read(1_000_001)
             captured=response.headers.get('X-Frame-Captured-At')
         return data,float(captured) if captured else None

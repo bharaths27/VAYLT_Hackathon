@@ -380,8 +380,8 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         f=None
         if hub:
             hub.touch();f=hub.latest() # a viewer: the poller runs while frames are being requested
-            if not f or time.time()-f.received_at>2:f=hub.latest(after=f.seq if f else 0,wait_s=1)
-        if not f or time.time()-f.received_at>2:raise HTTPException(503,'camera frame unavailable/stale')
+            if not f or hub.receipt_age(f)>2:f=hub.latest(after=f.seq if f else 0,wait_s=1)
+        if not f or hub.receipt_age(f)>2:raise HTTPException(503,'camera frame unavailable/stale')
         return Response(f.jpeg,media_type='image/jpeg',headers={'X-Frame-Sequence':str(f.seq),'X-Frame-Received-At':str(f.received_at),'X-Frame-Captured-At':str(f.captured_at) if f.captured_at else 'unknown'})
     @app.get('/video.mjpg')
     async def video(req:Request,principal=Depends(operator)):
@@ -391,7 +391,7 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
             try:
                 while not await req.is_disconnected():
                     f=await asyncio.to_thread(hub.latest,after=seq,wait_s=.5)
-                    if f and time.time()-f.received_at<2:
+                    if f and hub.receipt_age(f)<2:
                         seq=f.seq
                         yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
             finally:hub.unwatch()

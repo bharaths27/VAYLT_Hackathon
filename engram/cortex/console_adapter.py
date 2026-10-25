@@ -18,7 +18,8 @@ def authorized_client(url:str,*,timeout:float=30,transport=None):
     validate_loopback(url)
     key=os.environ.get('CORTEX_API_TOKEN','')
     if len(key)<32:raise Denied('configure the console server operator credential')
-    return httpx.AsyncClient(timeout=timeout,headers={'Authorization':'Bearer '+key},transport=transport,follow_redirects=False)
+    # trust_env=False: no HTTP(S)_PROXY/ALL_PROXY or .netrc, so the bearer token only ever goes to the loopback API.
+    return httpx.AsyncClient(timeout=timeout,headers={'Authorization':'Bearer '+key},transport=transport,follow_redirects=False,trust_env=False)
 
 def console_status(res:dict)->str:
     """Cortex outcome -> console card status. Only an attested PHYSICAL success is VERIFIED;
