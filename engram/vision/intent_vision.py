@@ -113,7 +113,7 @@ def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
     if not MIN_SIDE <= max_side <= MAX_SIDE:
         raise ValueError(f"max_side must be in [{MIN_SIDE}, {MAX_SIDE}]")
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
     except ImportError:
         return _prepare_cv2(data, max_side)
     try:
@@ -121,6 +121,10 @@ def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
         img.load()
     except Exception as e:  # noqa: BLE001 - any decode failure is "not an image"
         raise VisionError(f"not a readable image: {type(e).__name__}") from None
+    try:  # a phone photo stores its rotation in EXIF and re-encoding drops it: apply it first (OpenCV's decode does)
+        img = ImageOps.exif_transpose(img)
+    except Exception:  # noqa: BLE001 - a malformed EXIF block is ignored; the pixels are still the photo
+        pass
     if "transparency" in img.info or any(band in ("A", "a") for band in img.getbands()):
         rgba = img.convert("RGBA")
         img = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba)

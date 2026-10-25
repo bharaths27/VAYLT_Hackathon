@@ -19,6 +19,7 @@ import http.client
 import json
 import math
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -50,12 +51,45 @@ def _robot_url(text: str) -> str:
     return text
 
 
-def robot_frame(base: str) -> bytes:
-    try:
-        with urllib.request.urlopen(base.rstrip("/") + "/robot/frame?annotate=false&quality=85", timeout=5) as r:
-            return r.read()
-    except http.client.HTTPException as e:  # e.g. IncompleteRead: a truncated reply is a failed frame, not a crash
-        raise VisionError(f"robot frame: {type(e).__name__}") from None
+MAX_FRAME_BYTES = 8 << 20  # a robot JPEG is a few hundred KB; anything this big is not a frame
+
+
+def robot_frame(base: str, deadline_s: float = 5.0, max_bytes: int = MAX_FRAME_BYTES) -> bytes:
+    """One frame from the robot server, within a wall-clock deadline and a size cap. urlopen's timeout bounds each
+    read, not the whole reply, so a server that stalls or drips bytes could hang the CLI (luna round 9). The fetch
+    runs on a daemon thread; the caller stops waiting at the deadline and the thread stops at its next read."""
+    url = base.rstrip("/") + "/robot/frame?annotate=false&quality=85"
+    result: dict = {}
+    finished, abandoned = threading.Event(), threading.Event()
+
+    def work() -> None:
+        try:
+            with urllib.request.urlopen(url, timeout=deadline_s) as r:
+                parts, size = [], 0
+                while not abandoned.is_set():
+                    chunk = r.read(64 << 10)
+                    if not chunk:
+                        result["frame"] = b"".join(parts)
+                        return
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise VisionError(f"robot frame: larger than {max_bytes} bytes")
+                    parts.append(chunk)
+        except http.client.HTTPException as e:  # e.g. IncompleteRead: a truncated reply is a failed frame, not a crash
+            result["error"] = VisionError(f"robot frame: {type(e).__name__}")
+        except BaseException as e:  # noqa: BLE001 - handed to the caller below
+            result["error"] = e
+        finally:
+            finished.set()
+
+    threading.Thread(target=work, name="robot-frame", daemon=True).start()
+    if not finished.wait(deadline_s):
+        abandoned.set()
+        raise VisionError("robot frame: deadline exceeded")
+    err = result.get("error")
+    if err is not None:  # OSError (a refused or timed-out connection) keeps its type: run() reports it as a failed frame
+        raise err if isinstance(err, (VisionError, OSError)) else VisionError(f"robot frame: {type(err).__name__}")
+    return result["frame"]
 
 
 def open_webcam(index: int):

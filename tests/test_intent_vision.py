@@ -433,3 +433,65 @@ def test_the_cli_refuses_a_robot_address_that_is_not_an_http_url(url):
     # luna round 8: --robot "" satisfied the required source group, read as false, and fell through to the webcam
     r = _cli("hand", "--robot", url, env_extra={"TYPESAFE_API_KEY": KEY, "TYPESAFE_INTENT_MODEL": "m"})
     assert r.returncode == 2 and "--robot" in r.stderr and r.stdout == ""
+
+
+class _Reply:
+    """A stand-in urlopen reply: hands out `chunks` one read at a time (then b""), sleeping `pause` s before each."""
+
+    def __init__(self, chunks, pause=0.0):
+        self.chunks, self.pause = iter(chunks), pause
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        import time
+        time.sleep(self.pause)
+        return next(self.chunks, b"")
+
+
+def test_a_robot_frame_is_read_whole_and_returned(monkeypatch):
+    va = _vision_ask()
+    monkeypatch.setattr(va.urllib.request, "urlopen", lambda *a, **k: _Reply([b"jpeg ", b"bytes"]))
+    assert va.robot_frame("http://robot.invalid:8200") == b"jpeg bytes"
+
+
+def test_a_robot_server_that_drips_bytes_is_a_failed_frame_at_the_deadline(monkeypatch):
+    # luna round 9: urlopen's timeout bounds each read, not the reply, so a dripping server hung a one-shot run
+    import itertools
+    import time
+
+    va = _vision_ask()
+    monkeypatch.setattr(va.urllib.request, "urlopen", lambda *a, **k: _Reply(itertools.repeat(b"x"), pause=0.05))
+    started = time.monotonic()
+    with pytest.raises(iv.VisionError, match="deadline"):
+        va.robot_frame("http://robot.invalid:8200", deadline_s=0.4)
+    assert time.monotonic() - started < 2.0
+
+
+def test_a_robot_frame_over_the_size_cap_is_a_failed_frame(monkeypatch):
+    import itertools
+
+    va = _vision_ask()
+    monkeypatch.setattr(va.urllib.request, "urlopen", lambda *a, **k: _Reply(itertools.repeat(b"x" * 65536)))
+    with pytest.raises(iv.VisionError, match="larger than"):
+        va.robot_frame("http://robot.invalid:8200", max_bytes=200_000)
+
+
+@pytest.mark.parametrize("pillow", [True, False])
+def test_a_phone_photo_is_sent_the_right_way_up(monkeypatch, pillow):
+    # luna round 9: the Pillow path re-encoded without applying the EXIF orientation, so a photo stored sideways
+    # (as phones store portrait shots) reached the model sideways; OpenCV's decode already applies it
+    Image = pytest.importorskip("PIL.Image")
+    buf = io.BytesIO()
+    exif = Image.Exif()
+    exif[0x0112] = 6  # EXIF orientation 6: turn 90 degrees clockwise to view
+    Image.new("RGB", (600, 300), (10, 120, 200)).save(buf, "JPEG", exif=exif)
+    if not pillow:
+        pytest.importorskip("cv2")
+        monkeypatch.setitem(sys.modules, "PIL", None)
+    w, h, fmt = image_size(iv.prepare_jpeg(buf.getvalue()))
+    assert fmt == "JPEG" and h > w, (w, h)
