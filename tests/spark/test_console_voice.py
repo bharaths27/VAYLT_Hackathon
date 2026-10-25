@@ -341,6 +341,32 @@ def test_closing_the_pool_stops_its_thread_and_a_later_clip_starts_afresh(stt, w
     client.close()
 
 
+def test_whisper_cli_gets_the_audio_context_and_the_vocabulary_prompt(stt, monkeypatch):
+    assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "pick up the beaker"
+    ((_, cmd),) = stt.calls
+    assert cmd[cmd.index("-ac") + 1] == "512"
+    assert cmd[cmd.index("--prompt") + 1] == config.WHISPER_PROMPT and "claw" in config.WHISPER_PROMPT
+    stt.calls.clear()
+    monkeypatch.setattr(config, "WHISPER_AUDIO_CTX", 0)  # whisper's own defaults
+    monkeypatch.setattr(config, "WHISPER_PROMPT", "")
+    assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "pick up the beaker"
+    ((_, cmd),) = stt.calls
+    assert "-ac" not in cmd and "--prompt" not in cmd
+
+
+def test_the_whisper_server_gets_them_with_every_request(stt, whisper_server, monkeypatch):
+    prompt = config.WHISPER_PROMPT
+    monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"])
+    assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "hello from the server"
+    monkeypatch.setattr(config, "WHISPER_AUDIO_CTX", 0)
+    monkeypatch.setattr(config, "WHISPER_PROMPT", "")
+    assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "hello from the server"
+    (_, _, first), (_, _, second) = whisper_server["requests"]
+    assert b'name="audio_ctx"\r\n\r\n512\r\n' in first
+    assert b'name="prompt"\r\n\r\n' + prompt.encode() + b"\r\n" in first
+    assert b'name="audio_ctx"' not in second and b'name="prompt"' not in second  # the server's own defaults
+
+
 def test_server_alone_is_enough(stt, whisper_server, monkeypatch, tmp_path):
     monkeypatch.setattr(config, "WHISPER_SERVER_URL", whisper_server["url"])
     monkeypatch.setattr(config, "WHISPER_BIN", str(tmp_path / "no-cli"))
@@ -1260,17 +1286,36 @@ def test_queue_limits_are_validated(monkeypatch, raw, expected):
     assert config._count("ENGRAM_STT_MAX_PENDING", 4, 64) == expected
 
 
+@pytest.mark.parametrize("raw,expected", [("0", 0), ("384", 384), ("512", 512), ("768", 768), ("1500", 1500),
+                                          ("256", 512), ("383", 512), ("1501", 512), ("-1", 512), ("lots", 512)])
+def test_the_audio_context_is_validated(monkeypatch, raw, expected):
+    monkeypatch.setenv("ENGRAM_WHISPER_AUDIO_CTX", raw)
+    assert config._audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 512) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [("x" * 900, "x" * 500), ("  ", ""), ("Open the claw.", "Open the claw.")],
+                         ids=["900-chars", "blank", "sentence"])
+def test_the_vocabulary_prompt_is_trimmed_and_capped(raw, expected):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ENGRAM_")}
+    env["ENGRAM_WHISPER_PROMPT"] = raw
+    out = subprocess.run([sys.executable, "-c", "from console.server import config; print(repr(config.WHISPER_PROMPT))"],
+                         cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == repr(expected)
+
+
 @pytest.mark.parametrize("bad", ["inf", "nan", "-5", "1e9"])
 def test_bad_settings_fall_back_to_defaults_at_startup(bad):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ENGRAM_")}
     env.update(ENGRAM_WHISPER_SERVER_TIMEOUT_S=bad, ENGRAM_STT_MAX_PENDING=bad, ENGRAM_STT_MAX_SECONDS=bad,
-               ENGRAM_STT_MAX_PENDING_BYTES=bad, ENGRAM_TTS_MAX_PENDING=bad, ENGRAM_STT_UPLOAD_TIMEOUT_S=bad)
+               ENGRAM_STT_MAX_PENDING_BYTES=bad, ENGRAM_TTS_MAX_PENDING=bad, ENGRAM_STT_UPLOAD_TIMEOUT_S=bad,
+               ENGRAM_WHISPER_AUDIO_CTX=bad)
     code = ("from console.server import config as c; "
             "print(c.WHISPER_SERVER_TIMEOUT_S, c.STT_MAX_PENDING, c.STT_MAX_PENDING_BYTES, c.TTS_MAX_PENDING, "
-            "c.STT_MAX_SECONDS, c.STT_UPLOAD_TIMEOUT_S)")
+            "c.STT_MAX_SECONDS, c.STT_UPLOAD_TIMEOUT_S, c.WHISPER_AUDIO_CTX)")
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0", "20.0"]
+    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0", "20.0", "512"]
 
 
 def test_a_server_that_never_finishes_answering_hits_the_overall_deadline(stt, whisper_server, monkeypatch):

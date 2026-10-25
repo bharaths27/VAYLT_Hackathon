@@ -30,6 +30,16 @@ def _count(name: str, default: int, cap: int) -> int:
     return n if 0 < n <= cap else default
 
 
+def _audio_ctx(name: str, default: int) -> int:
+    """0 (whisper's own default, all 1500) or 384..1500; anything else gives the default. Below
+    ~384 whisper starts repeating words (256 measured unsafe: multi-second hallucinations)."""
+    try:
+        n = int(_env(name, str(default)))
+    except ValueError:
+        return default
+    return n if n == 0 or 384 <= n <= 1500 else default
+
+
 # Where Brian's robot adapter lives. "mock" = built-in simulator.
 ROBOT_URL = _env("ENGRAM_ROBOT_URL", "mock")
 # Where Bharath's memory API lives. "mock" = built-in sample memory.
@@ -58,6 +68,17 @@ FFMPEG_BIN = _env("ENGRAM_FFMPEG_BIN", "ffmpeg")
 WHISPER_SERVER_URL = _env("ENGRAM_WHISPER_SERVER_URL", "")
 # One overall deadline for the whole server request (connect, upload, answer), at most 120 s.
 WHISPER_SERVER_TIMEOUT_S = _seconds("ENGRAM_WHISPER_SERVER_TIMEOUT_S", 30.0, 120.0)
+# whisper's audio context (encoder frames; 1500 = 30 s). Our clips are a few seconds, so a smaller
+# context is much faster: 0 = whisper's default, else 384..1500. Passed to whisper-cli as -ac N,
+# and to the whisper server with every request as its audio_ctx form field (whisper.cpp's
+# /inference reads it per request; the server's own -ac start flag is only its default).
+WHISPER_AUDIO_CTX = _audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 512)
+# Initial prompt naming the robot's vocabulary, so whisper hears "claw" rather than "cloth" or
+# "clock". Passed to whisper-cli as --prompt and to the server as its prompt form field; empty =
+# none. A sentence of nouns, not a list of commands: measured, a bare word list did not help and a
+# prompt full of command phrases gets copied into transcripts.
+WHISPER_PROMPT = _env("ENGRAM_WHISPER_PROMPT", "A lab robot with a claw (its gripper), a beaker, goggles, "
+                      "a sample, a bench, a shelf, a tray and a station.").strip()[:500]
 # Longest clip STT accepts, measured on the decoded audio (at most 120 s). ffmpeg stops decoding
 # just past it, and longer clips are refused before whisper sees them.
 STT_MAX_SECONDS = _seconds("ENGRAM_STT_MAX_SECONDS", 30.0, 120.0)

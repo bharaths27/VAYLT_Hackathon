@@ -516,8 +516,13 @@ def _server_transcribe(endpoint: str, wav: Path) -> tuple[str | None, str]:
     accepts and then trickles or never answers cannot hold the STT worker. (None, reason) on
     any failure; the caller then uses whisper-cli."""
     limit = config.WHISPER_SERVER_TIMEOUT_S
+    fields = {"response_format": "json"}
+    if config.WHISPER_AUDIO_CTX:
+        fields["audio_ctx"] = str(config.WHISPER_AUDIO_CTX)
+    if config.WHISPER_PROMPT:
+        fields["prompt"] = config.WHISPER_PROMPT
     try:
-        return _WHISPER_HTTP.post(endpoint, wav, {"response_format": "json"}, limit)
+        return _WHISPER_HTTP.post(endpoint, wav, fields, limit)
     except (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError):
         return None, f"whisper server failed: no answer within {limit:g} s"
     except Exception as e:  # noqa: BLE001 - any failure means: use whisper-cli instead
@@ -577,8 +582,12 @@ def _transcribe_job(audio: bytes, suffix: str, details: dict | None = None) -> t
             text, server_why = _server_transcribe(server, wav)
             if text is not None or not cli:
                 return text, server_why
-        p = subprocess.run([config.WHISPER_BIN, "-m", config.WHISPER_MODEL, "-f", str(wav), "-nt", "-np", "-t", "4"],
-                           capture_output=True, timeout=40)
+        cmd = [config.WHISPER_BIN, "-m", config.WHISPER_MODEL, "-f", str(wav), "-nt", "-np", "-t", "4"]
+        if config.WHISPER_AUDIO_CTX:
+            cmd += ["-ac", str(config.WHISPER_AUDIO_CTX)]
+        if config.WHISPER_PROMPT:
+            cmd += ["--prompt", config.WHISPER_PROMPT]
+        p = subprocess.run(cmd, capture_output=True, timeout=40)
         if p.returncode != 0:
             return None, "whisper failed: " + p.stderr.decode()[-200:] + (f" ({server_why})" if server_why else "")
         return p.stdout.decode().strip(), f"ok (whisper-cli; {server_why})" if server_why else "ok"
