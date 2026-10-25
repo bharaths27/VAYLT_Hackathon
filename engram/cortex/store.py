@@ -86,6 +86,12 @@ class Store:
         self.policy = policy or Policy()
         self.clock = clock
         self.lock = threading.RLock()
+        # The vault's authority. A transaction that may withdraw authority from a running plan (a revocation, a new
+        # constraint, a changed binding: authority_tx) holds it, and so does each plan step from its final check through
+        # its dispatch (Brain._execute): such a change never lands between the two. It waits for the dispatched step, and
+        # the next step's check sees it. Always taken before self.lock (held_authority enforces the order).
+        self.authority = threading.RLock()
+        self._held = threading.local()
         self._depth = 0
         # Own the vault before the first write (WAL switch, migration, arena registration).
         # lock=False only for a caller that already holds vault_lock for this path.
@@ -119,6 +125,7 @@ class Store:
             savepoint = f'cx_sp_{self._depth}'
             self.conn.execute('BEGIN IMMEDIATE' if root else f'SAVEPOINT {savepoint}')
             self._depth += 1
+            self._held.tx = getattr(self._held, 'tx', 0) + 1
             try:
                 yield self.conn
             except BaseException:
@@ -140,6 +147,28 @@ class Store:
                     # A refused COMMIT (e.g. a deferred constraint) leaves the transaction open; never wedge the shared connection.
                     if self.conn.in_transaction: self.conn.rollback()
                     raise
+            finally:
+                self._held.tx -= 1
+
+    @contextmanager
+    def held_authority(self):
+        """Hold the vault's authority (see __init__). Taken before the store lock, never from inside a transaction that
+        does not already hold it: that one order keeps a revocation and a dispatching step from deadlocking."""
+        if getattr(self._held, 'tx', 0) and not getattr(self._held, 'authority', 0):
+            raise RuntimeError('lock order: take the vault authority before opening a transaction')
+        with self.authority:
+            self._held.authority = getattr(self._held, 'authority', 0) + 1
+            try:
+                yield
+            finally:
+                self._held.authority -= 1
+
+    @contextmanager
+    def authority_tx(self):
+        """A transaction that may withdraw authority from a running plan: it never commits between a step's final check
+        and its dispatch."""
+        with self.held_authority(), self.tx():
+            yield self.conn
 
     def rows(self, sql: str, args=()) -> list[dict]:
         with self.lock:
@@ -159,7 +188,7 @@ class Store:
         if not isinstance(arena, dict) or not isinstance(arena.get('zones'), (list, dict)):
             raise CortexError('arena needs zones and objects')
         zones = arena['zones']
-        with self.tx():
+        with self.authority_tx():                         # a changed binding withdraws what a running plan rests on
             for z in zones:
                 text(z, 'zone', 80)
                 existing = self.one('SELECT * FROM cx_station WHERE id=?', (z,))
@@ -407,7 +436,9 @@ class Store:
             text(n, 'task name', 100)
             Goal.from_dict(g)
         sid, cid, t = uid('src'), uid('chk'), self.clock()
-        with self.tx():
+        # A source may add a constraint or retire the one it revises; a commitment adds none (and is scheduled from inside
+        # the caller's transaction).
+        with (self.tx() if commitment else self.authority_tx()):
             rev = 1
             if supersedes:
                 prior = self.source_state(supersedes)
@@ -482,7 +513,7 @@ class Store:
 
     def revoke_source(self, sid: str, *, delete: bool = False) -> None:
         self.source_state(sid)
-        with self.tx():
+        with self.authority_tx():
             self.conn.execute('UPDATE cx_source SET status=? WHERE source_id=?', ('deleted' if delete else 'revoked', sid))
             self.conn.execute("UPDATE cx_rule SET status='revoked' WHERE assertion_id IN (SELECT id FROM assertion WHERE source_id=?)", (sid,))
             if delete:
@@ -742,7 +773,7 @@ class Store:
 
     def resolve_rule(self, assertion_id: str, *, principal: str, reason: str):
         text(principal,'reviewer',100); text(reason,'adjudication reason',1000)
-        with self.tx():
+        with self.authority_tx():
             r=next((x for x in self.rules() if x['id']==assertion_id),None)
             if not r: raise Missing('no current rule to resolve')
             self.conn.execute("UPDATE cx_rule SET status='overridden' WHERE rule_key=? AND status IN ('active','disputed')",(r['rule_key'],))

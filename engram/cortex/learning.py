@@ -109,7 +109,8 @@ class Skills:
 
     def revoke(self,sid: str):
         self.get(sid)
-        with self.store.tx(): self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
+        # Never between a running step's final check and its dispatch (Store.authority_tx).
+        with self.store.authority_tx(): self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
 
     def identity_refs(self, goal: Goal, refs: list[str]) -> list[str]:
         """The refs that identify a procedure: the sources and rules it rests on, which revocation follows. What only

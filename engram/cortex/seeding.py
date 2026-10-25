@@ -21,7 +21,7 @@ def load_seed(store,seed:dict,*,principal:str,runtime_mode:str='SIMULATED')->dic
     if getattr(store,'runtime_mode','SIMULATED')!='SIMULATED':raise Denied('this vault belongs to a PHYSICAL runtime; synthetic seed data is refused')
     if not isinstance(seed['sources'],list) or len(seed['sources'])>16:raise CortexError('seed source budget exceeded')
     fingerprint=digest(seed);key='cortex_seed:'+sid
-    with store.tx():
+    with store.authority_tx():               # it teaches sources: the vault's authority first, then the transaction
         previous=store.one('SELECT value FROM meta WHERE key=?',(key,))
         if previous:
             import json

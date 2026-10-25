@@ -312,32 +312,36 @@ class Brain:
         op=self.operation(ep)
         try:
             for i,s in enumerate(plan['steps']):
-                if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
-                if self.store.basis(goal)!=plan['basis'] or not self.store.refs_valid(plan['refs']):
-                    raise Stale('evidence changed while executing')
-                validate_step(s,set(tags.values()),self.store.zones())
-                # Observe/location steps must actually return a current observation before picking.
-                if s['op']=='pick_tagged_object':
-                    oid=s['args']['object_id']
-                    if oid not in seen: raise Missing('no fresh in-operation observation for pickup')
-                    for rule in self.store.related_rules(goal):
-                        if rule['subject']==oid:
-                            obj=next(o for o in self.store.objects() if o['id']==rule['object'])
-                            if not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
-                                raise Missing('prerequisite not currently observed at required station')
-                self.journal(ep,s['op'],s['args'],'pending',step=i)
-                # The recipe or skill behind this plan must still back it at every step: a revocation mid-run stops it.
-                changed=self._provenance_changed(op,plan)
-                if changed: raise Stale(changed+' while executing')
-                # STOP interlock: the last check sits immediately before dispatch (no validation or I/O in between),
-                # and the adapter refuses motion once stop() reached it, so a STOP in this gap cannot dispatch the step.
-                if self._stopped.is_set():
-                    self.journal(ep,s['op'],s['args'],'not_dispatched','stop arrived before dispatch',i); outcome='aborted'; reason='stop requested'; break
-                moved=moved or s['op'] in PHYSICAL
-                try: result=self.robot.execute(s['op'],s['args'])
-                except Exception:
-                    self.journal(ep,s['op'],s['args'],'unknown','adapter exception; no automatic retry',i)
-                    outcome='unknown'; reason='adapter exception after possible effect'; break
+                # From its first check through its dispatch a step holds the vault's authority: a revocation, a new
+                # constraint or a changed binding never commits in between. It waits for the dispatched step, and the
+                # next step's check sees it.
+                with self.store.held_authority():
+                    if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
+                    if self.store.basis(goal)!=plan['basis'] or not self.store.refs_valid(plan['refs']):
+                        raise Stale('evidence changed while executing')
+                    validate_step(s,set(tags.values()),self.store.zones())
+                    # Observe/location steps must actually return a current observation before picking.
+                    if s['op']=='pick_tagged_object':
+                        oid=s['args']['object_id']
+                        if oid not in seen: raise Missing('no fresh in-operation observation for pickup')
+                        for rule in self.store.related_rules(goal):
+                            if rule['subject']==oid:
+                                obj=next(o for o in self.store.objects() if o['id']==rule['object'])
+                                if not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
+                                    raise Missing('prerequisite not currently observed at required station')
+                    self.journal(ep,s['op'],s['args'],'pending',step=i)
+                    # The recipe or skill behind this plan must still back it at every step: a revocation mid-run stops it.
+                    changed=self._provenance_changed(op,plan)
+                    if changed: raise Stale(changed+' while executing')
+                    # STOP interlock: the last check sits immediately before dispatch (no validation or I/O in between),
+                    # and the adapter refuses motion once stop() reached it, so a STOP in this gap cannot dispatch the step.
+                    if self._stopped.is_set():
+                        self.journal(ep,s['op'],s['args'],'not_dispatched','stop arrived before dispatch',i); outcome='aborted'; reason='stop requested'; break
+                    moved=moved or s['op'] in PHYSICAL
+                    try: result=self.robot.execute(s['op'],s['args'])
+                    except Exception:
+                        self.journal(ep,s['op'],s['args'],'unknown','adapter exception; no automatic retry',i)
+                        outcome='unknown'; reason='adapter exception after possible effect'; break
                 for oid,proof in getattr(result,'location_evidence',{}).items():
                     current=next((x for x in self.store.objects() if x['id']==oid),None)
                     if current and current['fresh'] and current['last_observation_id']==proof.get('observation_id') and current['last_seen_at']==proof.get('captured_at') and current['last_zone']==proof.get('zone'):
