@@ -250,8 +250,11 @@ class Brain:
                     r=self.operation(ep); plan=r['plan']
                     if r['owner']!=principal: raise Denied('approver does not own this operation')
                     if r['status']!='proposed': raise Conflict('operation is not awaiting approval')
-                    # The durable latch is the authority; the event and the adapter flag are faster copies of it.
-                    if self._stopped.is_set() or self.robot.state().get('stopped') or self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): raise Denied('stop is latched')
+                    # The durable latch is the authority; the event and the adapter flag are faster copies of it. An adapter
+                    # that does not report its stop state as an explicit False may be stopped: no motion either.
+                    adapter=self.robot.state().get('stopped')
+                    if self._stopped.is_set() or adapter or self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): raise Denied('stop is latched')
+                    if adapter is not False: raise Denied('the adapter does not report its stop state; motion is refused')
                     self._require_reconciled('new motion')
                     if self.store.clock()>=r['expires_at']: raise Stale('proposal expired')
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
@@ -395,7 +398,8 @@ class Brain:
         # the adapter re-armed) or that the adapter does not report leaves the vault latched, so a restart still refuses
         # motion, and the robot is stopped again. Motion stays refused meanwhile: approval reads the latch and the event.
         try:
-            self.robot.reset_stop(); why='it still reports stopped' if self.robot.state().get('stopped') else None
+            self.robot.reset_stop(); s=self.robot.state().get('stopped')                  # only an explicit False confirms it
+            why=None if s is False else 'it still reports stopped' if s else 'it does not report its stop state'
         except Exception as e: why=type(e).__name__
         if why:
             self._restop(); raise Conflict(f'the adapter did not confirm the reset ({why}); the robot stays stopped and the stop stays latched')

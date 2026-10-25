@@ -84,11 +84,11 @@ def test_a_motion_conditional_naming_nothing_registered_is_scoped_to_everything(
     brain.store.teach('Rule','Nothing may be moved unless a supervisor approves.',owner='carther')
     with pytest.raises(Missing,match='structured review'): brain.command('Go to the bench',principal='carther')
 
-def test_any_conditional_naming_nothing_registered_fails_closed(brain):
-    # Round 5: no wording test tells a harmless exception from a safety one, so every unparsed conditional that
-    # names nothing registered is scoped to everything until a person reviews it.
-    brain.store.teach('Note','Lunch is served daily except Sunday.',owner='carther')
-    with pytest.raises(Missing,match='structured review'): brain.command('Go to the bench',principal='carther')
+def test_a_conditional_remark_naming_nothing_does_not_freeze_the_robot(brain):
+    # Round 8 (warden): a statement naming nothing blocks everything only as an instruction about handling or motion;
+    # a remark is listed for review but blocks no plan. (Rounds 3 and 5 scoped every such conditional to everything.)
+    assert brain.store.teach('Note','Lunch is served daily except Sunday.',owner='carther')['unresolved_rules']
+    assert brain.command('Go to the bench',principal='carther')['status']=='proposed'
 
 
 # P2-5: an alias two objects share is refused, never read as "both of them".

@@ -112,19 +112,23 @@ async def stop_task(task):
     task.cancel();await asyncio.gather(task,return_exceptions=True)
 
 class Guard:
-    """Outermost pure-ASGI gate. A cross-site or uncredentialed mutation is refused before ONE body
-    byte is read; every body is counted as it arrives (declared or chunked) and refused past MAX_BODY.
-    Route dependencies still decide operator versus sensor; this only checks that a credential exists."""
-    def __init__(self,app,*,credentials):self.app=app;self.credentials=[c.encode() for c in credentials]
+    """Outermost pure-ASGI gate. A cross-site mutation, or one without a credential of its route's role (a sensor
+    credential on a sensor route, an operator credential on every other), is refused before ONE body byte is read;
+    every body is counted as it arrives (declared or chunked) and refused past MAX_BODY. Route dependencies still
+    decide the principal; this only checks that a credential of the right role exists."""
+    def __init__(self,app,*,credentials,sensor_credentials=(),sensor_paths=frozenset()):
+        self.app=app;self.credentials=[c.encode() for c in credentials]
+        self.sensor_credentials=[c.encode() for c in sensor_credentials];self.sensor_paths=frozenset(sensor_paths)
     async def __call__(self,scope,receive,send):
         if scope['type']!='http':return await self.app(scope,receive,send)
         h={k.decode('latin-1').lower():v.decode('latin-1') for k,v in scope['headers']}
         if scope['method'] not in SAFE_METHODS:
             # Refuse cross-site browser mutations; serve through a paired same-origin TLS proxy.
             if h.get('sec-fetch-site')=='cross-site':return await refuse(send,403,'cross-site mutation refused')
-            auth=h.get('authorization','')
-            if not (auth.startswith('Bearer ') and any(hmac.compare_digest(auth[7:].encode(),c) for c in self.credentials)):
-                return await refuse(send,401,'operator credential required')
+            auth=h.get('authorization','');sensor=scope.get('path') in self.sensor_paths
+            role=self.sensor_credentials if sensor else self.credentials
+            if not (auth.startswith('Bearer ') and any(hmac.compare_digest(auth[7:].encode(),c) for c in role)):
+                return await refuse(send,401,'trusted sensor credential required' if sensor else 'operator credential required')
         try:declared=int(h.get('content-length','0'))
         except ValueError:return await refuse(send,400,'invalid length')
         if declared>MAX_BODY:return await refuse(send,413,'input too large')
@@ -245,7 +249,7 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         csp=response.headers.get('Content-Security-Policy')
         response.headers['Content-Security-Policy']=(csp+'; ' if csp else '')+"frame-ancestors 'none'"
         return response
-    app.add_middleware(Guard,credentials=[*keys,*skeys]) # added last = outermost
+    app.add_middleware(Guard,credentials=list(keys),sensor_credentials=list(skeys),sensor_paths={'/observations/sensor'}) # added last = outermost
     adapter_label=b.robot.state().get('adapter')
     @app.get('/health')
     def health():return {'ok':True,'robot':adapter_label,'mode':b.mode,'service':'cortex'}

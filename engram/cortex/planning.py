@@ -270,7 +270,7 @@ class Compiler:
         f=copy.deepcopy(fixture or self.fixture(symbolic=True))   # no live world given: the symbolic start state
         rules=self.store.related_rules(goal)
         relevant=set(goal.targets)|{r['object'] for r in rules}
-        if self.store.unresolved_for(self.store.scope(goal,rules)):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
+        if self.store.unresolved_for(self.store.scope(goal,rules),handles=goal.kind=='fetch'):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
         if self.store.prohibitions(relevant) and goal.kind=='fetch': raise DeniedPlan('current source prohibits moving an involved object')
         if any(r['status']!='active' for r in rules): raise Conflict('conflicting applicable source rules need resolution')
         positions=dict(f['positions']); steps=[]; ancestry=set()

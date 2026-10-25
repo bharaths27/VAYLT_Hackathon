@@ -32,7 +32,7 @@ FAIL_CLOSED=[
     ('Sample B is flammable.',{'sample_b'}),
     ('Everything may be moved if approved.',{'*'}),
     ('Nothing is safe to move today.',{'*'}),
-    ('Lunch is served daily except Sunday.',{'*'}),
+    # ('Lunch is served daily except Sunday.' blocks nothing since round 8: a remark naming nothing never freezes the robot)
     # only the conditional catches these (no hazard, permission or deontic word)
     ('Sample A goes to the bench if it is clean.',{'sample_a','bench'}),
     ('Provided it is dry, Sample B goes on shelf B.',{'sample_b','shelf_b'}),

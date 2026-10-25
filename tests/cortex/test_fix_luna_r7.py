@@ -73,10 +73,12 @@ def test_guard_a_stop_landing_right_after_the_clearing_commit_keeps_the_event_se
 
 
 # P1-2: a handling limitation said without a modal or hazard word is an unresolved constraint, never accepted silently.
+# (Round 8: "Sample A weighs 30 kg", "Sample A is sharp" are facts, and "It is too heavy to carry" names nothing: they
+# block nothing now; test_fix_luna_r8 pins that.)
 LIMITS=['Sample A is too heavy to carry.','Sample A is too hot to touch.','Sample A is too big for the claw.',
-        'Carry Sample A upright.','Lift Sample A with both hands.','Hold Sample A by the cap.','Sample A weighs 30 kg.',
-        'Sample A does not fit in the claw.','No lifting of Sample A.','Nobody moves Sample A.','Sample A is sharp.',
-        'Handle Sample A gently, one at a time.','Sample A is a biohazard.','It is too heavy to carry.']
+        'Carry Sample A upright.','Lift Sample A with both hands.','Hold Sample A by the cap.',
+        'Sample A does not fit in the claw.','No lifting of Sample A.','Nobody moves Sample A.',
+        'Handle Sample A gently, one at a time.','Sample A is a biohazard.']
 @pytest.mark.parametrize('sentence',LIMITS)
 def test_an_unparsed_handling_limitation_needs_structured_review(brain,sentence):
     assert brain.store.teach('Note',sentence,owner='carther')['unresolved_rules'],sentence

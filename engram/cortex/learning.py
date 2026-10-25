@@ -216,6 +216,9 @@ class Dreamer:
         try: return self._cycle(force=force)
         finally: self._cycle_lock.release()
 
+    def _live_hypotheses(self) -> int:
+        return self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
+
     def _model_cap(self) -> int:
         return self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
 
@@ -353,7 +356,7 @@ class Dreamer:
                 recent_sources=self.store.rows("SELECT c.id,c.source_id,c.text FROM source_chunk c JOIN cx_source s ON s.source_id=c.source_id JOIN source v ON v.id=c.source_id WHERE s.status='accepted' AND v.kind!='future' ORDER BY v.created_at DESC LIMIT 3")
                 for c in recent_sources:refs+=['source:'+c['source_id']]
                 refs+=['episode:'+e['id'] for e in episodes[:2]]
-                live=self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
+                live=self._live_hypotheses()
                 # The bundle is intentionally small; no whole-vault prompt.
                 # Only citable memory enters the prompt: every item carries a ref that is in allowed_refs. Observations,
                 # pending commitments and approved-skill rows have no resolvable ref, so a hypothesis could not cite them.
@@ -365,10 +368,11 @@ class Dreamer:
                 elif (resume:=self._model_budget()) is not None: model_pending=True; model_wait=resume
                 else:
                     st=self._model_state(); q=None; st['calls'].append(self.store.clock()); self._save_model_state(st)
-                    try: q=self.qwen.complete('dream',bundle)
+                    try: q=self.qwen.complete('dream',bundle)                           # yields to foreground work
                     except CortexError as e: errors.append(type(e).__name__)
                     st=self._model_state()
-                    if q is None:
+                    if q is None and interrupted(): model_pending=True                   # it yielded: not a failed attempt
+                    elif q is None:
                         n=st['attempts']+1 if st['input']==asked else 1
                         if n>=self.MODEL_ATTEMPTS:
                             st.update(answered=asked,input=None,attempts=0)    # explicitly abandoned, and recorded
@@ -379,6 +383,7 @@ class Dreamer:
                     self._save_model_state(st)
                     if q and not interrupted():
                         for h in q.value.get('candidates',[])[:3]:
+                            if self._live_hypotheses()>=self.LIVE_CAP: break                # the cap holds for every accepted row
                             # One bad candidate never sinks its siblings or the cycle.
                             try:
                                 if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list) or not all(isinstance(x,str) for x in h['refs']):

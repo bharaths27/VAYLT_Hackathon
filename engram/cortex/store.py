@@ -39,31 +39,37 @@ SAFETY_RE = re.compile(r"\b(?:must|mustn't|never|should|shouldn't|shall|needs? t
                        r"do not|don't|cannot|can't|may not|only|always|avoid|keep|hazard\w*|danger\w*|caution|warning)\b", re.I)
 # A negated handling statement in any word order ("must never be handled", "should not be moved", "nobody moves it").
 NEG_HANDLE_RE = re.compile(r"(?:\b(?:never|not|no|cannot|nobody|nothing)\b|n't\b).*\b(?:move[ds]?|moving|touch\w*|handl\w*|pick\w*|carr\w*|lift\w*|grab\w*|transport\w*)\b", re.I)
-# A handling limitation said without a modal or hazard word ("Sample A is too heavy to carry", "carry it upright"): an
-# excess or a limit, an inability, a manner or orientation of handling, a property that limits handling, or manipulation
-# wording itself. The robot only picks and places, so a statement of how an object is lifted, carried or held is one it
-# cannot honour unparsed: an unresolved constraint, like the safety wording above.
-LIMIT_RE = re.compile(r"\b(?:too\s+\w+|\w+\s+enough\s+(?:to|for)|at\s+(?:most|least)|no\s+more\s+than|maximum|minimum|limit\w*|exceed\w*|"
-                      r"unable|impossible|(?:does|do|did|will|would)(?:\s+not|n't)\s+fit|"
-                      r"carr(?:y|ies|ied|ying)|lift\w*|pick(?:s|ed|ing)?\s+(?:\w+\s+){0,3}up|grab\w*|grip\w*|grasp\w*|hold(?:s|ing)?|held|handl\w*|touch\w*|"
-                      r"tilt\w*|tip(?:s|ped|ping)?\s+over|drop\w*|shak\w*|stack\w*|squeez\w*|flip\w*|spill\w*|leak\w*|"
-                      r"upright|upside[\s-]+down|sideways|on\s+its\s+side|right\s+side\s+up|face\s+(?:up|down)|"
-                      r"gentl[ey]|careful(?:ly)?|with\s+care|slowly|with\s+(?:both|two)\s+hands|one\s+at\s+a\s+time|"
-                      r"heav(?:y|ier|iest)|weigh\w*|(?:\d+\s*)?(?:kg|kilo\w*)|hot|warm|cold|frozen|wet|sharp|brittle|breakable|delicate|slippery|"
-                      r"unstable|wobbl\w*|loose|cracked|broken|damaged|sterile|contaminat\w*|\w*hazard\w*|radioactive|pressuri[sz]ed)\b", re.I)
+# Handling wording: a verb of manipulating an object (not its noun: "the handle", "a lift"), the claw that does it, or
+# leaving an object be ("leave Sample A alone", "hands off"). A statement using it is about handling; one without it, or
+# without the constraint wording below, is a fact that blocks nothing ("Fridge 2 holds Sample A", "It is hot today").
+HANDLE_RE = re.compile(r"\b(?<!\ba )(?<!\ban )(?<!\bthe )(?<!\bits )(?<!\btheir )"
+                       r"(?:carr(?:y|ies|ied|ying)|lift\w*|pick(?:s|ed|ing)?|grab\w*|grip\w*|grasp\w*|handl\w*|touch\w*|mov(?:e|es|ed|ing)|"
+                       r"tilt\w*|drop\w*|stack\w*|squeez\w*|transport\w*)\b|\b(?:claws?|grippers?|untouched|disturb\w*|hands?\s+off|stay\w*\s+put|"
+                       r"leave\s+(?:\w+\s+){0,3}(?:alone|untouched|be|where|in\s+place)|left\s+(?:alone|untouched|in\s+place))\b", re.I)
+# An instruction in imperative mood: optional adverbs or negation, then the verb ("Carry it upright", "Never lift anything").
+IMPERATIVE_RE = re.compile(r"^\s*(?:(?:please|always|never|only|just|also|then|first|now|carefully|gently|slowly|do\s+not|don't|dont)\s+)*(?P<verb>[a-z]+)\b", re.I)
+HAND_VERBS = {'carry','lift','pick','grab','grip','grasp','hold','handle','touch','move','tilt','drop','stack','squeeze','transport',
+              'put','place','set','lay','load','store','push','pull'}
+GO_VERBS = {'go','drive','navigate','travel'}
+# Words that may refer to any object: every object at once ("never lift anything"), or one a sentence does not name ("it").
+EVERYTHING_RE = re.compile(r"\b(?:anything|everything|nothing|all|any|every|each|none)\b", re.I)
+PRONOUN_RE = re.compile(r"\b(?:it|its|they|them|this|these|those|that|there)\b", re.I)
+MODAL_RE = re.compile(r"\b(?:may|might|can|could|must|shall|should|cannot|can't|mustn't|shouldn't)\b", re.I)
 # Conditionals: every if/unless/only-if/provided/except form and approval-gated forms ("when approved", "with permission").
 CONDITIONAL_RE = re.compile(r"\b(?:unless|except|exceptions?|only\s+if|if|provided|providing|as\s+long\s+as|so\s+long\s+as|on\s+condition|in\s+case|"
                             r"subject\s+to|pending|until\s+(?:\w+\s+){0,3}(?:approv\w*|authori[sz]\w*|clear\w*|permit\w*)|"
                             r"(?:when|whenever|once|after)\s+(?:\w+\s+){0,3}(?:approv\w*|authori[sz]\w*|permit\w*|allow\w*|clear\w*|signs?\s+off|signed\s+off|supervis\w*)|"
                             r"with(?:out)?\s+(?:\w+\s+){0,2}(?:approval|permission|authori[sz]ation|supervision|clearance|sign-?off|consent))\b", re.I)
-# A hazard or a permission ("unsafe", "dangerous", "can/cannot/may be used, moved, handled", "not allowed", "requires
-# approval"). Unparsed, it is never accepted silently: it becomes an unresolved constraint, global if it names nothing.
-HAZARD_RE = re.compile(r"\b(?:unsafe|safe(?:ly)?|danger\w*|hazard\w*|toxic|flammable|corrosive|fragile|explosive|volatile|caution|warning|risk\w*|"
+# A hazard or a permission ("unsafe", "dangerous", "a biohazard", "can/cannot/may be used, moved, handled", "not allowed",
+# "requires approval"). Unparsed, it is never accepted silently: it becomes an unresolved constraint (scope: Store._reach).
+HAZARD_RE = re.compile(r"\b(?:unsafe|safe(?:ly)?|danger\w*|\w*hazard\w*|toxic|flammable|corrosive|fragile|explosive|volatile|caution|warning|risk\w*|"
                        r"forbidden|prohibited|banned|restricted|allowed|permitted|authori[sz]ed|approved|permission|approval|"
                        r"(?:can|could|may|might|must|shall|should|cannot)(?:\s+not|n't)?(?:\s+only)?(?:\s+ever)?\s+be\s+(?:\w+\s+)?"
                        r"(?:used|moved|handled|touched|picked|carried|lifted|stored|placed|left|opened|taken|brought|transported))\b", re.I)
-# Motion or use wording: a conditional that names nothing registered but speaks of these is scoped to everything.
-MOTION_RE = re.compile(r"\b(?:move[ds]?|moving|bring|take|carry|put|handled?|handling|touch|pick|use[ds]?|using|go|drive|leave|enter)\b", re.I)
+# Motion of the robot or use of a place ("goes on shelf B", "can be used"); "move" too, which may mean either the robot
+# or an object. A constraint speaking of it holds for every plan involving what it covers, not only handling plans.
+MOTION_RE = re.compile(r"\b(?:go|goes|going|went|drive\w*|drove|enter\w*|navigat\w*|travel\w*|use[ds]?|using|bring\w*|brought|take|takes|taking|took|"
+                       r"mov(?:e|es|ed|ing))\b", re.I)
 
 
 class Store:
@@ -278,6 +284,27 @@ class Store:
             out = re.sub(r'(?<![A-Za-z0-9])' + r'\s+'.join(map(re.escape, n.split())) + r'(?![A-Za-z0-9])', ' entity ', out, flags=re.I)
         return out
 
+    @staticmethod
+    def _handling(text: str) -> bool:
+        """Whether a (masked) sentence speaks of handling an object: handling wording, a negated handling verb, or an
+        imperative whose verb handles or places something ("Hold Sample A by the cap", "Put it on shelf B")."""
+        m = IMPERATIVE_RE.match(text)
+        return bool(HANDLE_RE.search(text) or NEG_HANDLE_RE.search(text) or (m and m['verb'].lower() in HAND_VERBS))
+
+    def _reach(self, masked: str, named: list[str]) -> list[str]:
+        """What an unresolved statement blocks: what it names, or every object when it speaks of every object at once
+        ("nothing may be moved", "never lift anything"). Naming nothing, it blocks everything only as an instruction about
+        handling or motion that may refer to any object ("carry it upright", "it must never be handled"); any other
+        statement blocks nothing, so a remark ("lunch is served daily except Sunday") never freezes the robot. A
+        statement about handling alone blocks only plans that handle what it covers ('@handle'): pick, carry, place."""
+        handling, m = self._handling(masked), IMPERATIVE_RE.match(masked)
+        motion = bool(MOTION_RE.search(masked) or (m and m['verb'].lower() in GO_VERBS))
+        instruction = bool(SAFETY_RE.search(masked) or MODAL_RE.search(masked) or NEG_HANDLE_RE.search(masked) or (m and m['verb'].lower() in HAND_VERBS | GO_VERBS))
+        if named: reach = list(named)
+        elif (handling or motion) and (EVERYTHING_RE.search(masked) or (instruction and PRONOUN_RE.search(masked))): reach = ['*']
+        else: return []
+        return reach + (['@handle'] if handling and not motion else [])
+
     def _template_rule(self, m) -> tuple | None:
         """(subject, prerequisite, station) of one prerequisite-template match, when each resolves to exactly one."""
         pre, subject = self.resolve_objects(m['pre']), self.resolve_objects(m['subject'])
@@ -327,10 +354,10 @@ class Store:
         forbidden, pending = list(prohibitions or []), []
         # Each sentence is accounted for by its meaning, not by the entities it names. What is stored accounts for its
         # own wording only: a prerequisite-template clause whose rule is stored as written (a reviewer's rule or an
-        # extracted one, its clause carrying nothing else), a prohibition whose objects are prohibited, or a negated
-        # handling sentence about reviewer-prohibited objects alone. A conditional is never resolved: no structured
-        # form expresses its exception. Whatever safety wording remains is an unresolved constraint, scoped by the
-        # names in its OWN sentence; with none of its own it is global (nothing is inherited from the document).
+        # extracted one, its clause saying nothing else), a prohibition whose objects are prohibited, or a handling or
+        # hazard sentence about reviewer-prohibited objects alone. A conditional is never resolved: no structured form
+        # expresses its exception. Whatever constraint wording remains (conditional, hazard or permission, deontic, or
+        # handling) is an unresolved constraint on what its OWN sentence names (Store._reach); anything else is a fact.
         stored = {(r.get('subject'), r.get('prerequisite'), r.get('required_zone')) for r in extracted if isinstance(r, dict)}
         banned = set(forbidden)
         quote = lambda s: s.strip()[:300]
@@ -339,23 +366,23 @@ class Store:
             masked = self._mask(sent)                     # registered names never count as wording ("Safety goggles")
             residual = sent
             for m in RULE_RE.finditer(sent):
-                words = self._mask(' '.join((m['pre'], m['zone'], m['subject'])))   # the clause's own words, names masked
-                if self._template_rule(m) in stored and not any(rx.search(words) for rx in (SAFETY_RE, CONDITIONAL_RE, HAZARD_RE, LIMIT_RE, NEG_HANDLE_RE)):
+                extra = set(self._mask(' '.join((m['pre'], m['zone'], m['subject']))).split()) - {'entity','the','a','an'}
+                if self._template_rule(m) in stored and not extra:   # the clause says no more than its stored rule
                     residual = residual.replace(m.group(0), ' ')
             if PROHIBIT_RE.search(sent):
                 objs = self.resolve_objects(sent); forbidden.extend(objs)
                 if objs: residual = PROHIBIT_RE.sub(' ', residual)
-            elif (NEG_HANDLE_RE.search(sent) or HAZARD_RE.search(masked) or LIMIT_RE.search(masked)) and named and set(named) <= banned and not CONDITIONAL_RE.search(masked):
+            elif (self._handling(masked) or HAZARD_RE.search(masked)) and named and set(named) <= banned and not CONDITIONAL_RE.search(masked):
                 residual = ''                             # a reviewer's total ban on exactly these objects covers it
             rest = self._mask(residual)
-            if CONDITIONAL_RE.search(masked):            # a conditional is never resolved: no structured form holds it
-                pending.append(('Conditional exception; structured review required: '+quote(sent), named or ['*']))
-            elif HAZARD_RE.search(rest):                 # a hazard or permission, unparsed: fail closed
-                pending.append(('Unparsed hazard or permission; structured review required: '+quote(sent), named or ['*']))
-            elif SAFETY_RE.search(rest) or PROHIBIT_RE.search(residual):
-                pending.append(('Unparsed safety statement; structured review required: '+quote(sent), named or ['*']))
-            elif LIMIT_RE.search(rest) or NEG_HANDLE_RE.search(rest):
-                pending.append(('Unparsed handling limitation; structured review required: '+quote(sent), named or ['*']))
+            if CONDITIONAL_RE.search(masked): why = 'Conditional exception'                  # never resolved
+            elif HAZARD_RE.search(rest): why = 'Unparsed hazard or permission'
+            elif SAFETY_RE.search(rest) or PROHIBIT_RE.search(residual): why = 'Unparsed safety statement'
+            elif self._handling(rest): why = 'Unparsed handling instruction or limitation'
+            else: continue                                # a fact: stored and searchable, blocking nothing
+            reach = self._reach(masked, named)
+            pending.append((why+'; structured review required'+('' if reach else ' (it names no object, so it blocks nothing; restate it naming one)')
+                            +': '+quote(sent), reach))
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
@@ -450,6 +477,9 @@ class Store:
                 for r in self.rows('SELECT id FROM source_chunk WHERE source_id=?', (sid,)):
                     self.conn.execute('DELETE FROM source_chunk_fts WHERE chunk_id=?', (r['id'],))
                 self.conn.execute("UPDATE source_chunk SET text='[deleted]',end_char=start_char WHERE source_id=?", (sid,))
+                # Its title and a reviewer's own rule keys are its text too (a revoked rule key is matched by no rule).
+                self.conn.execute("UPDATE source SET title='[deleted]' WHERE id=?", (sid,))
+                self.conn.execute("UPDATE cx_rule SET rule_key='[deleted]' WHERE assertion_id IN (SELECT id FROM assertion WHERE source_id=?)", (sid,))
             self._bump()
             # A removed instruction cannot wake a pending commitment later; one whose effect started keeps its real
             # outcome. Withdrawn first, so the invalidation below (which settles commitments too) finds it cancelled.
@@ -493,8 +523,9 @@ class Store:
     def _purge_episodes(self, sid: str, aliases: list[dict], tasks: set[str]) -> None:
         """Caller holds the transaction. The episodes built from a deleted source: plans citing it, its task aliases (a goal
         with its own arguments), the wakes of its commitments (planned or not). Each keeps its outcome as an audit record
-        but loses every copy of the source: plan, evidence bundle, the step arguments journalled at execution, a goal's
-        free-text arguments, a commitment's request, and the idle memories made from it (summaries, practice, procedures)."""
+        but loses every copy of the source: request (a commitment's text, a task alias's name) and its search row, plan,
+        evidence bundle, the step arguments journalled at execution, a goal's free-text arguments, and the idle memories
+        made from it (summaries, practice, procedures)."""
         redacted, gone, goals = canonical({'redacted': True}), set(), []
         for e in self.rows('SELECT e.id,e.plan_json,c.goal_json,c.request_key FROM episode e JOIN cx_episode c ON c.id=e.id'):
             key, goal = e['request_key'] or '', json.loads(e['goal_json'])
@@ -504,12 +535,10 @@ class Store:
             gone.add('episode:'+e['id'])
             self.settle(e['id'], 'invalidated', ('preparing','proposed'), 'source deleted')    # its plan is gone: never approvable
             if goal.get('args'): goals.append(goal); goal = {**goal, 'args': {'redacted': True}}
-            self.conn.execute('UPDATE episode SET goal=?,plan_json=NULL,evidence_json=NULL WHERE id=?', (canonical(goal), e['id']))
+            self.conn.execute("UPDATE episode SET goal=?,request='[deleted]',plan_json=NULL,evidence_json=NULL WHERE id=?", (canonical(goal), e['id']))
+            self.conn.execute('DELETE FROM cx_episode_fts WHERE episode_id=?', (e['id'],))
             self.conn.execute('UPDATE cx_episode SET goal_json=? WHERE id=?', (canonical(goal), e['id']))
             self.conn.execute('UPDATE operation_event SET args_json=? WHERE episode_id=?', (redacted, e['id']))
-            if woken:
-                self.conn.execute("UPDATE episode SET request='[deleted]' WHERE id=?", (e['id'],))
-                self.conn.execute('DELETE FROM cx_episode_fts WHERE episode_id=?', (e['id'],))
         for d in self.rows('SELECT id,refs_json FROM cx_derived'):
             if gone & set(json.loads(d['refs_json'])):     # a fresh fingerprint: a purged memory never stands in for a new one
                 self.conn.execute("UPDATE cx_derived SET payload_json=?,status='DELETED',fingerprint=? WHERE id=?", (redacted, 'deleted:'+d['id'], d['id']))
@@ -565,9 +594,11 @@ class Store:
                     frontier.append(r['object'])
         return relevant
 
-    def unresolved_for(self,ids: set[str]) -> list[dict]:
+    def unresolved_for(self,ids: set[str],*,handles: bool=True) -> list[dict]:
+        """Unresolved statements that block a plan involving these ids ('*': every plan). One about handling alone
+        ('@handle') blocks only a plan that handles them: handles=False (no pick or place, e.g. goto) passes it."""
         rows=self.rows("SELECT u.* FROM cx_unresolved u JOIN cx_source s ON s.source_id=u.source_id WHERE s.status='accepted' AND s.workspace=?",(self.workspace,))
-        return [r for r in rows if (m := set(json.loads(r['mentions_json']))) and ('*' in m or ids & m)]   # '*': scoped to everything
+        return [r for r in rows if (m := set(json.loads(r['mentions_json']))) and ('*' in m or ids & m) and (handles or '@handle' not in m)]
 
     @staticmethod
     def scope(goal: Goal, rules: list[dict]) -> set[str]:
@@ -591,7 +622,7 @@ class Store:
         zones = self.rows('SELECT id,version FROM cx_station ORDER BY id')
         payload = {'goal':goal.to_dict(), 'rules':[{k:r[k] for k in ('id','rule_key','required_zone','object','subject','status')} for r in rules],
                    'entities':entities, 'zones':zones}
-        payload['unresolved']=self.unresolved_for(self.scope(goal,rules))
+        payload['unresolved']=self.unresolved_for(self.scope(goal,rules),handles=goal.kind=='fetch')
         payload['prohibitions'] = self.prohibitions(ids)
         return digest(payload)
 
@@ -629,7 +660,7 @@ class Store:
         b = {'goal':request, 'task':goal.to_dict() if goal else None, 'epoch':self.epoch(),
              'basis': self.basis(goal) if goal else None, 'facts':facts, 'objects':objects, 'constraints':facts,
              'evidence':evidence, 'missing':missing, 'omitted':[], 'applicable_skills':[], 'derived':[]}
-        b['unresolved_constraints']=self.unresolved_for(self.scope(goal,rules) if goal else ids|set(self.zones_named(request)))
+        b['unresolved_constraints']=self.unresolved_for(self.scope(goal,rules) if goal else ids|set(self.zones_named(request)),handles=not goal or goal.kind=='fetch')
         b['prohibitions'] = self.prohibitions(ids)
         # Optional declared facts never override sensor locations or authority.
         generic=self.generic_facts(request)[:8]
