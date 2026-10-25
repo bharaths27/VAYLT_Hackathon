@@ -60,6 +60,21 @@ def is_memory_question(text: str) -> bool:
     return t.endswith("?") and not _POLITE_REQUEST.match(t) and route(t) != ["semantic"]
 
 
+# A question opener. "When" is left out (it begins real future instructions: "When the centrifuge
+# stops, carry the beaker"), and so are "do"/"have" (they begin commands: "Do not ...", "Have it ...").
+_ASKING_START = re.compile(r"^\s*(what|where|which|who|whom|whose|why|how|is|are|am|was|were|did|does|"
+                           r"can|could|should|would|will|shall|may|might|must)\b", re.IGNORECASE)
+
+
+def asks_question(text: str) -> bool:
+    """Any question at all, except a polite request ("Could you fetch the beaker?"). A question is
+    answered from memory and never becomes a plan: on 10-25 "Can the 500 mL beaker go in the drying
+    oven?" was planned as fetching the beaker. Whisper ends spoken questions with "?"; the opener
+    catches a typed question without one."""
+    t = text.strip()
+    return (t.endswith("?") or bool(_ASKING_START.match(t))) and not _POLITE_REQUEST.match(t)
+
+
 def topic_terms(question: str, objs: list[ObjectState]) -> list[str] | None:
     """What the question is about: known object names, else its content words.
     None means a general question ("what happened?") that matches everything."""

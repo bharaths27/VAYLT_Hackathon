@@ -26,7 +26,7 @@ from .ids import digest, new_id
 from .memory import Memory
 from .planner import PlanResult, RulePlanner, find_zone, refusal, targets_in
 from .prospective import Prospective, normalize, parse_when
-from .recall import Recall, is_memory_question
+from .recall import Recall, asks_question, is_memory_question
 from .robot.base import RobotAdapter
 from .skills import Skills
 from .teach import extract_rules
@@ -114,8 +114,9 @@ class Engine:
             if body.lower().startswith("that "):
                 body = body[5:]
             return {"kind": "taught", **self.teach(f"Spoken note from {who}", body, kind="spoken", origin=who)}
-        if is_memory_question(stripped):
+        if is_memory_question(stripped) or asks_question(stripped):
             # Answered from memory: never scheduled, never planned, nothing moves (practice check M2).
+            # Any question counts, not only memory-shaped ones: a question is never a request to move.
             return {"kind": "answer", **Recall(self.memory).recall(stripped)}
         when = parse_when(stripped)
         if when:
