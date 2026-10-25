@@ -151,3 +151,26 @@ def test_no_principal_means_no_private_rows(published):
 
 def test_guard_an_anchor_needs_a_principal(brain):
     with pytest.raises(CortexError,match='principal'): brain.skills.provenance(Goal('goto',zone='bench'),'ep_x',principal='')
+
+
+# P2-5: deleting a source redacts every free-text copy its episodes carry, including what an adapter echoed back.
+from .test_fix_luna_r7 import ANNOUNCE,dump
+class Echo(FakeRobot):
+    """An adapter whose reply echoes what it was told to say, in its detail or (a careless one) in its status."""
+    def __init__(self,arena,where): super().__init__(arena);self.where=where
+    def execute(self,op,args):
+        r=super().execute(op,args)
+        if op=='speak': setattr(r,self.where,'said '+args['text'])
+        return r
+
+@pytest.mark.parametrize('where',['detail','status'])
+def test_deleting_a_source_redacts_what_an_adapter_echoed(tmp_path,arena,clock,where):
+    s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);b=Brain(s,Echo(arena,where))
+    src=s.teach('Announcement','To announce the result, say the zqxmarker phrase.',owner='carther',goal_definitions=ANNOUNCE)
+    p=b.command('announce the result',principal='carther');approve(b,p)
+    assert any('zqxmarker' in row for name,row in dump(s) if name in ('operation_event','episode'))   # the premise: echoed
+    s.revoke_source(src['source_id'],delete=True)
+    for name,row in dump(s): assert 'zqxmarker' not in row,(name,row)                                # was: left in the journal
+    ops=[r['op'] for r in s.rows('SELECT op FROM operation_event WHERE episode_id=?',(p['operation_id'],))]
+    assert 'speak' in ops and b.operation(p['operation_id'])['status']==('success' if where=='detail' else 'unknown')   # audit kept
+    b.close()

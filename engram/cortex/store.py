@@ -25,6 +25,8 @@ from .types import (Conflict, CortexError, Denied, Goal, Missing, Policy, Stale,
 TASK_STATE = {'success':'done','failed':'failed','rejected':'failed','unknown':'unknown','aborted':'unknown',
               'cancelled':'cancelled','expired':'expired','invalidated':'failed'}
 STARTED = ('running','unknown','needs_verification')
+# The status words the runtime itself journals for an operation's steps (any other status is an adapter's own word).
+JOURNAL_STATES = ('pending','not_dispatched','reported_done','unknown','failed','rejected','success','noted')
 
 RULE_RE = re.compile(
     r'(?P<pre>[A-Za-z0-9 _-]+?)\s+(?:must|should|needs? to)\s+be\s+'
@@ -568,8 +570,9 @@ class Store:
         (a task alias or commitment request, planned or not), plans citing it, a goal with its free-text arguments, the
         wakes of its commitments. Each keeps its outcome as an audit record
         but loses every copy of the source: request (a commitment's text, a task alias's name) and its search row, plan,
-        evidence bundle, the step arguments journalled at execution, a goal's free-text arguments, and the idle memories
-        made from it (summaries, practice, procedures)."""
+        evidence bundle, the step arguments journalled at execution and every free-text field recorded about it (failure
+        reason, adapter replies, operator notes), a goal's free-text arguments, and the idle memories made from it
+        (summaries, practice, procedures)."""
         redacted, gone, goals = canonical({'redacted': True}), set(), []
         linked = {r['episode_id'] for r in self.rows('SELECT episode_id FROM cx_episode_source WHERE source_id=?', (sid,))}
         for e in self.rows('SELECT e.id,e.plan_json,c.goal_json,c.request_key FROM episode e JOIN cx_episode c ON c.id=e.id'):
@@ -578,12 +581,18 @@ class Store:
             refs = json.loads(e['plan_json']).get('refs', []) if e['plan_json'] else []
             if not (woken or e['id'] in linked or 'source:'+sid in refs or (goal.get('args') and goal in aliases)): continue
             gone.add('episode:'+e['id'])
-            self.settle(e['id'], 'invalidated', ('preparing','proposed'), 'source deleted')    # its plan is gone: never approvable
             if goal.get('args'): goals.append(goal); goal = {**goal, 'args': {'redacted': True}}
-            self.conn.execute("UPDATE episode SET goal=?,request='[deleted]',plan_json=NULL,evidence_json=NULL WHERE id=?", (canonical(goal), e['id']))
+            # Free text recorded about it may quote the source too: a failure reason, an adapter's reply (echoing the text
+            # it was told to speak), an operator's note. Its outcome stays; the words go.
+            self.conn.execute("UPDATE episode SET goal=?,request='[deleted]',plan_json=NULL,evidence_json=NULL,"
+                              "failure=CASE WHEN failure IS NULL THEN NULL ELSE '[deleted]' END WHERE id=?", (canonical(goal), e['id']))
+            self.settle(e['id'], 'invalidated', ('preparing','proposed'), 'source deleted')    # its plan is gone: never approvable
             self.conn.execute('DELETE FROM cx_episode_fts WHERE episode_id=?', (e['id'],))
             self.conn.execute('UPDATE cx_episode SET goal_json=? WHERE id=?', (canonical(goal), e['id']))
-            self.conn.execute('UPDATE operation_event SET args_json=? WHERE episode_id=?', (redacted, e['id']))
+            # The journal keeps each step's operation and the runtime's own status words; an adapter's own words go.
+            self.conn.execute("UPDATE operation_event SET args_json=?,detail=CASE WHEN detail='' THEN '' ELSE '[deleted]' END,"
+                              f"status=CASE WHEN status IN ({','.join('?'*len(JOURNAL_STATES))}) THEN status ELSE '[deleted]' END WHERE episode_id=?",
+                              (redacted, *JOURNAL_STATES, e['id']))
         for d in self.rows('SELECT id,refs_json FROM cx_derived'):
             if gone & set(json.loads(d['refs_json'])):     # a fresh fingerprint: a purged memory never stands in for a new one
                 self.conn.execute("UPDATE cx_derived SET payload_json=?,status='DELETED',fingerprint=? WHERE id=?", (redacted, 'deleted:'+d['id'], d['id']))
