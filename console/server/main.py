@@ -441,6 +441,12 @@ async def _fire_later(task: dict, delay: float):
     await handle_command(task["text"], "prospective")
 
 
+def _brain_understood(p: dict) -> bool:
+    """Did the brain state that it understood this proposal? Only when it says so both ways it can: classification
+    "understood" and needs_clarification false. A missing or contradictory field counts as unclear."""
+    return p.get("classification") == "understood" and p.get("needs_clarification") is False
+
+
 async def _brain_command(text: str, source: str, t0: float) -> dict:
     """EC08: Bharath's brain plans; the console shows it and relays the human approval."""
     try:
@@ -455,22 +461,23 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
         await bus.emit("bundle", bundle=brain.to_bundle(p["memory"]), memory_ms=0)
     kind = p.get("kind")
     out = {"kind": kind, "brain": p, "metrics": metrics}
-    if kind == "proposal" and p.get("status") == "proposed" and p.get("digest"):
+    if kind == "proposal" and not _brain_understood(p):
+        # Unclear or misheard (an unknown object, a time that did not parse, nothing heard): Carter's rule. It is
+        # checked for every proposal before anything is staged: a plan the brain does not state it understood is
+        # never staged, and a refusal it does not state it understood is not an understood refusal.
+        reason = p.get("reason") or "I'm not sure what you meant."
+        out["reason"] = reason
+        await _clarify(out, reason, source, running=True if p.get("stopped") is True else None)
+        trace = [f"brain: {p.get('status')}", f"brain: classification {p.get('classification')!r}, needs_clarification "
+                 f"{p.get('needs_clarification')!r}: not stated understood, so unclear"]
+        await bus.emit("parsed", kind="clarify", reason=reason, quip="", trace=trace, data={}, metrics=metrics,
+                       stopped=out["stopped"])
+        await bus.emit("say", text=out["reply"])
+    elif kind == "proposal" and p.get("status") == "proposed" and p.get("digest"):
         op = brain.RemoteOperation(p, text, source, metrics)
         await engine.stage(op)
         out["kind"], out["operation"] = "plan", op.public()
         await bus.emit("say", text="Here's my plan. Hold to approve.")
-    elif kind == "proposal" and p.get("classification") != "understood":
-        # Unclear or misheard (an unknown object, a time that did not parse, nothing heard): Carter's rule. Only a
-        # refusal the brain states as understood is one; anything that does not say so is unclear.
-        reason = p.get("reason") or p.get("status") or "refused"
-        out["reason"] = reason
-        await _clarify(out, reason, source, running=True if p.get("stopped") is True else None)
-        trace = [f"brain: {p.get('status')}", f"brain: {p['classification']}" if "classification" in p
-                 else "brain did not state a classification: treated as unclear"]
-        await bus.emit("parsed", kind="clarify", reason=reason, quip="", trace=trace, data={}, metrics=metrics,
-                       stopped=out["stopped"])
-        await bus.emit("say", text=out["reply"])
     elif kind == "proposal":  # understood and refused (a prohibited action, "don't"): unchanged
         reason = p.get("reason") or p.get("status") or "refused"
         out.update(kind="abstain", reason=reason)

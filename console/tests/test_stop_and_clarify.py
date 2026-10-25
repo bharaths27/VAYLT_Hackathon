@@ -460,3 +460,31 @@ def test_a_brain_refusal_that_does_not_state_understood_counts_as_unclear(c, on_
     on_brain(FakeBrain(unsaid, running=[{"operation_id": "ep_9"}]))
     j = c.post("/commands", json={"text": "throw the beaker"}).json()
     assert j["kind"] == "clarify" and j["stopped"] is True and main.engine.stopped
+
+
+# ---- every brain proposal is checked first: a plan is staged only when the brain states it understood, both ways --
+
+PLAN = {k: v for k, v in RunningBrain.PLAN.items() if k not in ("classification", "needs_clarification")}
+
+
+@pytest.mark.parametrize("stated", [
+    {"classification": "unclear", "needs_clarification": True}, {},
+    {"classification": "understood"}, {"needs_clarification": False},
+    {"classification": "understood", "needs_clarification": True}, {"classification": "unclear", "needs_clarification": False},
+], ids=["says unclear", "omits both fields", "omits needs_clarification", "omits classification",
+        "understood but needs clarification", "unclear but needs none"])
+def test_a_plan_the_brain_does_not_state_understood_is_not_staged_and_the_task_stops(c, on_brain, said, stated):
+    fake = on_brain(FakeBrain({**PLAN, **stated}, running=[{"operation_id": "ep_9"}]))
+    j = c.post("/commands", json={"text": "bring sample b to the bench"}).json()
+    assert j["kind"] == "clarify" and j["stopped"] is True and main.engine.stopped
+    assert j["reply"] == "I stopped. I'm not sure what you meant. Please clarify." and said[-1] == j["reply"]
+    assert "operation" not in j and PLAN["operation_id"] not in main.engine.ops   # nothing staged to approve
+    assert "/stop" in fake.calls                                # the latch stops the brain's plan as well
+
+
+def test_a_plan_the_brain_states_understood_is_staged_and_stops_nothing(c, on_brain):
+    fake = on_brain(FakeBrain({**PLAN, "classification": "understood", "needs_clarification": False},
+                              running=[{"operation_id": "ep_9"}]))
+    j = c.post("/commands", json={"text": "bring sample b to the bench"}).json()
+    assert j["kind"] == "plan" and j["operation"]["id"] == PLAN["operation_id"]
+    assert not main.engine.stopped and "/stop" not in fake.calls
