@@ -120,8 +120,8 @@ class Brain:
                     (basis,canonical(self.compiler.fixture()),t+self.store.policy.approval_ttl_s,ep))
         with self.activity.foreground():
             try:
-                instruction=self.store.teach('Task instruction',request,owner=principal,kind='request',rules=[],cloud_ok=cloud_allowed)
-                refs=['source:'+instruction['source_id']]+(extra_refs or [])
+                # A command is an episode, not a source: it is never recalled as knowledge.
+                refs=self.skills.provenance(goal,ep,extra_refs)
                 bundle=self.store.bundle(request,goal)
                 fixture=self.compiler.fixture()
                 # Optional relevance advice ranks only explicitly cloud-permitted evidence.

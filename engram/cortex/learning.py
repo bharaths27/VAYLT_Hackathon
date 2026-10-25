@@ -95,8 +95,19 @@ class Skills:
         self.get(sid)
         with self.store.tx(): self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
 
+    def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None) -> list[str]:
+        """Refs a command adds to its plan. Commands are episodes, not sources, so a recipe or
+        skill is keyed on goal + basis (rule/source refs), never on the request. A goal with no
+        rule or source cites the FIRST episode that asked for it, so repeats share one recipe."""
+        extra=list(extra_refs or [])
+        if extra or self.store.related_rules(goal): return extra
+        key='cx_goal_anchor:'+goal.key()    # primary-key lookup, not a scan of past episodes
+        with self.store.tx():
+            self.store.conn.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',(key,episode_id))
+            return ['episode:'+self.store.one('SELECT value FROM meta WHERE key=?',(key,))['value']]
+
     def find(self,goal: Goal) -> dict | None:
-        self.store.invalidate()
+        # Hot path: an indexed lookup by goal, each candidate validated below; no vault rescan.
         for r in self.store.rows("SELECT c.id FROM cx_skill c JOIN skill_version s ON s.id=c.id WHERE c.goal_key=? AND s.status='APPROVED' ORDER BY s.approved_at DESC",(goal.key(),)):
             s=self.get(r['id']); d=s['definition']
             if (digest(d)==s['digest'] and d['basis']==self.store.basis(goal) and d['policy_hash']==self.store.policy.fingerprint()
