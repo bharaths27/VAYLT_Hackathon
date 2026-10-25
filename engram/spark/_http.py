@@ -1,19 +1,21 @@
 """One small HTTP POST helper shared by the intent client and the local whisper client.
 
-- Absolute deadline: timeout_s bounds the WHOLE exchange (resolve, connect, send, status
-  line, headers and body), not each socket operation. The exchange runs on a short-lived
-  worker thread; the caller stops waiting at the deadline and raises TimeoutError.
+- Absolute deadline: timeout_s bounds the WHOLE exchange (resolve, connect, TLS handshake,
+  send, status line, headers and body), not each socket operation. The exchange runs on a
+  short-lived worker thread; the caller stops waiting at the deadline and raises TimeoutError.
 - Bounded workers: an abandoned worker must end too, or repeated timeouts pile them up.
-  Each connect attempt is given only the time left before the deadline; once connected, the
-  socket is shut down at the deadline, which unblocks any read or TLS handshake; and the
-  worker checks the deadline between body chunks. Name resolution cannot be interrupted from
-  Python, so at most MAX_OUTSTANDING workers may exist at once: when they are all still
-  busy, post() fails fast with Busy instead of starting another thread.
+  The connection is opened here, not by http.client: each TCP connect attempt gets only the
+  time left; for HTTPS the TLS socket is published as conn.sock BEFORE its handshake starts,
+  so the deadline's shutdown reaches a handshake that trickles; after that, the same
+  shutdown unblocks any read, and the worker checks the deadline between body chunks. Name
+  resolution cannot be interrupted from Python, so at most MAX_OUTSTANDING workers may exist
+  at once: when they are all still busy, post() fails fast with Busy instead of starting
+  another thread.
 - Redirects are never followed (http.client has no redirect logic): a 3xx comes back as its
   status code, so a moved or hijacked endpoint cannot forward the request, or its
   Authorization header, anywhere else.
 - No proxies: the request goes straight to the URL given. HTTPS verifies the certificate
-  and host name.
+  and the host name (SNI is sent), exactly as ssl.create_default_context() does.
 - Replies are read up to a fixed size; only a 200 reply's body is read.
 """
 
@@ -31,55 +33,84 @@ MAX_OUTSTANDING = 4          # worker threads (live or abandoned) allowed at onc
 _CHUNK = 16 * 1024
 _SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING)
 
-# Swapped out in tests to simulate a resolver or a connect that never answers.
+# Swapped out in tests: a resolver or connect that never answers, or a context trusting a test certificate.
 _resolve = socket.getaddrinfo
 _new_socket = socket.socket
+_tls_context = ssl.create_default_context
 
 
 class Busy(OSError):
     """Too many earlier requests are still unwinding; refusing to start another."""
 
 
-def _connect_by(deadline: float):
-    """A replacement for socket.create_connection whose connect attempts end by the deadline."""
+def _open_tcp(host: str, port: int, deadline: float) -> socket.socket:
+    """Connect, giving each attempt only the time left before the deadline."""
+    last: OSError | None = None
+    for family, kind, proto, _, sockaddr in _resolve(host, port, 0, socket.SOCK_STREAM):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("deadline passed before connecting")
+        sock = _new_socket(family, kind, proto)
+        try:
+            sock.settimeout(left)
+            sock.connect(sockaddr)
+        except OSError as e:
+            last = e
+            sock.close()
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return sock
+    raise last or OSError(f"no address for {host}")
 
-    def create_connection(address, timeout=None, source_address=None):  # noqa: ANN001, ARG001
-        host, port = address
-        last: OSError | None = None
-        for family, kind, proto, _, sockaddr in _resolve(host, port, 0, socket.SOCK_STREAM):
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError("deadline passed before connecting")
-            sock = _new_socket(family, kind, proto)
-            try:
-                sock.settimeout(left)
-                sock.connect(sockaddr)
-                return sock
-            except OSError as e:
-                last = e
-                sock.close()
-        raise last or OSError(f"no address for {host}")
 
-    return create_connection
+class _HTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, port: int, deadline: float):
+        super().__init__(host, port, timeout=max(deadline - time.monotonic(), 0.001))
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        self.sock = _open_tcp(self.host, self.port, self._deadline)
 
 
-def _connection(url: str, deadline: float, timeout_s: float) -> tuple[http.client.HTTPConnection, str]:
+class _HTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, deadline: float, context: ssl.SSLContext):
+        super().__init__(host, port, timeout=max(deadline - time.monotonic(), 0.001), context=context)
+        self._deadline = deadline
+        self._tls = context
+
+    def connect(self) -> None:
+        raw = _open_tcp(self.host, self.port, self._deadline)
+        try:
+            tls = self._tls.wrap_socket(raw, server_hostname=self.host, do_handshake_on_connect=False)
+        except BaseException:
+            raw.close()
+            raise
+        self.sock = tls   # published first: from here on the deadline's shutdown can interrupt the handshake
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("deadline passed before the TLS handshake")
+        tls.settimeout(left)
+        tls.do_handshake()   # verifies the certificate chain and the host name
+
+
+def _connection(url: str, deadline: float) -> tuple[http.client.HTTPConnection, str]:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme == "https":
-        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-            parts.hostname, parts.port or 443, timeout=timeout_s, context=ssl.create_default_context())
+        conn: http.client.HTTPConnection = _HTTPSConnection(parts.hostname, parts.port or 443, deadline,
+                                                            _tls_context())
     elif parts.scheme == "http":
-        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout_s)
+        conn = _HTTPConnection(parts.hostname, parts.port or 80, deadline)
     else:
         raise ValueError("only http and https URLs are supported")
-    # http.client opens its socket through this attribute (HTTPS wraps it in TLS afterwards).
-    conn._create_connection = _connect_by(deadline)  # type: ignore[attr-defined]
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     return conn, path
 
 
 def _abort(conn: http.client.HTTPConnection) -> None:
-    """Unblock a worker stuck reading from this connection (called from the waiting thread)."""
+    """Unblock a worker stuck on this connection: TLS handshake or read (called from the waiting thread)."""
     sock = conn.sock
     if sock is not None:
         try:
@@ -93,7 +124,7 @@ def post(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tu
     Busy when too many earlier workers are still unwinding, OSError for connection failures and
     ValueError for an oversized reply."""
     deadline = time.monotonic() + timeout_s
-    conn, path = _connection(url, deadline, timeout_s)
+    conn, path = _connection(url, deadline)
     if not _SLOTS.acquire(blocking=False):
         raise Busy(f"{MAX_OUTSTANDING} earlier requests are still outstanding")
     out: dict[str, object] = {}
