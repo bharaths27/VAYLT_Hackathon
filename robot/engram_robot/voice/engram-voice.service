@@ -1,0 +1,20 @@
+# Voice test console on star-pi (https :8444). Installed by voice/setup_voice.sh.
+# Optional: add VOICE_PIN=1234 to ~/engram_robot/robot.env to require a PIN for approvals.
+[Unit]
+Description=ENGRAM voice console (iPad, https :8444)
+After=engram-robot.service network-online.target
+Wants=engram-robot.service
+
+[Service]
+User=starrasp
+WorkingDirectory=/home/starrasp/engram_robot
+EnvironmentFile=/home/starrasp/engram_robot/robot.env
+Environment=ENGRAM_ROBOT_URL=http://localhost:8200
+Environment=HOME=/home/starrasp
+Nice=10
+ExecStart=/home/starrasp/engram_robot/.venv/bin/python -m voice.server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

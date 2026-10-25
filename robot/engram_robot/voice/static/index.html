@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Robot Voice</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --line: #2a2f3a; --text: #e8eaf0; --muted: #8b93a7;
+    --accent: #4f8cff; --ok: #2fbf71; --warn: #f2b33d; --bad: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+         padding: max(16px, env(safe-area-inset-top)) 16px 24px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--panel);
+          border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); } .chip.bad { color: var(--bad); }
+  .grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
+  @media (min-width: 820px) { .grid { grid-template-columns: 1.1fr 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+  .cam { width: 100%; aspect-ratio: 4/3; object-fit: cover; border-radius: 12px; background: #000; display: block; }
+  .muted { color: var(--muted); font-size: 14px; }
+  button { font: inherit; border: 0; border-radius: 14px; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .talk { width: 100%; height: 96px; font-size: 22px; font-weight: 600; background: var(--accent); color: #fff; }
+  .talk.rec { background: var(--bad); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .75; } }
+  .stop { width: 100%; height: 72px; font-size: 24px; font-weight: 800; letter-spacing: 1px;
+          background: var(--bad); color: #fff; margin-top: 14px; }
+  .row { display: flex; gap: 10px; margin-top: 12px; }
+  .row input { flex: 1; min-width: 0; font: inherit; padding: 12px 14px; border-radius: 12px;
+               border: 1px solid var(--line); background: #0c0e12; color: var(--text); }
+  .row button { padding: 0 16px; background: #2a3140; color: var(--text); }
+  .heard { font-size: 20px; margin: 14px 0 6px; min-height: 28px; }
+  .card { margin-top: 10px; padding: 14px; border-radius: 12px; border: 1px solid var(--line); background: #11141a; }
+  .card .op { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; color: var(--muted); }
+  .card .say { font-size: 18px; margin-top: 4px; }
+  .actions { display: flex; gap: 10px; margin-top: 12px; }
+  .approve { flex: 1; height: 56px; background: var(--ok); color: #06210f; font-weight: 700; font-size: 18px; }
+  .cancel { height: 56px; padding: 0 20px; background: #2a3140; color: var(--text); }
+  .result { margin-top: 12px; font-size: 15px; }
+  .result b.SUCCEEDED { color: var(--ok); } .result b.UNKNOWN, .result b.VETOED { color: var(--warn); }
+  .result b.FAILED, .result b.ABORTED, .result b.REJECTED { color: var(--bad); }
+  .reset { margin-top: 10px; width: 100%; height: 48px; background: var(--warn); color: #2a1d00; font-weight: 700; }
+  .hidden { display: none !important; }
+  .examples { margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Robot Voice</h1>
+  <div class="chips">
+    <span class="chip" id="chip-link">robot: …</span>
+    <span class="chip" id="chip-batt">battery: …</span>
+    <span class="chip" id="chip-front">front: …</span>
+  </div>
+</header>
+
+<div class="grid">
+  <section class="panel">
+    <img class="cam" id="cam" alt="Robot camera">
+    <p class="muted" id="cam-note">Camera starting…</p>
+    <button class="stop" id="stop">STOP</button>
+    <button class="reset hidden" id="reset">E-stop latched: tap to reset</button>
+  </section>
+
+  <section class="panel">
+    <button class="talk" id="talk">Tap to talk</button>
+    <div class="row">
+      <input id="typed" placeholder="…or type a command" autocomplete="off">
+      <button id="send">Send</button>
+    </div>
+    <p class="muted examples">Try: "pick up object seven", "turn left 90 degrees", "drive forward 30 centimeters",
+      "open the claw", "what do you see", "stop".</p>
+    <div class="heard" id="heard"></div>
+    <div class="card hidden" id="proposal">
+      <div class="op" id="p-op"></div>
+      <div class="say" id="p-say"></div>
+      <div class="actions">
+        <button class="approve" id="approve">Approve</button>
+        <button class="cancel" id="cancel">Cancel</button>
+      </div>
+    </div>
+    <div class="result" id="result"></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let pin = null, pinRequired = false, recorder = null, chunks = [], pending = null, mode = "direct", brainPlan = null;
+const NO_APPROVAL = new Set(["stop", "observe", "detect_tag"]);
+
+function speak(text) {
+  try { const u = new SpeechSynthesisUtterance(text); u.rate = 1.05; speechSynthesis.cancel(); speechSynthesis.speak(u); } catch (e) {}
+}
+async function api(path, body) {
+  const opts = body instanceof FormData ? { method: "POST", body }
+    : body !== undefined ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {};
+  const r = await fetch(path, opts);
+  let data = {}; try { data = await r.json(); } catch (e) {}
+  if (!r.ok && !data.status) throw new Error(data.error || data.detail || r.statusText);
+  return data;
+}
+function getPin() {
+  if (pinRequired && !pin) pin = prompt("Robot PIN");
+  return pin;
+}
+
+function esc(t) { return String(t).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function stepText(st) {
+  const op = st.op || st.action || st.name || "step";
+  const args = st.args || st.params || {};
+  const a = Object.entries(args).map(([k, v]) => `${k}=${v}`).join(", ");
+  return a ? `${op} (${a})` : op;
+}
+
+async function askBrain(text) {
+  $("proposal").classList.add("hidden");
+  $("result").textContent = "Planning from memory… (the AI can take up to a minute)";
+  let r;
+  try { r = await api("/api/brain/command", { text }); }
+  catch (e) { $("result").innerHTML = `<b class="FAILED">BRAIN</b> ${esc(e.message)}`; return; }
+  if (r.error) { $("result").innerHTML = `<b class="FAILED">BRAIN</b> ${esc(r.error)}`; return; }
+  if (r.kind === "taught") { $("result").innerHTML = `<b class="SUCCEEDED">REMEMBERED</b> ${esc(r.title || "")}`; speak("Got it, I'll remember that."); return; }
+  if (r.kind === "scheduled") { $("result").innerHTML = `<b class="SUCCEEDED">SCHEDULED</b> when ${esc(JSON.stringify(r.trigger))}: ${esc(r.request || "")}`; speak("Okay, I'll do that later."); return; }
+  if (r.status === "refused") { $("result").innerHTML = `<b class="REJECTED">REFUSED</b> ${esc(r.reason || "")}`; speak("I won't do that. " + (r.reason || "")); return; }
+  const steps = (r.plan && r.plan.steps) || [];
+  const check = r.check || {};
+  const errs = check.errors || [], warns = check.warnings || [];
+  if (r.status !== "proposed") {
+    $("result").innerHTML = `<b class="REJECTED">${esc((r.status || "?").toUpperCase())}</b> ${esc(errs.join("; "))}`;
+    speak("That plan failed the safety check."); return;
+  }
+  brainPlan = r;
+  $("p-op").textContent = `plan from ${r.source || "planner"} · ${steps.length} step(s)` + (r.planner_note ? ` · ${r.planner_note}` : "");
+  $("p-say").innerHTML = "<ol style='margin:6px 0 0 18px;padding:0'>" + steps.map(st => `<li>${esc(stepText(st))}</li>`).join("") + "</ol>"
+    + (warns.length ? `<div class="muted" style="margin-top:6px">Warnings: ${esc(warns.join("; "))}</div>` : "");
+  $("proposal").classList.remove("hidden");
+  speak(`I have a plan with ${steps.length} steps. Approve?`);
+}
+
+async function approveBrain() {
+  const r0 = brainPlan; brainPlan = null;
+  $("proposal").classList.add("hidden");
+  $("result").textContent = "Running the approved plan…";
+  try {
+    const r = await api("/api/brain/approve", { operation_id: r0.operation_id, digest: r0.digest, pin: getPin() });
+    if (r.error) throw new Error(r.error);
+    const outcome = (r.outcome || "?").toUpperCase();
+    const cls = outcome === "DONE" || outcome === "SUCCEEDED" ? "SUCCEEDED" : outcome === "UNKNOWN" ? "UNKNOWN" : "FAILED";
+    $("result").innerHTML = `<b class="${cls}">${esc(outcome)}</b> ${esc(r.failure || "")}`;
+    speak(`${outcome.toLowerCase()}. ${r.failure || ""}`);
+  } catch (e) {
+    if (String(e.message).includes("PIN")) pin = null;
+    $("result").innerHTML = `<b class="FAILED">ERROR</b> ${esc(e.message)}`;
+  }
+}
+
+function showIntent(text, intent) {
+  $("heard").textContent = text ? `“${text}”` : "";
+  $("result").textContent = "";
+  if (mode === "brain") {
+    if (intent.op === "stop") { doStop("voice"); return; }   // stop never waits for the AI
+    if (text && text.trim()) askBrain(text.trim()); else $("result").textContent = intent.say;
+    return;
+  }
+  if (!intent.op) { $("proposal").classList.add("hidden"); $("result").textContent = intent.say; speak(intent.say); return; }
+  if (intent.op === "stop") { doStop("voice"); return; }
+  if (NO_APPROVAL.has(intent.op)) { run(intent); return; }
+  pending = intent;
+  $("p-op").textContent = `${intent.op} ${JSON.stringify(intent.args)}`;
+  $("p-say").textContent = intent.say;
+  $("proposal").classList.remove("hidden");
+  speak(intent.say + " Approve?");
+}
+
+async function run(intent) {
+  $("proposal").classList.add("hidden");
+  $("result").textContent = "Running…";
+  try {
+    const r = await api("/api/execute", { op: intent.op, args: intent.args, pin: getPin() });
+    const st = r.status || (r.stopped ? "STOPPED" : "?");
+    let extra = "";
+    if (intent.op === "observe" && r.data && r.data.tags) {
+      extra = r.data.tags.length ? " Tags: " + r.data.tags.map(t => `${t.tag_id} at ${t.distance_m.toFixed(2)} m`).join(", ") : "";
+    }
+    $("result").innerHTML = `<b class="${st}">${st}</b> ${r.code || ""} — ${r.message || ""}${extra}`;
+    speak(`${st.toLowerCase()}. ${r.message || ""}${extra}`);
+  } catch (e) {
+    if (String(e.message).includes("PIN")) pin = null;
+    $("result").innerHTML = `<b class="FAILED">ERROR</b> ${e.message}`;
+  }
+}
+
+async function doStop(src) {
+  try { await api("/api/stop", {}); } catch (e) {}
+  $("proposal").classList.add("hidden");
+  $("result").innerHTML = `<b class="ABORTED">STOPPED</b> (${src}). Robot e-stop is latched.`;
+  speak("Stopped.");
+  refresh();
+}
+
+$("stop").onclick = () => doStop("button");
+$("reset").onclick = async () => {
+  if (!confirm("Clear the e-stop? Only if the area around the robot is safe.")) return;
+  try { await api("/api/reset", { operator: "ipad", pin: getPin() }); } catch (e) { alert(e.message); }
+  refresh();
+};
+$("approve").onclick = () => { if (mode === "brain" && brainPlan) { approveBrain(); return; } if (pending) run(pending); pending = null; };
+$("cancel").onclick = () => { pending = null; brainPlan = null; $("proposal").classList.add("hidden"); $("result").textContent = "Cancelled."; };
+$("send").onclick = async () => {
+  const text = $("typed").value.trim(); if (!text) return;
+  $("typed").value = "";
+  const r = await api("/api/parse", { text }); showIntent(r.text, r.intent);
+};
+$("typed").addEventListener("keydown", (e) => { if (e.key === "Enter") $("send").click(); });
+
+$("talk").onclick = async () => {
+  if (recorder && recorder.state === "recording") { recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = [];
+    recorder = new MediaRecorder(stream);
+    recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    recorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      $("talk").classList.remove("rec"); $("talk").textContent = "Transcribing…";
+      const type = recorder.mimeType || "audio/mp4";
+      const ext = type.includes("webm") ? "webm" : type.includes("ogg") ? "ogg" : "m4a";
+      const fd = new FormData(); fd.append("audio", new Blob(chunks, { type }), `speech.${ext}`);
+      try { const r = await api("/api/transcribe", fd); showIntent(r.text, r.intent); }
+      catch (e) { $("result").innerHTML = `<b class="FAILED">ERROR</b> ${e.message}`; }
+      $("talk").textContent = "Tap to talk";
+    };
+    recorder.start();
+    $("talk").classList.add("rec"); $("talk").textContent = "Listening… tap to finish";
+  } catch (e) {
+    $("result").innerHTML = `<b class="FAILED">MIC</b> ${e.message}. Safari needs this page over https and mic permission.`;
+  }
+};
+
+function chip(id, text, cls) { const c = $(id); c.textContent = text; c.className = "chip " + (cls || ""); }
+async function refresh() {
+  try {
+    const s = await (await fetch("/api/state")).json();
+    if (s.error) throw new Error(s.error);
+    const v = s.driver && s.driver.battery_v;
+    chip("chip-batt", v ? `battery ${v.toFixed(2)} V` : "battery ?", !v ? "" : v < 7.0 ? "bad" : v < 7.4 ? "warn" : "ok");
+    const f = s.safety.lidar_min_front_m;
+    chip("chip-front", f == null ? "front clear" : `front ${Math.round(f * 100)} cm`, f != null && f < 0.25 ? "warn" : "ok");
+    const latched = s.safety.estop_latched;
+    chip("chip-link", latched ? "E-STOP" : s.busy ? `busy: ${s.busy.op}` : "robot ready", latched ? "bad" : "ok");
+    $("reset").classList.toggle("hidden", !latched);
+  } catch (e) { chip("chip-link", "robot offline", "bad"); }
+}
+let streamFails = 0;
+function startStream() {
+  const cam = $("cam");
+  cam.onload = () => { streamFails = 0; $("cam-note").textContent = "Live camera stream."; };
+  cam.onerror = () => {
+    streamFails++;
+    $("cam-note").textContent = streamFails > 3 ? "Camera unavailable." : "Reconnecting camera…";
+    setTimeout(startStream, Math.min(5000, 1000 * streamFails));
+  };
+  cam.src = "/api/stream?q=60&fps=20&t=" + Date.now();
+}
+(async () => {
+  try {
+    const c = await (await fetch("/api/config")).json();
+    pinRequired = c.pin_required;
+    mode = c.mode || "direct";
+    document.querySelector("h1").textContent = mode === "brain" ? "Robot Voice · ENGRAM brain" : "Robot Voice · direct test";
+    if (!c.speech_ready) $("result").textContent = "Speech not installed on the robot yet (" + c.missing.join(", ") + "). Typing still works.";
+  } catch (e) {}
+  refresh(); setInterval(refresh, 2000); startStream();
+})();
+</script>
+</body>
+</html>
