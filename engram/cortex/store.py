@@ -69,9 +69,12 @@ HAZARD_RE = re.compile(r"\b(?:unsafe|safe(?:ly)?|danger\w*|\w*hazard\w*|toxic|fl
                        r"forbidden|prohibited|banned|restricted|allowed|permitted|authori[sz]ed|approved|permission|approval|"
                        r"(?:can|could|may|might|must|shall|should|cannot)(?:\s+not|n't)?(?:\s+only)?(?:\s+ever)?\s+be\s+(?:\w+\s+)?"
                        r"(?:used|moved|handled|touched|picked|carried|lifted|stored|placed|left|opened|taken|brought|transported))\b", re.I)
-# Motion of the robot or use of a place ("goes on shelf B", "can be used"); "move" too, which may mean either the robot
-# or an object. A constraint speaking of it holds for every plan involving what it covers, not only handling plans.
-MOTION_RE = re.compile(r"\b(?:go|goes|going|went|drive\w*|drove|enter\w*|navigat\w*|travel\w*|use[ds]?|using|bring\w*|brought|take|takes|taking|took|"
+# Motion of the robot itself ("never drive", "driving is forbidden"); "move" too, which may mean either the robot or an
+# object. Naming nothing, an instruction about it still has a subject: the robot (Store._reach).
+LOCOMOTION_RE = re.compile(r"\b(?:go|goes|going|went|driv(?:e\w*|ing)|drove|enter\w*|navigat\w*|travel\w*|mov(?:e|es|ed|ing))\b", re.I)
+# Motion of the robot or of what it takes somewhere, or use of a place ("goes on shelf B", "can be used"). A constraint
+# speaking of it holds for every plan involving what it covers, not only handling plans.
+MOTION_RE = re.compile(r"\b(?:go|goes|going|went|driv(?:e\w*|ing)|drove|enter\w*|navigat\w*|travel\w*|use[ds]?|using|bring\w*|brought|take|takes|taking|took|"
                        r"mov(?:e|es|ed|ing))\b", re.I)
 
 
@@ -296,7 +299,9 @@ class Store:
 
     def _reach(self, masked: str, named: list[str]) -> list[str]:
         """What an unresolved statement blocks: what it names, or every object when it speaks of every object at once
-        ("nothing may be moved", "never lift anything"). Naming nothing, it blocks everything only as an instruction about
+        ("nothing may be moved", "never lift anything"). Naming nothing, an instruction about the robot's own motion
+        ("never drive", "the robot must not travel") blocks every plan until it is reviewed: what moves is the robot, so
+        there is nothing for it to name. Otherwise, naming nothing, it blocks everything only as an instruction about
         handling or motion that may refer to any object ("carry it upright", "it must never be handled"); any other
         statement blocks nothing, so a remark ("lunch is served daily except Sunday") never freezes the robot. A
         statement about handling alone blocks only plans that handle what it covers ('@handle'): pick, carry, place."""
@@ -304,6 +309,7 @@ class Store:
         motion = bool(MOTION_RE.search(masked) or (m and m['verb'].lower() in GO_VERBS))
         instruction = bool(SAFETY_RE.search(masked) or MODAL_RE.search(masked) or NEG_HANDLE_RE.search(masked) or (m and m['verb'].lower() in HAND_VERBS | GO_VERBS))
         if named: reach = list(named)
+        elif instruction and LOCOMOTION_RE.search(masked): reach = ['*']
         elif (handling or motion) and (EVERYTHING_RE.search(masked) or (instruction and PRONOUN_RE.search(masked))): reach = ['*']
         else: return []
         return reach + (['@handle'] if handling and not motion else [])
