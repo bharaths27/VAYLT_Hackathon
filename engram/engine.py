@@ -54,6 +54,11 @@ def clarify_reply(reason: str, stopped: bool) -> str:
     return ("I stopped. " if stopped else "") + (reason + " " if reason else "") + "Please clarify."
 
 
+def _classified(classification: str) -> dict[str, Any]:
+    """How a command was taken, as every proposal result states it: understood, unclear or misheard."""
+    return {"classification": classification, "needs_clarification": classification != "understood"}
+
+
 class EngineError(Exception):
     pass
 
@@ -122,8 +127,8 @@ class Engine:
         action the robot may not do, "don't") and stop words are unchanged.
         bundle: as for propose(), if the command proposes."""
         result = self._command(text, who, bundle)
-        if result.get("needs_clarification"):
-            result.update(self._clarify(result["reason"]))
+        if result.get("classification") != "understood":  # stated by every result; one that does not say is unclear
+            result.update(self._clarify(result.get("reason", "")))
         result["heard_id"] = record_heard(self.conn, text.strip(), who, result)
         return result
 
@@ -135,39 +140,41 @@ class Engine:
             out["robot"] = self.stop()
         return out
 
-    def _refuse(self, request: str, reason: str, unclear: bool) -> dict[str, Any]:
+    def _refuse(self, request: str, reason: str, classification: str) -> dict[str, Any]:
         """A command refused before planning, recorded as a refused episode like propose()'s refusals."""
         episode_id = new_id("ep")
         self._episode(episode_id, request, None, {}, "refused", reason, PlanResult(None))
         self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", reason)
         return {"kind": "proposal", "operation_id": episode_id, "status": "refused", "reason": reason,
-                "needs_clarification": unclear}
+                **_classified(classification)}
 
     def _command(self, text: str, who: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
         # A stop wins before anything else (it is still recorded as heard by command()).
         if STOP_WORDS.search(text):
-            return {"kind": "stopped", **self.stop()}
+            return {"kind": "stopped", **self.stop(), "classification": "understood"}
         stripped = text.strip()
         if not stripped:  # nothing was heard: a misheard command, never a plan
-            return self._refuse(stripped, "I didn't catch anything.", unclear=True)
+            return self._refuse(stripped, "I didn't catch anything.", "misheard")
         body = rule_body(stripped)  # "Remember that ...", "Note that ...", "From now on, ..."
         if body is not None:
-            return {"kind": "taught", **self.teach(f"Spoken note from {who}", body, kind="spoken", origin=who)}
+            return {"kind": "taught", **self.teach(f"Spoken note from {who}", body, kind="spoken", origin=who),
+                    "classification": "understood"}
         if is_memory_question(stripped) or asks_question(stripped):
             # Answered from memory: never scheduled, never planned, nothing moves (practice check M2).
             # Any question counts, not only memory-shaped ones: a question is never a request to move.
-            return {"kind": "answer", **Recall(self.memory).recall(stripped)}
+            return {"kind": "answer", **Recall(self.memory).recall(stripped), "classification": "understood"}
         rule = deferred_rule(stripped)  # "When X, remember that ...": a rule cannot wait for an event
         if rule is not None:  # understood, and refused as said: a rule now, or a robot action to schedule
             reason = (f"I can only schedule a robot action, and not '{rule}': it is a rule. Say the rule now, or "
                       "schedule a robot action, like 'When calibration ends, bring Sample B to the bench'.")
-            return self._refuse(stripped, reason, unclear=False)
+            return self._refuse(stripped, reason, "understood")
         when = parse_when(stripped)
         if when:
             trigger, request = when
             src = self.memory.add_source(f"Future task from {who}", stripped, kind="spoken", origin=who)
             task_id, created = self.prospective.add(trigger, request, src)
-            return {"kind": "scheduled", "task_id": task_id, "created": created, "trigger": trigger, "request": request}
+            return {"kind": "scheduled", "task_id": task_id, "created": created, "trigger": trigger, "request": request,
+                    "classification": "understood"}
         return {"kind": "proposal", **self.propose(stripped, bundle=bundle)}
 
     def propose(self, request: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
@@ -175,16 +182,18 @@ class Engine:
         changed since (voice presets prefetch it while the user is still speaking). Without one, or with one
         retrieved for another request, it is retrieved here.
 
-        needs_clarification, on every result: True when the request was refused because what was meant is
-        not clear (an unknown object, a time that did not parse), so the person must say it another way;
-        False when it was understood (planned, or refused as something the robot may not do)."""
+        classification, stated on every result: "unclear" when the request was refused because what was meant
+        is not clear (an unknown object, a time that did not parse), so the person must say it another way;
+        "understood" when it was planned, or refused as something the robot may not do. needs_clarification
+        says the same as a bool: true for anything but "understood"."""
         episode_id = new_id("ep")
         cls = classify_refusal(request)
         if cls:
             why, unclear = cls
             self._episode(episode_id, request, None, {}, "refused", why, PlanResult(None))
             self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", why)
-            return {"operation_id": episode_id, "status": "refused", "reason": why, "needs_clarification": unclear}
+            return {"operation_id": episode_id, "status": "refused", "reason": why,
+                    **_classified("unclear" if unclear else "understood")}
 
         if bundle is None or bundle.goal != request:
             bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
@@ -208,7 +217,8 @@ class Engine:
         if res.plan is None:
             self._episode(episode_id, request, None, {"bundle": bundle.to_dict()}, "refused", res.refused, res)
             return {"operation_id": episode_id, "status": "refused", "reason": res.refused,
-                    "needs_clarification": res.unclear, "memory": bundle.to_dict(), "planner_calls": res.planner_calls}
+                    **_classified("unclear" if res.unclear else "understood"), "memory": bundle.to_dict(),
+                    "planner_calls": res.planner_calls}
 
         check = check_plan(res.plan, self.memory, self.zones)
         plan_digest = digest(res.plan)
@@ -221,7 +231,7 @@ class Engine:
             "operation_id": episode_id, "status": status, "plan": res.plan, "digest": plan_digest,
             "check": check.to_dict(), "memory": bundle.to_dict(), "source": res.source,
             "planner_note": res.note, "planner_calls": res.planner_calls, "planning_ms": round(res.planning_ms, 3),
-            "needs_clarification": False,   # planned, or rejected by the checker: understood either way
+            **_classified("understood"),   # planned, or rejected by the checker: understood either way
         }
 
     def propose_fixed(self, goal: str, steps: list[dict[str, Any]], source: str) -> dict[str, Any]:

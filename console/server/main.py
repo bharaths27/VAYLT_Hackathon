@@ -460,14 +460,14 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
         await engine.stage(op)
         out["kind"], out["operation"] = "plan", op.public()
         await bus.emit("say", text="Here's my plan. Hold to approve.")
-    elif kind == "proposal" and p.get("needs_clarification") is not False:
-        # Unclear (an unknown object, a time that did not parse): Carter's rule. A brain that does not say
-        # (needs_clarification missing) is treated as unclear: a needless stop costs one Clear Stop.
+    elif kind == "proposal" and p.get("classification") != "understood":
+        # Unclear or misheard (an unknown object, a time that did not parse, nothing heard): Carter's rule. Only a
+        # refusal the brain states as understood is one; anything that does not say so is unclear.
         reason = p.get("reason") or p.get("status") or "refused"
         out["reason"] = reason
         await _clarify(out, reason, source, running=True if p.get("stopped") is True else None)
-        trace = [f"brain: {p.get('status')}", "needs clarification" if "needs_clarification" in p
-                 else "brain did not say needs_clarification: treated as unclear"]
+        trace = [f"brain: {p.get('status')}", f"brain: {p['classification']}" if "classification" in p
+                 else "brain did not state a classification: treated as unclear"]
         await bus.emit("parsed", kind="clarify", reason=reason, quip="", trace=trace, data={}, metrics=metrics,
                        stopped=out["stopped"])
         await bus.emit("say", text=out["reply"])

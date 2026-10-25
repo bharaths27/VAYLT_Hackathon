@@ -222,9 +222,9 @@ def on_brain(monkeypatch):
 
 
 UNKNOWN = {"kind": "proposal", "status": "refused", "reason": "I don't know which object you mean.",
-           "needs_clarification": True, "stopped": False, "operation_id": "ep_1"}
-PROHIBITED = {"kind": "proposal", "status": "refused", "needs_clarification": False, "operation_id": "ep_2",
-              "reason": "I will not do that: 'throw' is not something this robot is allowed to do."}
+           "classification": "unclear", "needs_clarification": True, "stopped": False, "operation_id": "ep_1"}
+PROHIBITED = {"kind": "proposal", "status": "refused", "classification": "understood", "needs_clarification": False,
+              "operation_id": "ep_2", "reason": "I will not do that: 'throw' is not something this robot is allowed to do."}
 
 
 def test_brain_unclear_and_it_stopped_its_own_plan(c, on_brain):
@@ -258,7 +258,7 @@ def test_brain_understood_refusal_is_unchanged(c, on_brain):
 
 
 def test_brain_that_does_not_say_is_treated_as_unclear(c, on_brain):
-    old = {k: v for k, v in UNKNOWN.items() if k not in ("needs_clarification", "stopped")}
+    old = {k: v for k, v in UNKNOWN.items() if k not in ("classification", "needs_clarification", "stopped")}
     on_brain(FakeBrain(old, running=[{"operation_id": "ep_9"}]))
     j = c.post("/commands", json={"text": "bring the thing"}).json()
     assert j["kind"] == "clarify" and j["stopped"] is True
@@ -354,7 +354,7 @@ class RunningBrain(FakeBrain):
     PLAN = {"kind": "proposal", "status": "proposed", "operation_id": "ep_run", "digest": "d" * 64, "source": "rules",
             "plan": {"goal": "Bring Sample B to the bench", "steps": [{"op": "locate_tag", "args": {}},
                                                                       {"op": "pick_tagged_object", "args": {}}]},
-            "check": {"ok": True, "physical": True}, "needs_clarification": False}
+            "check": {"ok": True, "physical": True}, "classification": "understood", "needs_clarification": False}
 
     def __init__(self):
         super().__init__(self.PLAN)
@@ -452,3 +452,11 @@ def test_a_rule_inside_two_delays_while_a_task_runs_is_refused_and_stops_nothing
     assert said[-1] == "I can only schedule a robot action."
     held.finish.set()
     assert wait(c, op["id"])["status"] != "STOPPED"
+
+
+def test_a_brain_refusal_that_does_not_state_understood_counts_as_unclear(c, on_brain):
+    # needs_clarification false, but no classification: only a stated "understood" keeps a task going
+    unsaid = {k: v for k, v in PROHIBITED.items() if k != "classification"}
+    on_brain(FakeBrain(unsaid, running=[{"operation_id": "ep_9"}]))
+    j = c.post("/commands", json={"text": "throw the beaker"}).json()
+    assert j["kind"] == "clarify" and j["stopped"] is True and main.engine.stopped

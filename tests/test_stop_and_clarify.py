@@ -230,3 +230,26 @@ def test_a_stop_during_a_step_ends_the_run_as_stopped(arena, which, status):
     assert r["stopped"] is True
     assert (out["run"]["outcome"], out["run"]["stopped"], out["run"]["failure"]) == ("aborted", True, "stop was pressed")
     assert lessons(eng) == before                            # a stopped step is no lesson about the step
+
+
+# ---- every command result states its classification; the console reads it, never the words or a missing flag --
+
+
+@pytest.mark.parametrize("text,kind,cls", [
+    ("Stop.", "stopped", "understood"),
+    ("Remember that the bench is wet.", "taught", "understood"),
+    ("What did I say about the goggles?", "answer", "understood"),
+    ("When calibration ends, bring Sample B to the bench", "scheduled", "understood"),
+    (REQUEST, "proposal", "understood"),
+    (UNDERSTOOD, "proposal", "understood"),
+    ("When calibration ends, remember that the bench is wet", "proposal", "understood"),
+    (UNCLEAR, "proposal", "unclear"),
+    ("Open the claw later", "proposal", "unclear"),
+    ("", "proposal", "misheard"),
+], ids=["stop", "taught", "answer", "scheduled", "planned", "prohibited", "a rule that waits", "unknown object",
+        "unparsed time", "nothing heard"])
+def test_every_command_result_states_its_classification(lab, text, kind, cls):
+    r = lab.command(text, "test")
+    assert (r["kind"], r["classification"]) == (kind, cls), r
+    if kind == "proposal":
+        assert r["needs_clarification"] is (cls != "understood")
