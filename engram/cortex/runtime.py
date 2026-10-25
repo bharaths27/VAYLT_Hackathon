@@ -598,8 +598,8 @@ class Brain:
         return True
 
     def metrics(self,principal: str | None=None):
-        # With a principal, episode records are that owner's only, as operation reads and /events show them.
-        return {'episodes':self.store.rows('SELECT e.id,e.outcome,e.planner_calls,e.skill_id FROM episode e LEFT JOIN cx_episode c ON c.id=e.id WHERE (? IS NULL OR c.owner=?) ORDER BY e.started_at',(principal,principal)),
+        # Episode records are the principal's own only, as operation reads and /events show them; with no principal, none.
+        return {'episodes':self.store.rows('SELECT e.id,e.outcome,e.planner_calls,e.skill_id FROM episode e JOIN cx_episode c ON c.id=e.id WHERE c.owner=? ORDER BY e.started_at',(principal,)),
                 'derived':self.store.rows('SELECT kind,status,COUNT(*) n FROM cx_derived GROUP BY kind,status'),
                 'skills':self.store.rows('SELECT status,COUNT(*) n FROM skill_version GROUP BY status'),
                 'practice':self.store.rows('SELECT status,COUNT(*) n FROM cx_practice GROUP BY status'),

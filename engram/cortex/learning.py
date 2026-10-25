@@ -140,11 +140,13 @@ class Skills:
         a=o and self.store.one('SELECT value FROM meta WHERE key=?',(self._anchor_key(goal,o['owner']),))
         return bool(a) and a['value']==episode_id
 
-    def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None, *, principal: str='') -> list[str]:
+    def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None, *, principal: str) -> list[str]:
         """Refs a command adds to its plan. Commands are episodes, not sources, so a recipe or
         skill is keyed on goal + basis (rule/source refs), never on the request. A goal with no
         rule or source cites the FIRST episode its principal asked for it in, so that principal's
-        repeats share one recipe, and nobody's plan cites another operator's episode."""
+        repeats share one recipe, and nobody's plan cites another operator's episode. There is
+        no anchor without a principal (none is shared under an empty one)."""
+        principal=text(principal,'principal',100)
         extra=list(extra_refs or [])
         if extra or self.store.related_rules(goal): return extra
         key=self._anchor_key(goal,principal)    # primary-key lookup, not a scan of past episodes

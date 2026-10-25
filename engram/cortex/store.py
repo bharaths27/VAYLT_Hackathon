@@ -725,8 +725,8 @@ class Store:
         q=' OR '.join('"'+w+'"' for w in words)
         episodes=[]
         if q:
-            episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM cx_episode_fts f JOIN episode e ON e.id=f.episode_id JOIN cx_episode c ON c.id=e.id WHERE cx_episode_fts MATCH ? AND (? IS NULL OR c.owner=?) ORDER BY bm25(cx_episode_fts) LIMIT 3',(q,principal,principal))
-        prospective=self.rows("SELECT p.id,p.request,p.trigger,p.status FROM prospective_task p LEFT JOIN cx_commitment c ON c.id=p.id WHERE p.status IN ('waiting','fired','unknown') AND (? IS NULL OR c.owner=?) ORDER BY p.created_at DESC LIMIT 3",(principal,principal))
+            episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM cx_episode_fts f JOIN episode e ON e.id=f.episode_id JOIN cx_episode c ON c.id=e.id WHERE cx_episode_fts MATCH ? AND c.owner=? ORDER BY bm25(cx_episode_fts) LIMIT 3',(q,principal))
+        prospective=self.rows("SELECT p.id,p.request,p.trigger,p.status FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.status IN ('waiting','fired','unknown') AND c.owner=? ORDER BY p.created_at DESC LIMIT 3",(principal,))
         approved=self.approved_skills(principal,goal_key=goal.key() if goal else '',limit=3,fields=('id','name','digest'))
         related_derived=[]
         for d in self.derived(limit=32):
@@ -751,14 +751,14 @@ class Store:
         return out
 
     def visible(self, refs: list[str], principal: str | None, _seen: frozenset = frozenset()) -> bool:
-        """Whether a memory may be shown to this principal. One citing another operator's episode is not (None: any
-        operator's), nor one citing a commitment (a 'future' source) but to its owner (None: nobody), directly or
-        through a derived memory it cites: its payload may quote that operator's request."""
+        """Whether a memory may be shown to this principal. One citing an episode or a commitment (a 'future' source) is
+        shown to their owner only, directly or through a derived memory it cites: its payload may quote that operator's
+        request. With no principal it is shown to nobody: no owner means no private rows, never all of them."""
         for ref in refs:
             kind, _, rid = ref.partition(':')
-            if kind == 'episode' and principal is not None:
+            if kind == 'episode':
                 o = self.one('SELECT owner FROM cx_episode WHERE id=?', (rid,))
-                if not o or o['owner'] != principal: return False
+                if principal is None or not o or o['owner'] != principal: return False
             elif kind == 'source':
                 s = self.one('SELECT kind,origin FROM source WHERE id=?', (rid,))
                 if s and s['kind'] == 'future' and (principal is None or s['origin'] != principal): return False
@@ -889,18 +889,18 @@ class Store:
                               (name,kind,canonical(payload),self.clock()))
 
     def episodes_about(self, ids: set[str], limit: int = 8, *, principal: str | None = None) -> list[dict]:
-        """Newest episodes naming any of these objects (the principal's own when given), searched BEFORE limiting."""
+        """The principal's newest episodes naming any of these objects (no principal: none), searched BEFORE limiting."""
         names = [' '+normalize(n)+' ' for o in self.objects() if o['id'] in ids for n in [o['id'], o['name']]+o['aliases']]
         out = []
         with self.lock:
-            for r in self.conn.execute('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id WHERE (? IS NULL OR c.owner=?) ORDER BY e.started_at DESC',(principal,principal)):
+            for r in self.conn.execute('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e JOIN cx_episode c ON c.id=e.id WHERE c.owner=? ORDER BY e.started_at DESC',(principal,)):
                 p = ' '+normalize(r['request'])+' '
                 if any(n in p for n in names): out.append(dict(r))
                 if len(out) >= limit: break
         return out
 
     def recall(self, question: str, kinds: list[str] | None = None, *, principal: str | None = None) -> dict:
-        # With a principal, episodes and commitments are that owner's only: another operator's requests stay private.
+        # Episodes and commitments are the asking principal's only (no principal: none): another operator's requests stay private.
         allowed={'semantic','episodic','procedural','external','parametric','prospective','working'}
         chosen=set(kinds or allowed)
         if not chosen <= allowed: raise CortexError('unknown memory kind')
@@ -911,12 +911,12 @@ class Store:
             result['memories']['external']=self.search(question)
             result['evidence']=[x['chunk_id'] for x in result['memories']['external']]
         if 'episodic' in chosen:
-            result['memories']['episodic']=self.rows('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id WHERE (? IS NULL OR c.owner=?) ORDER BY e.started_at DESC LIMIT 8',(principal,principal))
+            result['memories']['episodic']=self.rows('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e JOIN cx_episode c ON c.id=e.id WHERE c.owner=? ORDER BY e.started_at DESC LIMIT 8',(principal,))
         if 'procedural' in chosen:
             self.invalidate()
             result['memories']['procedural']=self.approved_skills(principal,limit=10,fields=('id','name','version','status'))
         if 'prospective' in chosen:
-            result['memories']['prospective']=self.rows("SELECT p.id,p.trigger,p.request,p.status,p.proposal_id FROM prospective_task p LEFT JOIN cx_commitment c ON c.id=p.id WHERE p.status NOT IN ('done','cancelled') AND (? IS NULL OR c.owner=?) ORDER BY p.created_at DESC LIMIT 10",(principal,principal))
+            result['memories']['prospective']=self.rows("SELECT p.id,p.trigger,p.request,p.status,p.proposal_id FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.status NOT IN ('done','cancelled') AND c.owner=? ORDER BY p.created_at DESC LIMIT 10",(principal,))
         if 'parametric' in chosen:
             result['memories']['parametric']=[{**r,'payload':json.loads(r.pop('payload_json'))} for r in self.rows('SELECT * FROM cx_manifest')]
         if 'working' in chosen:

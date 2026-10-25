@@ -130,3 +130,24 @@ def published(arena,clock):
     s=Store(clock=clock,policy=Policy(auto_publish_verified=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
     yield b
     b.close()
+
+
+# P2-4 (class B): no principal means no private rows, never every owner's. No episode, commitment or procedure
+# anchored on an episode is returned without one; the owner still sees hers.
+def test_no_principal_means_no_private_rows(published):
+    b=published;goal=Goal('goto',zone='shelf_b')
+    b.schedule('the tray arrives','bring Sample A to the bench',principal='alice')
+    for request in ('Go to the shelf b','Bring Sample A to the bench.'):
+        p=b.command(request,principal='alice');b.reject(p['operation_id'],principal='alice')
+    assert b.skills.find(goal,'alice')                                                      # hers, anchored on her episode
+    bundle=b.store.bundle('Go to the shelf b when the tray arrives',goal)
+    assert not bundle['related_episodes'] and not bundle['prospective'] and not bundle['applicable_skills'],bundle   # was: hers
+    kinds=['episodic','prospective','procedural']
+    r=b.store.recall('what happened last time',kinds)
+    assert not any(r['memories'][k] for k in kinds) and 'shelf' not in r['reply'].lower(),r                       # was: hers
+    assert not b.store.episodes_about({'sample_a'}) and not b.metrics()['episodes'] and b.skills.find(goal) is None
+    mine=b.store.recall('what happened last time',kinds,principal='alice')
+    assert all(mine['memories'][k] for k in kinds) and b.store.episodes_about({'sample_a'},principal='alice')    # control
+
+def test_guard_an_anchor_needs_a_principal(brain):
+    with pytest.raises(CortexError,match='principal'): brain.skills.provenance(Goal('goto',zone='bench'),'ep_x',principal='')
