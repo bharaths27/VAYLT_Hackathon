@@ -469,6 +469,8 @@ class Store:
         s = self.one('SELECT * FROM source WHERE id=?', (sid,))
         if not s:
             raise Missing('no such legacy source')
+        if self.one('SELECT 1 FROM cx_source WHERE source_id=?', (sid,)):      # a commitment's text never becomes shared
+            raise Conflict('not a legacy source: Cortex already holds it (revise it with supersedes)')
         parts = self.rows('SELECT text FROM source_chunk WHERE source_id=? ORDER BY start_char', (sid,))
         return self.teach(s['title'], '\n\n'.join(p['text'] for p in parts), owner=owner, kind='adopted_legacy')
 
@@ -688,7 +690,7 @@ class Store:
         if q:
             episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM cx_episode_fts f JOIN episode e ON e.id=f.episode_id JOIN cx_episode c ON c.id=e.id WHERE cx_episode_fts MATCH ? AND (? IS NULL OR c.owner=?) ORDER BY bm25(cx_episode_fts) LIMIT 3',(q,principal,principal))
         prospective=self.rows("SELECT p.id,p.request,p.trigger,p.status FROM prospective_task p LEFT JOIN cx_commitment c ON c.id=p.id WHERE p.status IN ('waiting','fired','unknown') AND (? IS NULL OR c.owner=?) ORDER BY p.created_at DESC LIMIT 3",(principal,principal))
-        approved=self.rows("SELECT v.id,v.name,v.digest FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' AND c.goal_key=? LIMIT 3",(goal.key() if goal else '',))
+        approved=self.approved_skills(principal,goal_key=goal.key() if goal else '',limit=3,fields=('id','name','digest'))
         related_derived=[]
         for d in self.derived(limit=32):
             if d['status']=='VERIFIED' and self.refs_valid(d['refs']) and (not goal or d['basis_hash']==self.basis(goal)) and self.visible(d['refs'],principal):
@@ -700,6 +702,16 @@ class Store:
             if len(canonical(trial).encode())<=self.policy.max_bundle_bytes: b=trial
             else: b['omitted'].append(name)
         return b
+
+    def approved_skills(self, principal: str | None, *, goal_key: str | None = None, limit: int = 10, fields: tuple = ('id','name')) -> list[dict]:
+        """Approved procedures this principal may see (Store.visible on their definition refs), newest first: one built
+        on another operator's commitment or episode is that operator's alone."""
+        out = []
+        for r in self.rows("SELECT v.*,c.goal_key FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' AND (? IS NULL OR c.goal_key=?) "
+                           "ORDER BY v.approved_at DESC", (goal_key, goal_key)):
+            if len(out) >= limit: break
+            if self.visible(json.loads(r['definition_json']).get('refs', []), principal): out.append({k: r[k] for k in fields})
+        return out
 
     def visible(self, refs: list[str], principal: str | None, _seen: frozenset = frozenset()) -> bool:
         """Whether a memory may be shown to this principal. One citing another operator's episode is not (None: any
@@ -865,7 +877,7 @@ class Store:
             result['memories']['episodic']=self.rows('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id WHERE (? IS NULL OR c.owner=?) ORDER BY e.started_at DESC LIMIT 8',(principal,principal))
         if 'procedural' in chosen:
             self.invalidate()
-            result['memories']['procedural']=self.rows("SELECT v.id,v.name,v.version,v.status FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' ORDER BY v.approved_at DESC LIMIT 10")
+            result['memories']['procedural']=self.approved_skills(principal,limit=10,fields=('id','name','version','status'))
         if 'prospective' in chosen:
             result['memories']['prospective']=self.rows("SELECT p.id,p.trigger,p.request,p.status,p.proposal_id FROM prospective_task p LEFT JOIN cx_commitment c ON c.id=p.id WHERE p.status NOT IN ('done','cancelled') AND (? IS NULL OR c.owner=?) ORDER BY p.created_at DESC LIMIT 10",(principal,principal))
         if 'parametric' in chosen:

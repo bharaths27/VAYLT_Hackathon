@@ -144,7 +144,7 @@ class Brain:
         with self.activity.foreground():
             try:
                 # A command is an episode, not a source: it is never recalled as knowledge.
-                refs=self.skills.provenance(goal,ep,extra_refs)
+                refs=self.skills.provenance(goal,ep,extra_refs,principal=principal)
                 bundle=self.store.bundle(request,goal,principal=principal)
                 fixture=self._fixture()
                 # Optional relevance advice ranks only explicitly cloud-permitted evidence.
@@ -152,7 +152,7 @@ class Brain:
                 if shareable:
                     self._advisor('relevance',{'request':request,'evidence':[{'id':e.get('id',e.get('chunk_id')),'text':e['text']} for e in shareable[:5]]},
                                   {'sufficient':'Does the supplied evidence directly support this request without missing a material condition?'},cloud_allowed)
-                skill=self.skills.find(goal)
+                skill=self.skills.find(goal,principal)                  # only a procedure this principal may see
                 # A stored procedure is reused only where every step still makes progress; otherwise compose afresh.
                 if skill and not verify(goal,skill['definition']['steps'],fixture,self.store.related_rules(goal),self.store.policy).ok: skill=None
                 if skill and self.store.cloud_eligible(skill['definition']['refs']):

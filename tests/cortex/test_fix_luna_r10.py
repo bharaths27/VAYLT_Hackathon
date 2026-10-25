@@ -52,3 +52,46 @@ def test_a_condition_taught_after_proposing_stops_its_approval(brain):
 @pytest.mark.parametrize('note',['Safety goggles must be at the ppe station before handling Sample B.','Lena arrives when the lab opens.'])
 def test_control_a_stored_rule_and_a_remark_add_no_condition(store,note):
     assert not store.teach('Note',note,owner='carther')['unresolved_rules']
+
+
+# P2-3, P1-4 and the privacy class: a procedure built on one operator's commitment or episode is theirs alone. It is not
+# listed in another's bundle or recall (nor with no principal), and never selected for another's command.
+from engram.cortex.store import Store
+
+@pytest.fixture
+def published(arena,clock):
+    s=Store(clock=clock,policy=Policy(auto_publish_verified=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    yield b
+    b.close()
+
+def commitment_skill(b):
+    """Alice's commitment wakes into a proposal; with auto-publish its procedure is approved, citing her commitment."""
+    b.schedule('the tray arrives','bring Sample A to the bench',principal='alice')
+    assert b.trigger('the tray arrives',event_id='ev1',principal='alice')[0]['proposal']['status']=='proposed'
+    fsid=b.store.one("SELECT id FROM source WHERE kind='future'")['id']
+    skill=next(s for s in b.skills.list() if 'source:'+fsid in s['definition']['refs'])
+    assert skill['status']=='APPROVED'
+    return skill,fsid
+
+def test_a_procedure_built_on_a_commitment_stays_out_of_others_bundles_and_recall(published):
+    skill,_=commitment_skill(published);s=published.store;goal=Goal('fetch',('sample_a',),'bench')
+    listed=lambda who:[x['id'] for x in s.bundle('Bring Sample A to the bench',goal,principal=who)['applicable_skills']]
+    assert skill['id'] in listed('alice') and skill['id'] not in listed('bob')                  # was: listed to bob
+    recalled=lambda who:[x['id'] for x in s.recall('what do you remember',['procedural'],principal=who)['memories']['procedural']]
+    assert skill['id'] in recalled('alice') and skill['id'] not in recalled('bob') and skill['id'] not in recalled(None)
+
+def test_another_operators_command_never_selects_a_procedure_built_on_her_commitment(published):
+    skill,fsid=commitment_skill(published)
+    p=published.command('Bring Sample A to the bench.',principal='bob')
+    assert p['status']=='proposed' and p['skill_id']!=skill['id'] and fsid not in str(p['plan'])   # was: her procedure
+    assert published.command('Bring Sample A to the bench.',principal='alice')['skill_id']==skill['id']   # hers to reuse
+
+def test_no_plan_cites_another_operators_episode(brain):
+    a=brain.command('Go to the shelf b',principal='alice');b=brain.command('Go to the shelf b',principal='bob')
+    assert 'episode:'+a['operation_id'] in a['plan']['refs'] and 'episode:'+b['operation_id'] in b['plan']['refs']
+    assert 'episode:'+a['operation_id'] not in b['plan']['refs']                               # was: her first request
+
+def test_a_commitment_never_becomes_a_shared_source_by_adoption(brain):
+    brain.schedule('the tray arrives','bring Sample A to the bench',principal='alice')
+    fsid=brain.store.one("SELECT id FROM source WHERE kind='future'")['id']
+    with pytest.raises(Conflict,match='not a legacy source'): brain.store.adopt_legacy_source(fsid,owner='bob')

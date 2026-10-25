@@ -126,26 +126,40 @@ class Skills:
                 todo+=json.loads(row['refs_json']) if row else [r]
             elif not r.startswith('episode:'): core.add(r)
         if core: return sorted(core)
-        anchor=self.store.one('SELECT value FROM meta WHERE key=?',('cx_goal_anchor:'+goal.key(),))
-        return ['episode:'+anchor['value']] if anchor and 'episode:'+anchor['value'] in refs else sorted(set(refs))
+        anchors=[r for r in refs if r.startswith('episode:') and self._anchor(goal,r[len('episode:'):])]
+        return sorted(set(anchors)) if anchors else sorted(set(refs))
 
-    def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None) -> list[str]:
+    @staticmethod
+    def _anchor_key(goal: Goal, principal: str) -> str:
+        return 'cx_goal_anchor:'+principal+':'+goal.key()
+
+    def _anchor(self, goal: Goal, episode_id: str) -> bool:
+        """Whether this episode is its owner's anchor for the goal (that owner's first request for it)."""
+        o=self.store.one('SELECT owner FROM cx_episode WHERE id=?',(episode_id,))
+        a=o and self.store.one('SELECT value FROM meta WHERE key=?',(self._anchor_key(goal,o['owner']),))
+        return bool(a) and a['value']==episode_id
+
+    def provenance(self, goal: Goal, episode_id: str, extra_refs: list[str] | None=None, *, principal: str='') -> list[str]:
         """Refs a command adds to its plan. Commands are episodes, not sources, so a recipe or
         skill is keyed on goal + basis (rule/source refs), never on the request. A goal with no
-        rule or source cites the FIRST episode that asked for it, so repeats share one recipe."""
+        rule or source cites the FIRST episode its principal asked for it in, so that principal's
+        repeats share one recipe, and nobody's plan cites another operator's episode."""
         extra=list(extra_refs or [])
         if extra or self.store.related_rules(goal): return extra
-        key='cx_goal_anchor:'+goal.key()    # primary-key lookup, not a scan of past episodes
+        key=self._anchor_key(goal,principal)    # primary-key lookup, not a scan of past episodes
         with self.store.tx():
             self.store.conn.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',(key,episode_id))
             return ['episode:'+self.store.one('SELECT value FROM meta WHERE key=?',(key,))['value']]
 
-    def find(self,goal: Goal) -> dict | None:
+    def find(self,goal: Goal,principal: str | None=None) -> dict | None:
+        """An approved, still valid procedure for this goal that this principal may see (Store.visible on its refs): one
+        built on another operator's commitment or episode is never selected for, or shown to, anyone else."""
         # Hot path: an indexed lookup by goal, each candidate validated below; no vault rescan.
         for r in self.store.rows("SELECT c.id FROM cx_skill c JOIN skill_version s ON s.id=c.id WHERE c.goal_key=? AND s.status='APPROVED' ORDER BY s.approved_at DESC",(goal.key(),)):
             s=self.get(r['id']); d=s['definition']
             if (digest(d)==s['digest'] and d['basis']==self.store.basis(goal) and d['policy_hash']==self.store.policy.fingerprint()
-                    and s['validation'] and s['validation']['definition_digest']==s['digest'] and self.store.refs_valid(d['refs'])):
+                    and s['validation'] and s['validation']['definition_digest']==s['digest'] and self.store.refs_valid(d['refs'])
+                    and self.store.visible(d['refs'],principal)):
                 return s
         return None
 
