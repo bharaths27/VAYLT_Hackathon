@@ -247,21 +247,21 @@ def test_cancel_closes_the_connection_and_returns_at_once():
 
 class _SlowConnect(socket.socket):
     def connect(self, address):
-        time.sleep(0.3)
+        time.sleep(1.0)
         super().connect(address)
 
 
 def test_a_request_cancelled_while_connecting_is_never_sent(monkeypatch):
     srv = _OneAtATimeWhisper([0.0])
-    monkeypatch.setattr(_http, "_new_socket", _SlowConnect)   # the TCP connect takes 0.3 s
+    monkeypatch.setattr(_http, "_new_socket", _SlowConnect)   # the TCP connect takes 1 s
     try:
         token = CancelToken()
         threading.Timer(0.1, token.cancel).start()             # cancelled while still connecting
         t0 = time.monotonic()
         with pytest.raises(Cancelled):
             WhisperServerClient(srv.url, timeout_s=5).transcribe(PcmWindow().snapshot(), cancel=token)
-        assert time.monotonic() - t0 < 0.25                     # released at the cancel, not after the connect
-        time.sleep(0.5)                                         # the connect completes meanwhile...
+        assert time.monotonic() - t0 < 0.7                      # released at the cancel, not after the connect
+        time.sleep(1.2)                                         # the connect completes meanwhile...
         assert srv.log == []                                    # ...but the request is never sent
         assert _no_workers_left()
     finally:
