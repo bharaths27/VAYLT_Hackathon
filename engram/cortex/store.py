@@ -691,7 +691,8 @@ class Store:
         elif re.search(r'\b(pending|what is next|what needs to happen|waiting)\b',low):
             tasks=result['memories'].get('prospective',[])
             result['reply']='; '.join(f"{t['request']}: {t['status']} (trigger: {t['trigger']})" for t in tasks[:3]) or 'No open commitments in the returned scope.'
-        elif 'where' in low and ids:
+        elif 'where' in low and ids and all(o['fresh'] for o in self.objects() if o['id'] in ids):
+            # Object state answers a location only while CURRENT; unobserved or stale state falls through to the evidence.
             result['reply']='; '.join(o['statement'] for o in self.objects() if o['id'] in ids)
         elif hits:
             result['reply']='Source says: '+hits[0]['text'][:600]
