@@ -745,7 +745,12 @@ class Store:
         q=' OR '.join('"'+w+'"' for w in words)
         episodes=[]
         if q:
-            episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM cx_episode_fts f JOIN episode e ON e.id=f.episode_id JOIN cx_episode c ON c.id=e.id WHERE cx_episode_fts MATCH ? AND c.owner=? ORDER BY bm25(cx_episode_fts) LIMIT 3',(q,principal))
+            # Ranked within a window, the principal's newest matching episodes: planning reads this on every request, so
+            # its cost must not grow with the episode history.
+            episodes=self.rows('SELECT e.id,e.request,e.outcome,e.failure,c.mode FROM (SELECT f.episode_id,bm25(cx_episode_fts) score '
+                               'FROM cx_episode_fts f JOIN cx_episode c ON c.id=f.episode_id WHERE cx_episode_fts MATCH ? AND c.owner=? '
+                               'ORDER BY f.rowid DESC LIMIT 32) w JOIN episode e ON e.id=w.episode_id JOIN cx_episode c ON c.id=e.id '
+                               'ORDER BY w.score LIMIT 3',(q,principal))
         prospective=self.rows("SELECT p.id,p.request,p.trigger,p.status FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.status IN ('waiting','fired','unknown') AND c.owner=? ORDER BY p.created_at DESC LIMIT 3",(principal,))
         approved=self.approved_skills(principal,goal_key=goal.key() if goal else '',limit=3,fields=('id','name','digest'))
         related_derived=[]

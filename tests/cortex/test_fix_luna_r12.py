@@ -220,3 +220,26 @@ def test_an_explicit_empty_sensor_credential_set_refuses_the_environment_token(b
     assert not brain.store.one('SELECT 1 FROM observation')
     with TestClient(create_app(brain,tokens={TA:'alice'},start_idle=False)) as c:              # control: absent, the environment's
         assert c.post('/observations/sensor',json=PACKET,headers=h(SENSOR)).status_code==200
+
+
+# Found by this round's gates (no review finding): the planning bundle ranked every matching episode of the history, so
+# planning cost grew with it (the timing test in test_fix_learn_memory was flaky for that reason). It ranks a window, the
+# principal's newest matching episodes. Counted in SQLite VM steps, so the check is deterministic.
+def test_the_related_episode_lookup_costs_the_same_however_long_the_history(store):
+    goal=Goal('fetch',('sample_b',),'bench');made=[0]
+    def history(n):
+        with store.tx():
+            for _ in range(n):
+                made[0]+=1;ep=f'ep_hist{made[0]}'
+                store.conn.execute('INSERT INTO episode(id,goal,request,outcome,started_at) VALUES(?,?,?,?,?)',(ep,'{}','Bring Sample B to bench','rejected',made[0]))
+                store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',(ep,'SIMULATED','{}','','','{}',None,'',0,'op'))
+    def steps():
+        n=[0]
+        def tick(): n[0]+=1;return 0
+        store.conn.set_progress_handler(tick,10)
+        try: related=store.bundle('Bring Sample B to bench',goal,principal='op')['related_episodes']
+        finally: store.conn.set_progress_handler(None,0)
+        assert len(related)==3
+        return n[0]
+    history(50);small=steps();history(450);large=steps()                                  # ten times the history
+    assert large<=small*1.5,(small,large)                                                   # was: about seven times the steps
