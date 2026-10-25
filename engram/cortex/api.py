@@ -5,8 +5,8 @@ Run from the repository root with uvicorn engram.cortex.api:create_app --factory
 No submitted branch, voice stack, or motor service is modified by importing this.
 """
 from __future__ import annotations
-import asyncio,copy,hmac,json,os,time
-from contextlib import asynccontextmanager
+import asyncio,copy,hmac,json,logging,os,time
+from contextlib import AsyncExitStack,asynccontextmanager
 from pathlib import Path
 from typing import Any,Literal
 from fastapi import FastAPI,Depends,Header,HTTPException,Request
@@ -88,6 +88,27 @@ class Turn(Input):
 
 MAX_BODY=300000
 SAFE_METHODS={'GET','HEAD','OPTIONS'}
+SWEEP_S,SWEEP_MAX_S,REPEAT_S=1.0,60.0,600.0
+log=logging.getLogger('engram.cortex.api')
+
+async def sweep_forever(b:Brain):
+    """Timed-task scheduler that never dies. Any failure (clock rollback, 'database is locked')
+    is logged, retried with exponential backoff SWEEP_S..SWEEP_MAX_S, and recorded as a decision
+    once per REPEAT_S while the same failure repeats. Due tasks only ever become proposals."""
+    delay,last,noted=SWEEP_S,None,0.0
+    while True:
+        try:await asyncio.to_thread(b.sweep_due);delay,last=SWEEP_S,None
+        except Exception as e:
+            code=e.code if isinstance(e,CortexError) else type(e).__name__
+            log.warning('timed-task sweep failed: %s; retrying in %.1f s',code,delay)
+            if code!=last or time.monotonic()-noted>=REPEAT_S:
+                try:await asyncio.to_thread(b.store.decision,'clock_sweep','local',None,False,code);last,noted=code,time.monotonic()
+                except Exception:log.exception('could not record the sweep failure')
+            await asyncio.sleep(delay);delay=min(delay*2,SWEEP_MAX_S);continue
+        await asyncio.sleep(delay)
+
+async def stop_task(task):
+    task.cancel();await asyncio.gather(task,return_exceptions=True)
 
 class Guard:
     """Outermost pure-ASGI gate. A cross-site or uncredentialed mutation is refused before ONE body
@@ -176,24 +197,15 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     enable_idle=(os.environ.get('CORTEX_IDLE','1')=='1') if start_idle is None else start_idle
     @asynccontextmanager
     async def lifespan(app):
-        # Reconcile durable wakes into proposals only; never resume a physical effect.
-        await asyncio.to_thread(b.reconcile_wakes)
-        async def scheduler():
-            while True:
-                try:await asyncio.to_thread(b.sweep_due)
-                except CortexError as e:b.store.decision('clock_sweep','local',None,False,e.code)
-                await asyncio.sleep(1)
-        timer_task=asyncio.create_task(scheduler()) if b.store.policy.clock_trusted else None
-        if enable_idle:b.dreamer.start()
-        if hub:hub.start()
-        yield
-        if timer_task:
-            timer_task.cancel()
-            try:await timer_task
-            except asyncio.CancelledError:pass
-        if hub:hub.stop()
-        b.dreamer.stop()
-        if not supplied:b.close()
+        async with AsyncExitStack() as cleanup: # every registered step runs at shutdown, even if one raises
+            if not supplied:cleanup.callback(b.close)
+            cleanup.callback(b.dreamer.stop)
+            # Reconcile durable wakes into proposals only; never resume a physical effect.
+            await asyncio.to_thread(b.reconcile_wakes)
+            if b.store.policy.clock_trusted:cleanup.push_async_callback(stop_task,asyncio.create_task(sweep_forever(b)))
+            if enable_idle:b.dreamer.start()
+            if hub:hub.start();cleanup.callback(hub.stop)
+            yield
     app=FastAPI(title='ENGRAM Cortex Memory Runtime',version='0.2.0',lifespan=lifespan)
     app.state.brain=b;app.state.frame_hub=hub
     def operator(authorization:str|None=Header(default=None)):
