@@ -88,8 +88,8 @@ class Engine:
 
     # ---- commands --------------------------------------------------------
 
-    def command(self, text: str, who: str = "user") -> dict[str, Any]:
-        """One entry point for typed or spoken commands."""
+    def command(self, text: str, who: str = "user", bundle: MemoryBundle | None = None) -> dict[str, Any]:
+        """One entry point for typed or spoken commands. bundle: as for propose(), if the command proposes."""
         stripped = text.strip()
         low = stripped.lower()
         if low.startswith("remember"):
@@ -104,7 +104,7 @@ class Engine:
             src = self.memory.add_source(f"Future task from {who}", stripped, kind="spoken", origin=who)
             task_id, created = self.prospective.add(trigger, request, src)
             return {"kind": "scheduled", "task_id": task_id, "created": created, "trigger": trigger, "request": request}
-        return {"kind": "proposal", **self.propose(stripped)}
+        return {"kind": "proposal", **self.propose(stripped, bundle=bundle)}
 
     def propose(self, request: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
         """bundle: the memory bundle for this request, if the caller has already retrieved it and memory has not

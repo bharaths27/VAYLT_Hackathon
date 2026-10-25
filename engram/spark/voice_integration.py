@@ -121,8 +121,8 @@ class VoiceIntegration:
             preset = PRESETS[r.preset]
             # r.bundle was retrieved for preset.request at the memory version the gate has just re-read, so the
             # proposal uses it instead of retrieving it again.
-            out = self.engine.propose(preset.request, bundle=r.bundle)
-            return {"kind": "proposal", **out, **base, "preset": preset.name, "reused_prediction": r.reused}
+            out = self.engine.command(preset.request, who="voice", bundle=r.bundle)
+            return {**out, **base, "preset": preset.name, "reused_prediction": r.reused}
         if r.action == "schedule":
             out = self.engine.command(r.commitment, who="voice")
             if out.get("kind") != "scheduled":

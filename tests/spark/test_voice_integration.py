@@ -491,3 +491,17 @@ def test_propose_uses_a_given_bundle_only_if_it_is_for_that_request(voice, monke
     out = engine.propose("Open the gripper", bundle=given)
     assert out["status"] == "proposed" and len(fetched) == retrievals
     assert out["memory"]["goal"] == "Open the gripper" == recorded_bundle(engine, out["operation_id"])["goal"]
+
+
+def test_a_voice_final_is_a_spoken_command_and_carries_the_prefetched_bundle(voice, spawn, monkeypatch):
+    engine = voice.engine
+    calls = []
+    real_command = engine.command
+    monkeypatch.setattr(engine, "command", lambda text, **kw: calls.append((text, kw)) or real_command(text, **kw))
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    prepared = voice.gate.prepared()                            # owner thread: prefetches the bundle
+    out = voice.on_final(1, 1, "Open the claw")
+    assert out["kind"] == "proposal" and out["status"] == "proposed"
+    assert [(text, kw["who"]) for text, kw in calls] == [("Open the gripper", "voice")]   # the one entry point
+    assert calls[0][1]["bundle"] is prepared.bundle             # with the bundle prepared while speaking
