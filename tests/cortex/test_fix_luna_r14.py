@@ -242,3 +242,25 @@ def test_a_wall_clock_stepped_back_never_makes_an_old_frame_read_as_new():
     hub.publish(bytes([0xff,0xd8])+bytes(16)+bytes([0xff,0xd9]),captured_at=wall[0]-30)    # thirty seconds old on arrival
     wall[0]-=3600;mono[0]+=10                                                               # the wall clock steps back an hour
     m=hub.metadata();assert m['capture_age_s']==40 and m['receipt_age_s']==10,m            # was: 0, an old frame read as new
+
+
+# P3-6: a GET, HEAD or OPTIONS request carrying a body (declared, or chunked and so of unknown size, however large) is
+# refused without one byte of it read; one without a body is passed on.
+from engram.cortex import api
+from .test_fix_luna_r7 import TA
+def bodyless(method,headers):
+    reads,sent=[],[]
+    async def receive(): reads.append(1);return {'type':'http.request','body':b'x'*100000,'more_body':True}   # far past MAX_BODY
+    async def send(m): sent.append(m)
+    async def ok(scope,receive,send):
+        await send({'type':'http.response.start','status':200,'headers':[]});await send({'type':'http.response.body','body':b''})
+    scope={'type':'http','asgi':{'version':'3.0'},'http_version':'1.1','method':method,'path':'/health','raw_path':b'/health',
+           'root_path':'','scheme':'http','query_string':b'','client':('127.0.0.1',1),'server':('127.0.0.1',80),'headers':headers}
+    asyncio.run(api.Guard(ok,credentials=[TA])(scope,receive,send))
+    return sent[0]['status'],reads
+
+@pytest.mark.parametrize('method',['GET','HEAD','OPTIONS'])
+def test_a_bodyless_method_carrying_a_body_is_refused_unread(method):
+    assert bodyless(method,[(b'transfer-encoding',b'chunked')])==(413,[])           # was: passed on, its size never limited
+    assert bodyless(method,[(b'content-length',b'10')])==(413,[])
+    assert bodyless(method,[])==(200,[])                                             # control: no body, passed on, nothing read

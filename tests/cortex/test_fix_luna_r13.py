@@ -183,4 +183,5 @@ def test_a_method_that_takes_no_body_never_has_one_read():
     async def receive(): reads.append(1);return {'type':'http.request','body':b'x'*1000,'more_body':True}   # an endless body
     async def send(m): sent.append(m)
     asyncio.run(api.Guard(ok,credentials=[TA])(asgi_scope('GET','/health'),receive,send))
-    assert not reads and sent[0]['status']==200                        # was: read and buffered, with no credential at all
+    # Round 14: a body on a method that takes none is refused, still unread (it was passed on unread in round 13).
+    assert not reads and sent[0]['status']==413                        # was: read and buffered, with no credential at all

@@ -143,8 +143,11 @@ class Guard:
         try:declared=int(h.get('content-length','0'))
         except ValueError:return await refuse(send,400,'invalid length')
         if declared>MAX_BODY:return await refuse(send,413,'input too large')
-        # A method that takes no body is passed on with its body unread: nothing of it is buffered here (no route reads one).
-        if scope['method'] in SAFE_METHODS:return await self.app(scope,receive,send)
+        # A method that takes no body has none: one sent anyway (declared, or chunked and so of unknown size) is refused
+        # unread; one without is passed on, nothing of it read or buffered here.
+        if scope['method'] in SAFE_METHODS:
+            if declared>0 or 'transfer-encoding' in h:return await refuse(send,413,'a GET, HEAD or OPTIONS request takes no body')
+            return await self.app(scope,receive,send)
         # Gathered into one growing buffer, never re-copied per chunk: a body in tiny chunks costs linear time.
         body=bytearray();more=True
         while more:
