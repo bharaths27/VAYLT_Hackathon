@@ -132,9 +132,25 @@ def test_negation_in_the_words_blocks_even_when_the_model_misses_it(spawn, clock
 
 
 def test_negation_from_the_model_blocks_even_without_negation_words(spawn, clock):
-    text = "Open the claw, actually leave it"
-    fake = FakeIntent({text: decision("open_gripper", negated=0.9)})
-    assert make_gate(fake, spawn, clock).on_final(1, 0, text).action == "none"
+    text = "Open the claw, on reflection leave it shut"      # no local negation, correction or future cue
+    gate = make_gate(FakeIntent({text: decision("open_gripper", negated=0.9)}), spawn, clock)
+    assert not any(gate._flags(text, decision("open_gripper")))   # so only the model's flag can block it
+    assert gate.on_final(1, 0, text).action == "none"
+
+
+@pytest.mark.parametrize("text", [
+    "Open the claw; actually, close it",
+    "ACTUALLY close the claw",
+    "Close the claw instead",
+    "Open the claw, or rather close it",
+    "Open the claw I mean close it",
+    "Open the claw no wait close it",
+    "Open the claw, scratch that, close it",
+])
+def test_correction_words_block_even_when_the_model_is_confident(spawn, clock, text):
+    fake = FakeIntent({text: decision("close_gripper", confidence=0.97, ready=0.95, correction=0.05)})
+    r = make_gate(fake, spawn, clock).on_final(1, 0, text)
+    assert r.action == "none" and r.preset is None
 
 
 def test_correction_means_no_action(spawn, clock):

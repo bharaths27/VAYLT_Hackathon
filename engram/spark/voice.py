@@ -48,8 +48,11 @@ DEFAULT_TTL_S = 8.0          # a prediction older than this (from when it was as
 DEFAULT_FINAL_WAIT_S = 6.0   # how long on_final waits for the request already in flight
 
 STOP_WORDS = re.compile(r"\b(stop|halt|freeze|abort|emergency)\b", re.IGNORECASE)
+# Words that take back or replace part of what was just said. The intent prompt names the same
+# cues; matching them here too means a confident model answer cannot talk past a correction.
 CORRECTION = re.compile(
-    r"\b(i mean|i meant|scratch that|never ?mind|on second thought|no wait|wait no|sorry)\b"
+    r"\b(i mean|i meant|actually|instead|rather|scratch that|never ?mind|on second thought|no wait|wait no"
+    r"|sorry)\b"
     r"|(?:^|[,;.!?]\s*)no\b",
     re.IGNORECASE,
 )

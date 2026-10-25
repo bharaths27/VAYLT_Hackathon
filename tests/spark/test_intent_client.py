@@ -3,7 +3,8 @@
 import json
 import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import pytest
 
@@ -162,15 +163,87 @@ class _Server:
         self.httpd.server_close()
 
 
+class _Trickle:
+    """Sends a reply one byte every 50 ms, for at most 3 s. phase: 'body' or 'headers'."""
+
+    def __init__(self, phase):
+        self.stop = threading.Event()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                reply = json.dumps(answers()).encode()
+                # The long header keeps a header-phase trickle going for the whole 3 s.
+                head = (f"HTTP/1.1 200 OK\r\nX-Pad: {'a' * 400}\r\n"
+                        f"Content-Length: {len(reply) + 100_000}\r\n\r\n").encode()
+                if phase == "body":
+                    self.wfile.write(head)
+                    slow = reply + b" " * 100_000
+                else:
+                    slow = head + reply
+                t_end = time.monotonic() + 3.0
+                try:
+                    for i in range(len(slow)):
+                        if outer.stop.is_set() or time.monotonic() > t_end:
+                            return
+                        self.wfile.write(slow[i:i + 1])
+                        time.sleep(0.05)
+                except OSError:
+                    return          # the client hung up: what a deadline should cause
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/systemone"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.stop.set()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _no_http_workers_left(within_s=1.0):
+    end = time.monotonic() + within_s
+    while time.monotonic() < end:
+        if not any(t.name == "spark-http" and t.is_alive() for t in threading.enumerate()):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@pytest.mark.parametrize("phase", ["body", "headers"])
+def test_a_trickling_server_cannot_hold_the_caller_past_the_deadline(phase):
+    srv = _Trickle(phase)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _http.post(srv.url, b"{}", {"Content-Type": "application/json"}, 0.5)
+        assert time.monotonic() - t0 < 1.5            # each byte arrives well inside any per-read timeout
+        assert _no_http_workers_left()                # the abandoned worker was unblocked and ended
+
+        def to_trickle(_url, body, headers, timeout_s):
+            return _http.post(srv.url, body, headers, timeout_s)
+
+        t0 = time.monotonic()
+        with pytest.raises(IntentError, match="TimeoutError"):
+            client(to_trickle, timeout_s=0.5).classify("Open the claw", True)
+        assert time.monotonic() - t0 < 1.5
+    finally:
+        srv.close()
+
+
 @pytest.mark.parametrize("status", [301, 302, 307, 308])
 def test_redirects_are_refused_over_real_http(status):
     srv = _Server(status)
     try:
         url = f"http://127.0.0.1:{srv.port}/start"
-        assert _http.post(url, b"{}", {"Content-Type": "application/json"}, 5, use_env_proxies=False) == (status, b"")
+        assert _http.post(url, b"{}", {"Content-Type": "application/json"}, 5) == (status, b"")
 
         def to_local(_url, body, headers, timeout_s):
-            return _http.post(url, body, headers, timeout_s, use_env_proxies=False)
+            return _http.post(url, body, headers, timeout_s)
 
         with pytest.raises(IntentError, match="redirect refused"):
             client(to_local).classify("Open the claw", False)

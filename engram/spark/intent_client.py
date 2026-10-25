@@ -17,7 +17,8 @@ experimental guesses until they are measured on recorded utterances.
 Configuration comes from the environment and has no defaults in code:
     TYPESAFE_API_KEY       the API key (never logged, never in repr or errors)
     TYPESAFE_INTENT_MODEL  the pinned model id to ask
-The endpoint is fixed to the official URL and redirects are never followed.
+The endpoint is fixed to the official URL, redirects are never followed, no proxy is used,
+and timeout_s is an absolute deadline for the whole request and reply.
 """
 
 from __future__ import annotations

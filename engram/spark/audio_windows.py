@@ -7,8 +7,8 @@ so the caller must end the utterance instead of transcribing a clipped one. snap
 returns a 16 kHz mono 16-bit WAV of everything so far, ready for a partial transcript.
 
 WhisperServerClient talks to a resident whisper.cpp server (its HTTP server example,
-POST /inference) on this machine only: the URL must be a loopback IP literal, proxies from
-the environment are ignored, and redirects are not followed.
+POST /inference) on this machine only: the URL must be a loopback IP literal, no proxy is
+used, redirects are not followed, and timeout_s bounds the whole request.
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ Transport = Callable[[str, bytes, dict[str, str], float], tuple[int, bytes]]
 
 
 def _loopback_transport(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tuple[int, bytes]:
-    return _http.post(url, body, headers, timeout_s, use_env_proxies=False)
+    return _http.post(url, body, headers, timeout_s)
 
 
 class WhisperServerClient:
