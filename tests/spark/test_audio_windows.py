@@ -15,7 +15,7 @@ from engram.spark import _http
 from engram.planner import FUTURE_HINTS, NEGATION
 from engram.spark.audio_windows import (
     SAMPLE_RATE, SOUND_DESCRIPTORS, SOUND_WORDS, AudioOverflow, Cancelled, CancelToken, LiveTranscriber, OutOfOrder,
-    PcmWindow, WhisperError, WhisperServerClient, speech_only,
+    PcmWindow, WhisperError, WhisperServerClient, WindowSealed, speech_only,
 )
 from engram.spark.voice import CORRECTION, STOP_WORDS
 
@@ -355,7 +355,8 @@ def test_nothing_partial_happens_after_end_of_speech():
     tr.start()
     assert fake.started.acquire(timeout=2)                      # a partial is in flight, held
     assert tr.finish() == "Open the claw." and tr.cancelled == 1
-    _speech(window, 1.0)                                        # more audio after the end of speech
+    with pytest.raises(WindowSealed):
+        _speech(window, 1.0)                                    # more audio after the end of speech: refused
     fake.release.set()
     time.sleep(0.15)
     assert fake.calls == ["partial", "final"]                   # no new partial was started
@@ -387,7 +388,8 @@ def test_no_partial_starts_after_end_of_speech_even_when_none_was_in_flight():
         time.sleep(0.005)
     time.sleep(0.05)                                            # idle: no request in flight
     tr.finish()
-    _speech(window, 1.0)                                        # new audio after the end of speech
+    with pytest.raises(WindowSealed):
+        _speech(window, 1.0)                                    # new audio after the end of speech: refused
     time.sleep(0.15)
     assert fake.calls.count('partial') == 1 and tr.cancelled == 0
 
@@ -472,3 +474,142 @@ def test_partials_stop_once_the_utterance_overflowed(monkeypatch):
     with pytest.raises(AudioOverflow):
         tr.finish()
     assert fake.calls == [] and crashed == []                   # and the worker ended cleanly
+
+
+# ---- the final is of the whole utterance, or it is not final -----------------------------------------------------
+
+
+class _BlockingFinal:
+    """Partials answer at once; the FINAL transcription blocks until the test releases it."""
+
+    def __init__(self, text="Open the claw"):
+        self.text, self.calls = text, []
+        self.final_started, self.release = threading.Event(), threading.Event()
+
+    def transcribe(self, wav, cancel=None):
+        if cancel is not None:
+            self.calls.append("partial")
+            return self.text
+        self.calls.append("final")
+        self.final_started.set()
+        assert self.release.wait(5), "the test never released the final"
+        return self.text
+
+
+def _finish_in_thread(tr):
+    out = {}
+
+    def run():
+        try:
+            out["text"] = tr.finish()
+        except Exception as e:  # noqa: BLE001
+            out["error"] = e
+
+    t = threading.Thread(target=run)
+    t.start()
+    return t, out
+
+
+@pytest.mark.parametrize("tail_s", [0.6, 0.05], ids=["tail overflows the window", "tail fits"])
+def test_audio_appended_while_the_final_is_made_makes_it_not_final(tail_s):
+    stt, window = _BlockingFinal(), PcmWindow(max_seconds=1.0)
+    _speech(window, 0.6)                                        # "Open the claw"
+    tr = LiveTranscriber(stt, window)
+    t, out = _finish_in_thread(tr)
+    assert stt.final_started.wait(2)                            # the final transcription is running
+    with pytest.raises(WindowSealed):
+        _speech(window, tail_s)                                 # "...no, don't" arrives late: refused
+    stt.release.set()
+    t.join(5)
+    assert "text" not in out                                    # the prefix is never handed out as final
+    assert isinstance(out["error"], AudioOverflow)              # the usual "not final, say it again"
+
+
+def test_a_reset_during_the_final_cannot_hide_refused_audio():
+    stt, window = _BlockingFinal(), PcmWindow(max_seconds=1.0)
+    _speech(window, 0.6)
+    tr = LiveTranscriber(stt, window)
+    t, out = _finish_in_thread(tr)
+    assert stt.final_started.wait(2)
+    with pytest.raises(WindowSealed):
+        _speech(window, 0.05)                                   # the tail is refused...
+    window.reset()                                              # ...then the producer moves on,
+    _speech(window, 0.3)                                        # and the next utterance is accepted
+    stt.release.set()
+    t.join(5)
+    assert "text" not in out and isinstance(out["error"], AudioOverflow)
+
+
+def test_once_the_final_is_decided_the_window_refuses_audio_until_reset():
+    stt, window = _BlockingFinal(), PcmWindow(max_seconds=1.0)
+    stt.release.set()
+    _speech(window, 0.6)
+    assert LiveTranscriber(stt, window).finish() == "Open the claw"   # the whole utterance: final
+    with pytest.raises(WindowSealed):
+        _speech(window, 0.05)                                   # nothing more for this utterance
+    window.reset()
+    _speech(window, 0.05)                                       # the next utterance starts clean
+    assert window.snapshot() and not window.overflowed
+
+
+def test_a_transcriber_never_finalizes_another_utterances_audio():
+    stt, window = _BlockingFinal(), PcmWindow(max_seconds=1.0)
+    stt.release.set()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(stt, window)
+    window.reset()                                              # the producer moved on before the end
+    _speech(window, 0.3)
+    with pytest.raises(AudioOverflow):
+        tr.finish()
+    assert "final" not in stt.calls
+
+
+def test_seal_captures_exactly_what_had_arrived_and_decides_once():
+    window = PcmWindow(max_seconds=1.0)
+    window.append(pcm(1, 2, 3))
+    sealed = window.seal()
+    assert read_wav(sealed.audio)[3] == pcm(1, 2, 3)
+    assert window.finalize(sealed) is True                      # nothing was refused: final
+    with pytest.raises(WindowSealed):
+        window.append(pcm(4))
+    assert window.finalize(sealed) is True                      # the decision stands
+    other = PcmWindow(max_seconds=1.0)
+    other.append(pcm(1))
+    sealed2 = other.seal()
+    with pytest.raises(WindowSealed):
+        other.append(pcm(2))                                    # refused before the decision...
+    assert other.finalize(sealed2) is False                     # ...so not final
+    with pytest.raises(AudioOverflow):
+        other.snapshot()
+    with pytest.raises(AudioOverflow):
+        PcmWindow().seal(generation=-1)                         # another utterance than the one held
+
+
+def test_partials_stop_when_the_window_moves_on_to_another_utterance():
+    fake, window = _FakeWhisper(), PcmWindow()
+    fake.release.set()
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    window.reset()                                              # this transcriber's utterance is gone
+    _speech(window, 0.6)                                        # audio of the next one
+    tr.start()
+    time.sleep(0.15)
+    assert fake.calls == [] and tr.poll() is None               # never sent as this utterance's partial
+
+
+class _ClipsAtSnapshot(PcmWindow):
+    """Stops being whole between the partial loop's check and its snapshot (the race, made certain)."""
+
+    def snapshot(self):
+        raise AudioOverflow("clipped between the check and the snapshot")
+
+
+def test_a_window_clipped_between_check_and_snapshot_ends_the_partials_cleanly(monkeypatch):
+    crashed = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: crashed.append(args.exc_type))
+    fake, window = _FakeWhisper(), _ClipsAtSnapshot()
+    fake.release.set()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    tr._thread.join(1.0)
+    assert not tr._thread.is_alive() and crashed == [] and fake.calls == []

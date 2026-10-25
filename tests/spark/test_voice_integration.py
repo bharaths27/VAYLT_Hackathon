@@ -1,6 +1,7 @@
 """Voice presets reach the real Engine only as unapproved proposals or future tasks."""
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -288,3 +289,39 @@ def test_an_overflowed_utterance_can_never_reach_a_proposal(taught, spawn, clock
     done = voice.finish_live(2, 99, tr2)
     assert done["kind"] == "proposal" and done["status"] == "proposed" and done["reused_prediction"]
     assert taught.robot.calls == OBSERVED_ONLY
+
+
+class _BlockingFinalWhisper:
+    """Partials answer at once; the FINAL transcription blocks until the test releases it."""
+
+    def __init__(self, text="Open the claw"):
+        self.text, self.calls = text, []
+        self.final_started, self.release = threading.Event(), threading.Event()
+
+    def transcribe(self, wav, cancel=None):
+        if cancel is not None:
+            self.calls.append("partial")
+            return self.text
+        self.calls.append("final")
+        self.final_started.set()
+        assert self.release.wait(5), "the test never released the final"
+        return self.text
+
+
+@pytest.mark.parametrize("tail_s", [0.6, 0.05], ids=["tail overflows the window", "tail fits"])
+def test_audio_arriving_while_the_final_is_made_never_becomes_a_proposal(taught, spawn, clock, tail_s):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _BlockingFinalWhisper(), PcmWindow(max_seconds=1.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", voice.finish_live(1, 99, tr)))
+    t.start()
+    assert stt.final_started.wait(2)                            # "Open the claw" is being finalized...
+    with pytest.raises(AudioOverflow):
+        window.append(b"\x01\x00" * int(tail_s * SAMPLE_RATE))  # ...when "no, don't" arrives
+    stt.release.set()
+    t.join(5)
+    assert out["r"]["kind"] == "clarify"                        # not final: say it again
+    assert voice.gate.prepared() is None
+    assert nothing_happened(taught)
