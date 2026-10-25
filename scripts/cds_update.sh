@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Switch star-pi's checkout (~/engram_hub) to Carter's integrated build: github.com/mrrCarter/VAYLT_Hackathon, branch main.
 # Run ON the Pi:   bash ~/engram_hub/scripts/cds_update.sh
-# Nothing is lost: uncommitted work on the Pi is saved to a local branch AND a patch file in ~/cds-backup/ first.
+# First time (the old checkout does not have this file yet), fetch it and run that copy:
+#   cd ~/engram_hub && git fetch https://github.com/mrrCarter/VAYLT_Hackathon.git main && git show FETCH_HEAD:scripts/cds_update.sh > /tmp/cds_update.sh && bash /tmp/cds_update.sh
+# Nothing is lost: the commit the Pi was on is kept as branch pre-cds-<stamp>, and uncommitted work on the Pi is saved
+# to a branch pi-local-<stamp> AND a patch file in ~/cds-backup/<stamp>/ first.
 # Ignored files (.venv, console/.venv, console/models, console/certs, engram.db, ~/engram_robot) are never touched.
-# Undo: the last lines it prints say exactly how to go back to what was checked out before.
+# Undo: the last line it prints says exactly how to go back (also kept in ~/cds-backup/<stamp>/UNDO.txt).
 set -euo pipefail
 HUB=${ENGRAM_HUB:-$HOME/engram_hub}
 REPO_URL=https://github.com/mrrCarter/VAYLT_Hackathon.git
@@ -11,32 +14,40 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 BACKUP=$HOME/cds-backup/$STAMP
 cd "$HUB"
 
-before_branch=$(git rev-parse --abbrev-ref HEAD)
-before_commit=$(git rev-parse --short HEAD)
-echo "now: $HUB on $before_branch at $before_commit"
+echo "now: $HUB on $(git symbolic-ref -q --short HEAD || echo 'a detached HEAD') at $(git rev-parse --short HEAD)"
 
-# 1. keep anything changed on the Pi (tracked edits, new untracked files) before switching
+# 1. fetch Carter's main first: if the network fails here, nothing on the Pi has changed
+git remote add carter "$REPO_URL" 2>/dev/null || git remote set-url carter "$REPO_URL"
+git fetch carter main
+
+# 2. keep what was checked out, and anything changed on the Pi (tracked edits, new untracked files)
 mkdir -p "$BACKUP"
+git branch "pre-cds-$STAMP" HEAD   # the commit the Pi was on; checkout -B below may move a local main
+undo="git checkout pre-cds-$STAMP"
 git status --porcelain > "$BACKUP/status.txt"
 if [ -s "$BACKUP/status.txt" ]; then
   echo "local changes found; saving them (list: $BACKUP/status.txt)"
-  git diff HEAD > "$BACKUP/tracked-changes.patch" || true
-  git ls-files --others --exclude-standard -z | tar --null -czf "$BACKUP/untracked-files.tgz" -T -
+  git diff --binary HEAD > "$BACKUP/tracked-changes.patch" || true
+  saved="branch pi-local-$STAMP, $BACKUP/tracked-changes.patch"
+  if [ -n "$(git ls-files --others --exclude-standard)" ]; then   # only when there are untracked files to keep
+    git ls-files --others --exclude-standard -z | tar --null -czf "$BACKUP/untracked-files.tgz" -T -
+    saved="$saved, $BACKUP/untracked-files.tgz"
+  fi
   git stash push --include-untracked -m "cds-update $STAMP" >/dev/null
   git branch "pi-local-$STAMP" "stash@{0}"   # the stash commit, as a branch that cannot expire
-  echo "saved: branch pi-local-$STAMP, $BACKUP/tracked-changes.patch, $BACKUP/untracked-files.tgz"
+  undo="$undo && git stash apply --index pi-local-$STAMP"
+  echo "saved: $saved"
 else
   echo "no local changes"
 fi
+echo "cd $HUB && $undo" > "$BACKUP/UNDO.txt"
 
-# 2. fetch Carter's main and switch to it
-git remote get-url carter >/dev/null 2>&1 || git remote add carter "$REPO_URL"
-git fetch carter main
+# 3. switch to Carter's main
 git checkout -B main carter/main
 echo "switched to main at $(git rev-parse --short HEAD)"
 
-# 3. Python packages (needs internet; skipped with a warning when offline, the old ones usually still work)
-if curl -s -m 5 -o /dev/null https://pypi.org/simple/; then
+# 4. Python packages (needs internet; skipped with a warning when offline, the old ones usually still work)
+if curl -fsI -m 5 -o /dev/null https://pypi.org/simple/pip/; then   # headers only; the full index is 48 MB
   [ -x .venv/bin/pip ] && .venv/bin/pip install -q -r requirements.txt || echo "WARNING: brain packages not updated"
   [ -x console/.venv/bin/pip ] && console/.venv/bin/pip install -q -r console/requirements.txt || echo "WARNING: console packages not updated"
 else
@@ -44,5 +55,5 @@ else
 fi
 
 echo
-echo "done. next: bash $HUB/scripts/cds_up.sh"
-echo "to undo:  cd $HUB && git checkout $before_branch   (your saved changes: git stash list / branch pi-local-$STAMP if any)"
+echo "done. next: bash $HUB/scripts/cds_up.sh --restart   (--restart: services already running still run the old code)"
+echo "to undo:  cd $HUB && $undo"
