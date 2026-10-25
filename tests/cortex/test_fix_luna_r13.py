@@ -128,3 +128,22 @@ def test_guard_a_sweep_that_outlasts_the_shutdown_wait_leaves_the_store_open(are
     client.__exit__(None,None,None)
     assert after==['open'] and b.store.one('SELECT 1')                # it ran on an open store, and the app left that open
     b.close()
+
+
+# P2-4 (class B): an event with no operation is shown only through an explicit public allowlist (a STOP, a clock jump);
+# a system event an operator caused (clearing a stop, re-establishing the clock with a note) is that operator's alone.
+def test_a_system_event_an_operator_caused_is_theirs_and_only_public_kinds_are_shared(arena,clock):
+    s=Store(clock=clock,policy=Policy(clock_trusted=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    with TestClient(create_app(b,tokens={TA:'alice',TB:'bob'},start_idle=False)) as c:
+        assert c.post('/stop',headers=h(TA)).status_code==200
+        assert c.post('/robot/clear_stop',headers=h(TA)).status_code==200
+        assert c.post('/clock/reestablish',json={'reason':'zqxnote the lab clock was set by hand'},headers=h(TA)).status_code==200
+        with s.tx(): s.conn.execute("INSERT INTO operation_event(operation_id,episode_id,op,args_json,status,detail,at) "
+                                    "VALUES('system:0',NULL,'clock_reestablished','{}','confirmed','zqxlegacy note',0)")   # an older version's row
+        seen=lambda token:[(e['op'],e['detail']) for e in c.get('/events',headers=h(token)).json()]
+        alice,bob=seen(TA),seen(TB)
+    assert ('stop','') in bob and ('stop','') in alice                                       # public: the STOP
+    assert not [e for e in bob if e[0] in ('clear_stop','clock_reestablished')],bob         # was: who cleared it, her clock note
+    assert ('clear_stop','alice') in alice and any('zqxnote' in d for _,d in alice)
+    assert not any('zqxlegacy' in d for _,d in alice+bob)                                    # unowned and not allowlisted: nobody's
+    b.close()

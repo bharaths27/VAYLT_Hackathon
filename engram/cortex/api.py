@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse,FileResponse,Response,StreamingRespon
 from pydantic import BaseModel,ConfigDict,Field
 from .types import *
 from .store import Store
-from .runtime import Brain
+from .runtime import PUBLIC_EVENTS,Brain
 from .planning import CAPS,PHYSICAL,parse_goal,safety_reason
 from .models import IntentAdvisor,QwenClient
 from .simulation import FakeRobot
@@ -418,7 +418,10 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         return [{**x,'proposal':present(x['proposal'])} if 'proposal' in x else x for x in b.trigger(body.trigger,event_id=body.event_id,principal=principal)]
     @app.get('/events')
     def events(limit:int=100,principal=Depends(operator)):
-        return b.store.rows('SELECT o.* FROM operation_event o LEFT JOIN cx_episode e ON e.id=o.episode_id WHERE e.owner=? OR o.episode_id IS NULL ORDER BY o.seq DESC LIMIT ?',(principal,max(1,min(limit,200))))
+        # Their operations' events and the system events they caused; of the rest, only an allowlisted public kind.
+        return b.store.rows('SELECT o.* FROM operation_event o LEFT JOIN cx_episode e ON e.id=o.episode_id LEFT JOIN cx_event_owner w ON w.seq=o.seq '
+                            f"WHERE e.owner=? OR w.owner=? OR (o.episode_id IS NULL AND w.owner IS NULL AND o.op IN ({','.join('?'*len(PUBLIC_EVENTS))})) "
+                            'ORDER BY o.seq DESC LIMIT ?',(principal,principal,*PUBLIC_EVENTS,max(1,min(limit,200))))
     @app.post('/dream/compile')
     def dream(principal=Depends(operator)):return b.dreamer.cycle(force=True)
     @app.get('/dream/status')

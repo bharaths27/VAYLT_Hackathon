@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS cx_due(task_id TEXT PRIMARY KEY REFERENCES prospectiv
 CREATE TABLE IF NOT EXISTS cx_consolidated(episode_id TEXT PRIMARY KEY REFERENCES episode(id),outcome TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_event(id TEXT PRIMARY KEY,trigger TEXT NOT NULL,payload_hash TEXT NOT NULL,origin TEXT NOT NULL,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_wake(event_id TEXT NOT NULL REFERENCES cx_event(id),task_id TEXT NOT NULL REFERENCES prospective_task(id),generation INTEGER NOT NULL,status TEXT NOT NULL,proposal_id TEXT,error TEXT,PRIMARY KEY(event_id,task_id,generation));
+CREATE TABLE IF NOT EXISTS cx_event_owner(seq INTEGER PRIMARY KEY REFERENCES operation_event(seq),owner TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_decision(id TEXT PRIMARY KEY,stage TEXT NOT NULL,provider TEXT NOT NULL,model TEXT,accepted INTEGER NOT NULL,detail TEXT NOT NULL,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_practice(id TEXT PRIMARY KEY,case_json TEXT NOT NULL,expected_json TEXT NOT NULL,actual_json TEXT NOT NULL,status TEXT NOT NULL,verifier TEXT NOT NULL,mode TEXT NOT NULL DEFAULT 'SIMULATED',created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_dream(id TEXT PRIMARY KEY,started_at REAL NOT NULL,finished_at REAL,status TEXT NOT NULL,summary_json TEXT NOT NULL);

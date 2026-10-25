@@ -21,6 +21,9 @@ from . import vault_lock
 from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,digest,normalize,text,uid
 
 WHEN=re.compile(r'^\s*(?:when|once|after|as soon as)\s+(.+?),\s*(?:then\s+)?(.+)$',re.I)
+# The system events every operator sees (/events): they carry no operator's details. Any other event with no operation
+# is the operator's who caused it (journal(owner=...)), and one with neither (an older version's) is nobody's.
+PUBLIC_EVENTS=('stop','clock_jump')
 
 
 class Brain:
@@ -289,10 +292,11 @@ class Brain:
             for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('expired','invalidated')"):self.store.finish_task(r['id'],r['outcome'])
         return [self.operation(r['id']) for r in self.store.rows("SELECT id FROM episode WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode) ORDER BY started_at DESC")]
 
-    def journal(self,ep: str | None,op: str,args: dict,status: str,detail: str='',step: int=0):
+    def journal(self,ep: str | None,op: str,args: dict,status: str,detail: str='',step: int=0,*,owner: str | None=None):
         with self.store.tx():
-            self.store.conn.execute('INSERT INTO operation_event(operation_id,episode_id,op,args_json,status,detail,at) VALUES(?,?,?,?,?,?,?)',
-                (f'{ep or "system"}:{step}',ep,op,canonical(args),status,detail[:1000],self.store.clock()))
+            seq=self.store.conn.execute('INSERT INTO operation_event(operation_id,episode_id,op,args_json,status,detail,at) VALUES(?,?,?,?,?,?,?)',
+                (f'{ep or "system"}:{step}',ep,op,canonical(args),status,detail[:1000],self.store.clock())).lastrowid
+            if owner: self.store.conn.execute('INSERT INTO cx_event_owner VALUES(?,?)',(seq,owner))
 
     def approve(self,ep: str, supplied_digest: str,*,principal: str) -> dict:
         text(principal,'authenticated approver',100)
@@ -487,7 +491,7 @@ class Brain:
                 if self._stop_gen!=gen: raise Conflict('a stop arrived while the latch was being cleared; the robot stays stopped')
                 self._require_reconciled('rearming')
                 self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
-                self.journal(None,'clear_stop',{},'cleared',principal)
+                self.journal(None,'clear_stop',{},'cleared',principal,owner=principal)
         except BaseException:
             self._restop(); raise
         self._stopped.clear()
@@ -565,7 +569,7 @@ class Brain:
             last=self.store.one("SELECT value FROM meta WHERE key='cortex_last_utc'"); prior=float(last['value']) if last else None
             self.store.conn.execute("INSERT INTO meta VALUES('cortex_last_utc',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(now),))
             self.store.conn.execute("DELETE FROM meta WHERE key='cortex_clock_hold'")
-            self.journal(None,'clock_reestablished',{'previous_utc':prior,'utc':now},'confirmed',principal+': '+note)
+            self.journal(None,'clock_reestablished',{'previous_utc':prior,'utc':now},'confirmed',principal+': '+note,owner=principal)
         return {'utc':now,'previous_utc':prior,'reestablished_by':principal}
 
     def cancel_task(self,tid: str,*,principal: str) -> dict:
