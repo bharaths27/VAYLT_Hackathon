@@ -55,7 +55,8 @@ class Brain:
             for r in running:
                 self.store.settle(r['id'],'unknown',('running',),'Restart interrupted execution; no automatic replay')
                 self.journal(r['id'],'recovery',{},'unknown','requires operator reconciliation')
-            if running: self._stopped.set()
+            if running: self._latch('restart interrupted execution')
+            if self._latched(): self._stopped.set()
             self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<?)",(self.store.clock(),))
             self.store.conn.execute("UPDATE cx_wake SET status='pending' WHERE status='preparing'")
             # Existing task links remain durable; recovery never dispatches physical effects.
@@ -224,7 +225,8 @@ class Brain:
                     r=self.operation(ep); plan=r['plan']
                     if r['owner']!=principal: raise Denied('approver does not own this operation')
                     if r['status']!='proposed': raise Conflict('operation is not awaiting approval')
-                    if self._stopped.is_set() or self.robot.state().get('stopped'): raise Denied('stop is latched')
+                    if self._latched() or self.robot.state().get('stopped'): raise Denied('stop is latched')
+                    self._require_reconciled('new motion')
                     if self.store.clock()>=r['expires_at']: raise Stale('proposal expired')
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
                     if supplied_digest!=actual or supplied_digest!=r['digest']: raise Conflict('approval does not match this exact plan')
@@ -300,7 +302,9 @@ class Brain:
             self._stopped.set()
             try: self.robot.stop()
             except Exception: reason=(reason or '')+'; stop not confirmed'
-        self.store.settle(ep,outcome,('running',),reason)
+        with self.store.tx():
+            if outcome in {'unknown','aborted','failed'}: self._latch(f'{ep} ended {outcome}')
+            self.store.settle(ep,outcome,('running',),reason)
         return {**self.operation(ep),'steps':steps}
 
     def verify_outcome(self,ep: str,*,principal: str,ok: bool,note: str):
@@ -324,16 +328,35 @@ class Brain:
             self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
         except Exception: pass
         with self.store.tx():
+            self._latch('operator stop')
             for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
                 self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
             self.journal(None,'stop',{},'confirmed' if confirmed else 'requested')
         return {'stop_requested':True,'stop_confirmed':confirmed,'auto_resume':False}
 
     def clear_stop(self,*,principal: str):
-        text(principal,'operator',100)
-        if self.store.one("SELECT 1 FROM episode WHERE outcome IN ('running','unknown','needs_verification')"): raise Denied('reconcile running/unknown operations before rearming')
-        self.robot.reset_stop(); self._stopped.clear(); self.activity.touch()
+        principal=text(principal,'operator',100)
+        with self.store.tx():
+            self._require_reconciled('rearming')
+            self.robot.reset_stop()
+            self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
+            self.journal(None,'clear_stop',{},'cleared',principal)
+            self._stopped.clear()
+        self.activity.touch()
         return self.robot.state()
+
+    def _latch(self,reason: str):
+        # The stop latch is durable: a restart must not silently re-arm motion.
+        self._stopped.set()
+        with self.store.tx(): self.store.conn.execute("INSERT OR IGNORE INTO meta VALUES('cortex_stop',?)",(canonical({'at':self.store.clock(),'reason':reason}),))
+
+    def _latched(self) -> bool:
+        return self._stopped.is_set() or bool(self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"))
+
+    def _require_reconciled(self,action: str):
+        # Cortex operations only, as operation() and verify_outcome() can see them; ids let the operator reconcile each one.
+        ids=[r['id'] for r in self.store.rows("SELECT e.id FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('running','unknown','needs_verification') ORDER BY e.started_at,e.id")]
+        if ids: raise Denied(f'reconcile unresolved operations before {action}: '+', '.join(ids[:10])+(f' and {len(ids)-10} more' if len(ids)>10 else ''))
 
     def schedule(self,trigger: str,request: str,*,principal: str,expires_at: float | None=None) -> dict:
         trigger=text(trigger,'trigger',200); request=text(request,'future task',2000)
