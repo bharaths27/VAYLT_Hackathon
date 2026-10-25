@@ -9,7 +9,8 @@
 # Safe to run again: a healthy service is left alone; brain and console restart only when what they should drive
 # changes (mock <-> real, the model came or went) or the console certificate had to be renewed.
 # It never starts, stops or resets Brian's robot server, and it never moves the robot. On its ports it stops only
-# ENGRAM processes (serve_dual.py, run.sh, uvicorn, cortex or engram in the command line); it names anything else.
+# this hub's ENGRAM processes (one of our scripts in the command line, or started from or running in ~/engram_hub);
+# it names anything else and leaves it running.
 set -uo pipefail
 HUB=${ENGRAM_HUB:-$HOME/engram_hub}
 LOGS=$HOME/cds-logs
@@ -28,16 +29,22 @@ healthy() { case $(code "$1") in 2*) return 0 ;; *) return 1 ;; esac; }
 field() { curl -sk -m 3 "$1" 2>/dev/null | grep -o "\"$2\":[^,}]*" | head -1 | cut -d: -f2- | tr -d '"'; }   # one JSON value
 wait_for() { for _ in $(seq 1 "${2:-30}"); do healthy "$1" && return 0; sleep 2; done; return 1; }
 pids_on() { ss -ltnpH "sport = :$1" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u; }
+HUB_DIR=$(pwd -P)   # the hub's real path
+ours() { # pid: ENGRAM from this hub: its command line names one of our scripts or starts in the hub, or it runs in the hub
+  local a; a=$(ps -ww -o args= -p "$1" 2>/dev/null) || return 1
+  case $a in *scripts/serve_dual.py*|*console/scripts/run.sh*|*cortex_sidecar*|"$HUB"/*|"$HUB_DIR"/*) return 0 ;; esac
+  case $(readlink -f "/proc/$1/cwd" 2>/dev/null)/ in "$HUB_DIR"/*) return 0 ;; esac
+  return 1
+}
 free_ports() { # stop ENGRAM processes on these ports (TERM, then KILL after 5 s: a console streaming video to the
                # iPad ignores TERM); anything else is named and left alone. 0 when nothing else holds them.
   local port p a pids= rc=0
   for port in "$@"; do
     for p in $(pids_on "$port"); do
-      a=$(ps -ww -o args= -p "$p" 2>/dev/null) || continue   # already gone
-      case $a in
-        *serve_dual.py*|*run.sh*|*uvicorn*|*cortex*|*engram*) pids="$pids $p" ;;
-        *) echo "port $port is held by pid $p ($a), which these scripts did not start; stop it yourself if it is an old ENGRAM copy, then run again"; rc=1 ;;
-      esac
+      if ours "$p"; then pids="$pids $p"
+      elif a=$(ps -ww -o args= -p "$p" 2>/dev/null); then   # (gone already: nothing to say)
+        echo "port $port is held by pid $p ($a), which these scripts did not start; stop it yourself if it is an old ENGRAM copy, then run again"; rc=1
+      fi
     done
   done
   [ -n "$pids" ] || return $rc
