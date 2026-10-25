@@ -7,11 +7,11 @@ import hashlib
 import inspect
 import json
 import logging
-import queue
 import socket
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -111,17 +111,24 @@ class Ledger:
     """Append only JSONL. Evidence format from the team packet:
     ticket | commit | input fixture | procedure | observed result | limitation | next owner
 
-    Every write happens on the ledger's own thread, in order: append() serializes the record and queues it,
-    so a slow or stalled disk can never block the event loop (and with it a stop, or any other request).
+    Every write happens on the ledger's own thread, in order: append() serializes the record and adds it to a
+    backlog, so a slow or stalled disk can never block the event loop (and with it a stop, or any other request).
+    The backlog holds at most max_pending records, so a long stall under sustained traffic cannot exhaust memory
+    and take the console down with its software stop: when it is full, append() drops the oldest record that is
+    not being written and counts it in `dropped`, never blocking or raising. A stall that drops records logs once
+    as the drops start and once, with the count, when the writer has caught up.
     Reads (find) happen on a reader thread for the same reason, and also see records that are not on disk yet.
     A write that fails is logged; the caller is not told."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, max_pending: int = 1000) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._queue: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
-        self._unwritten: dict[str, str] = {}  # id -> line, until it is on disk
-        self._lock = threading.Lock()  # guards _unwritten only; never held during disk I/O
+        self.max_pending = max(2, max_pending)
+        self.dropped = 0  # records dropped because the backlog was full, since start
+        self._pending: OrderedDict[str, str] = OrderedDict()  # id -> line, oldest first, until it is on disk
+        self._writing: str | None = None  # the record in the writer's hands, which may yet land: never dropped
+        self._stall_drops = 0
+        self._cond = threading.Condition()  # guards the fields above; never held during disk I/O
         self._reader = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="ledger-reader")
         self.read_timeout_s = 2.0
         threading.Thread(target=self._writer, name="ledger-writer", daemon=True).start()
@@ -129,42 +136,62 @@ class Ledger:
     def append(self, event: str, **rec: Any) -> str:
         eid = "ev_" + uuid.uuid4().hex[:10]
         line = json.dumps({"id": eid, "kind": event, "ts": time.time(), **rec}, default=str) + "\n"
-        with self._lock:
-            self._unwritten[eid] = line
-        self._queue.put((eid, line))
+        with self._cond:
+            if len(self._pending) >= self.max_pending:
+                oldest = next((k for k in self._pending if k != self._writing), None)
+                if oldest is not None:
+                    del self._pending[oldest]
+                self.dropped += 1
+                self._stall_drops += 1
+                if self._stall_drops == 1:
+                    log.error("ledger backlog is full (%d records; is the disk stalled?): dropping the oldest records",
+                              self.max_pending)
+                if oldest is None:  # nothing else to drop: this record is the one that goes
+                    return eid
+            self._pending[eid] = line
+            self._cond.notify_all()
         return eid
 
     def _writer(self) -> None:
         while True:
-            eid, line = self._queue.get()
+            with self._cond:
+                while not self._pending:
+                    self._cond.wait()
+                eid, line = next(iter(self._pending.items()))
+                self._writing = eid
             try:
                 self._write(line)
             except Exception as e:  # noqa: BLE001
                 log.error("ledger write failed, record %s lost: %s: %s", eid, type(e).__name__, e)
-            with self._lock:
-                self._unwritten.pop(eid, None)
+            with self._cond:
+                self._pending.pop(eid, None)
+                self._writing = None
+                if self._stall_drops and not self._pending:  # caught up: the stall is over
+                    log.error("ledger dropped %d records during a stall", self._stall_drops)
+                    self._stall_drops = 0
+                self._cond.notify_all()
 
     def _write(self, line: str) -> None:
         with self.path.open("a") as f:
             f.write(line)
 
     def flush(self, timeout_s: float = 5.0) -> bool:
-        """Wait in the calling thread until every queued record is written (or has failed). For shutdown and tests."""
+        """Wait in the calling thread until every pending record is written (or has failed). For shutdown and tests."""
         deadline = time.monotonic() + timeout_s
-        while True:
-            with self._lock:
-                if not self._unwritten:
-                    return True
-            if time.monotonic() > deadline:
-                return False
-            time.sleep(0.01)
+        with self._cond:
+            while self._pending:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cond.wait(left)
+            return True
 
     async def find(self, eid: str) -> dict | None:
         """The first (oldest) record with this id or operation id. The file is read on the ledger's reader thread,
         so a slow or stalled disk can delay only this lookup, by at most read_timeout_s (after which only the
         records not on disk yet are searched), and never the event loop or a stop."""
-        with self._lock:  # snapshot first: a record written after this is then in the file
-            pending = list(self._unwritten.values())
+        with self._cond:  # snapshot first: a record written after this is then in the file
+            pending = list(self._pending.values())
         try:
             reading = asyncio.get_running_loop().run_in_executor(self._reader, self._scan, eid)
             j = await asyncio.wait_for(reading, self.read_timeout_s)

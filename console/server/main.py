@@ -85,7 +85,8 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "robot": config.ROBOT_URL, "memory": config.MEMORY_URL, "uptime_s": int(time.time() - STATUS["boot"])}
+    return {"ok": True, "robot": config.ROBOT_URL, "memory": config.MEMORY_URL, "uptime_s": int(time.time() - STATUS["boot"]),
+            "ledger_dropped": ledger.dropped}  # records dropped while the ledger's disk was stalled (Ledger)
 
 
 @app.get("/status")

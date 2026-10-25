@@ -8,6 +8,7 @@
 Expected kinds were written down before the fix; every table had failing rows on the old parser.
 """
 import asyncio
+import logging
 import threading
 import time
 
@@ -495,11 +496,13 @@ class StalledDisk:
     """A ledger file whose every open hangs, like a stalled SD card, until released. With reads_stall, looking
     the file up (exists()) hangs too, and `reading` is set once a read is stuck."""
 
-    def __init__(self, release: threading.Event, reads_stall: bool = False):
-        self.release, self.reads_stall, self.reading = release, reads_stall, threading.Event()
+    def __init__(self, release: threading.Event, reads_stall: bool = False, stall_s: float = 3.0):
+        self.release, self.reads_stall, self.stall_s = release, reads_stall, stall_s
+        self.reading, self.writing = threading.Event(), threading.Event()
 
-    def open(self, *args, **kwargs):
-        self.release.wait(3)
+    def open(self, *args, **kwargs):  # only writes open the file here: reads stop at exists()
+        self.writing.set()
+        self.release.wait(self.stall_s)
         raise OSError("the disk stalled")
 
     def exists(self):
@@ -507,6 +510,64 @@ class StalledDisk:
             self.reading.set()
             self.release.wait(5)
         return False
+
+
+def _backlog(ledger) -> dict:
+    """The ledger's records that are not on disk yet (the attribute was _unwritten before round 8)."""
+    return ledger._pending if hasattr(ledger, "_pending") else ledger._unwritten
+
+
+def test_a_long_ledger_stall_keeps_a_bounded_backlog_and_counts_the_drops(monkeypatch, caplog):
+    # Review round 8: during a disk stall the ledger kept every record in memory, so sustained traffic could
+    # exhaust memory and take the console down, software stop included. The backlog now has a cap: when it is
+    # full, the oldest record that is not being written is dropped and counted.
+    cap, burst = 50, 2000
+    release = threading.Event()
+    disk = StalledDisk(release, stall_s=60)
+    caplog.set_level(logging.WARNING, logger="console.core")
+    appended: list[str] = []
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        assert main.ledger.flush(10)
+        dropped0 = getattr(main.ledger, "dropped", 0)
+        real_append = main.ledger.append
+
+        def counting_append(event, **rec):
+            appended.append(real_append(event, **rec))
+            return appended[-1]
+
+        try:
+            with monkeypatch.context() as m:
+                m.setattr(main.ledger, "path", disk)
+                m.setattr(main.ledger, "max_pending", cap, raising=False)
+                m.setattr(main.ledger, "append", counting_append)
+                first = main.ledger.append("first")
+                assert disk.writing.wait(5), "the writer never reached the disk"  # it now hangs on `first`
+                slowest = 0.0
+                for _ in range(20):  # requests keep coming during the stall and are never held up
+                    t0 = time.monotonic()
+                    assert c.post("/commands", json={"text": "What do you see?", "source": "typed"}).status_code == 200
+                    slowest = max(slowest, time.monotonic() - t0)
+                for i in range(burst):
+                    main.ledger.append("probe", i=i)
+                newest = appended[-1]
+                t0 = time.monotonic()
+                stop = c.post("/stop")
+                stop_s = time.monotonic() - t0
+                backlog, n = dict(_backlog(main.ledger)), len(appended)
+                dropped = getattr(main.ledger, "dropped", 0) - dropped0
+                health = c.get("/health").json()
+        finally:
+            release.set()
+        assert main.ledger.flush(10)
+        c.post("/stop/clear")
+    assert len(backlog) == cap, len(backlog)  # bounded at the cap, however long the stall lasts
+    assert dropped == n - cap, (dropped, n)  # every record over the cap is counted
+    assert first in backlog and newest in backlog  # the oldest go first; the one being written stays
+    assert stop.status_code == 200 and stop_s < 1.0 and slowest < 1.0, (stop.status_code, stop_s, slowest)
+    assert health.get("ledger_dropped") == dropped0 + dropped, health
+    logs = [r.getMessage() for r in caplog.records if r.name == "console.core" and "dropp" in r.getMessage()]
+    assert len(logs) == 2 and f"dropped {dropped} " in logs[-1], logs  # once as drops start, once with the count
 
 
 def test_a_stalled_ledger_read_never_delays_a_stop(monkeypatch):
