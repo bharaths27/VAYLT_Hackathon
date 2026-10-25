@@ -15,7 +15,7 @@ from typing import Any
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
 from .planning import CAPS,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
-from .store import Store
+from .store import TASK_STATE,Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
 from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,digest,normalize,text,uid
@@ -68,11 +68,18 @@ class Brain:
                 self.journal(r['id'],'recovery',{},'unknown','requires operator reconciliation')
             if running: self._latch('restart interrupted execution')
             if self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): self._stopped.set()
-            self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<?)",(self.store.clock(),))
+            self._expire()
             self.store.conn.execute("UPDATE cx_wake SET status='pending' WHERE status='preparing'")
-            # Existing task links remain durable; recovery never dispatches physical effects.
-            for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('unknown','success','failed','aborted','cancelled','rejected')"):
+            # Existing task links remain durable; recovery never dispatches physical effects. Every settled outcome reaches
+            # its commitment, an expiry or invalidation an older version left unreconciled too.
+            for r in self.store.rows(f"SELECT id,outcome FROM episode WHERE outcome IN ({','.join('?'*len(TASK_STATE))})",tuple(TASK_STATE)):
                 self.store.finish_task(r['id'],r['outcome'])
+
+    def _expire(self):
+        """Proposals past their approval window expire, each one's commitment with it (Store.settle)."""
+        with self.store.tx():
+            for r in self.store.rows("SELECT e.id FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome='proposed' AND c.expires_at<=?",(self.store.clock(),)):
+                self.store.settle(r['id'],'expired',('proposed',),'approval window passed')
 
     def _advisor(self,stage,state,questions,allowed=False):
         answer=self.intent.evaluate(stage,state,questions,disclosure_allowed=bool(allowed and self.store.policy.cloud_enabled))
@@ -259,8 +266,7 @@ class Brain:
                 'skill_id':r['skill_id'],'derived_memory_id':m.get('derived_memory_id')}
 
     def pending(self):
-        with self.store.tx():
-            self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<=?)",(self.store.clock(),))
+        self._expire()
         with self.store.tx():
             for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('expired','invalidated')"):self.store.finish_task(r['id'],r['outcome'])
         return [self.operation(r['id']) for r in self.store.rows("SELECT id FROM episode WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode) ORDER BY started_at DESC")]

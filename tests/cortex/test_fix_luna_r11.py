@@ -174,3 +174,38 @@ def test_deleting_a_source_redacts_what_an_adapter_echoed(tmp_path,arena,clock,w
     ops=[r['op'] for r in s.rows('SELECT op FROM operation_event WHERE episode_id=?',(p['operation_id'],))]
     assert 'speak' in ops and b.operation(p['operation_id'])['status']==('success' if where=='detail' else 'unknown')   # audit kept
     b.close()
+
+
+# P3-6: a restart after a woken proposal expired settles its commitment at once, not only once pending() runs.
+def test_a_restart_after_a_proposal_expired_settles_its_commitment(tmp_path,arena,clock):
+    def open_brain(): s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);return Brain(s,FakeRobot(arena))
+    b=open_brain();t=b.schedule('the tray arrives','bring Sample A to the bench',principal='alice')['task_id']
+    p=b.trigger('the tray arrives',event_id='ev1',principal='alice')[0]['proposal'];assert p['status']=='proposed'
+    ttl=b.store.policy.approval_ttl_s;b.close();clock.advance(ttl+1)
+    b=open_brain()
+    assert b.operation(p['operation_id'])['status']=='expired'
+    assert b.store.one('SELECT status FROM prospective_task WHERE id=?',(t,))['status']=='expired'      # was: still fired
+    shown=b.store.recall('what is pending',['prospective'],principal='alice')['memories']['prospective']
+    assert [x['status'] for x in shown]==['expired'],shown                                   # was: shown as fired, open
+    b.close()
+
+def test_a_restart_reconciles_an_expiry_an_older_version_left_unreconciled(tmp_path,arena,clock):
+    def open_brain(): s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);return Brain(s,FakeRobot(arena))
+    b=open_brain();t=b.schedule('the tray arrives','bring Sample A to the bench',principal='alice')['task_id']
+    p=b.trigger('the tray arrives',event_id='ev1',principal='alice')[0]['proposal']
+    with b.store.tx(): b.store.conn.execute("UPDATE episode SET outcome='expired' WHERE id=?",(p['operation_id'],))   # as it did
+    b.close();b=open_brain()
+    assert b.store.one('SELECT status FROM prospective_task WHERE id=?',(t,))['status']=='expired'      # was: still fired
+    b.close()
+
+def test_guard_an_expiry_settles_its_commitment_in_the_same_transaction(brain,clock):
+    t=brain.schedule('the tray arrives','bring Sample A to the bench',principal='alice')['task_id']
+    p=brain.trigger('the tray arrives',event_id='ev1',principal='alice')[0]['proposal'];clock.advance(brain.store.policy.approval_ttl_s)
+    brain._expire()
+    assert brain.operation(p['operation_id'])['status']=='expired'
+    assert brain.store.one('SELECT status FROM prospective_task WHERE id=?',(t,))['status']=='expired'
+
+def test_guard_an_expiry_at_the_window_edge_is_the_same_for_recovery_and_approval(brain,clock):
+    p=brain.command('Go to the shelf b',principal='carther');clock.advance(brain.store.policy.approval_ttl_s)
+    with pytest.raises(Stale): approve(brain,p)                                              # at the edge: expired for approval
+    brain.recover();assert brain.operation(p['operation_id'])['status']=='expired'          # and for recovery
