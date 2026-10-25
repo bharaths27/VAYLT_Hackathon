@@ -68,8 +68,10 @@ def test_control_the_structured_sentence_alone_is_resolved(store):
 
 # P2-4: conditionals are detected whatever `rules` says, and scoped to stations as well as objects.
 @pytest.mark.parametrize('rules',[None,[]])
-def test_a_station_conditional_requires_clarification_before_planning_there(brain,rules):
-    brain.store.teach('Shelf note','Shelf B is not to be used unless a supervisor approves.',owner='carther',rules=rules)
+@pytest.mark.parametrize('body',['Shelf B is not to be used unless a supervisor approves.',
+                                 'Shelf B can be used provided that a supervisor approves.'])   # no safety wording: only the conditional
+def test_a_station_conditional_requires_clarification_before_planning_there(brain,rules,body):
+    brain.store.teach('Shelf note',body,owner='carther',rules=rules)
     with pytest.raises(Missing,match='structured review'): brain.command('Go to the shelf b',principal='carther')
     assert brain.command('Go to the bench',principal='carther')['status']=='proposed'
 
