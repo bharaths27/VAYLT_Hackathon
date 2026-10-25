@@ -21,6 +21,9 @@ def _counts(engine):
     "Where is the beaker",
     "Is the beaker on the bench",
     "which bench is the beaker on",
+    "Do you know where the beaker is",
+    "Have you seen the beaker on the bench",
+    "do we have the beaker on the bench",
 ])
 def test_a_question_is_answered_never_planned_scheduled_or_moved(engine, text):
     before = _counts(engine)
@@ -54,6 +57,10 @@ def test_a_future_instruction_is_still_scheduled(engine):
     ("When the timer ends, open the gripper.", False),
     ("Do not move Sample B.", False),
     ("Bring the beaker to the bench.", False),
+    ("Do you know where the beaker is", True),
+    ("Have you seen the beaker", True),
+    ("Have the robot bring the beaker to the bench.", False),
+    ("Do the pick again.", False),
 ])
 def test_asks_question(text, expected):
     assert asks_question(text) is expected

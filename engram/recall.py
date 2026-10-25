@@ -61,9 +61,11 @@ def is_memory_question(text: str) -> bool:
 
 
 # A question opener. "When" is left out (it begins real future instructions: "When the centrifuge
-# stops, carry the beaker"), and so are "do"/"have" (they begin commands: "Do not ...", "Have it ...").
-_ASKING_START = re.compile(r"^\s*(what|where|which|who|whom|whose|why|how|is|are|am|was|were|did|does|"
-                           r"can|could|should|would|will|shall|may|might|must)\b", re.IGNORECASE)
+# stops, carry the beaker"). "Do"/"have" also begin commands ("Do not ...", "Have the robot ..."), so they
+# count only when a person or "it" follows: "Do you know where the beaker is", "Have you seen it".
+_ASKING_START = re.compile(r"^\s*((what|where|which|who|whom|whose|why|how|is|are|am|was|were|did|does|"
+                           r"can|could|should|would|will|shall|may|might|must)\b"
+                           r"|(do|have|has|had)\s+(you|we|i|they|he|she|it)\b)", re.IGNORECASE)
 
 
 def asks_question(text: str) -> bool:
