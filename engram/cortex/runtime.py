@@ -34,6 +34,7 @@ class Brain:
         self.compiler=Compiler(store); self.skills=Skills(store); self.activity=Activity()
         self.dreamer=Dreamer(store,self.skills,self.activity,qwen,self.intent)
         self._recoverable_preparing=set(); self._effect_lock=threading.Lock(); self._stopped=threading.Event(); self._stop_gen=0; self._file_lock=None
+        self._stop_requests=0    # operator STOPs so far: each revokes every proposal whose request began before it
         self.mode='SIMULATED' if robot.state().get('adapter')=='mock' else 'PHYSICAL'
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
@@ -79,6 +80,7 @@ class Brain:
         return answer
 
     def command(self,request: str,*,principal: str,idempotency_key: str | None=None,cloud_allowed: bool=False) -> dict:
+        stops=self._stop_requests     # when this request began: a STOP after it revokes what it proposes
         request=text(request,'request',2000); principal=text(principal,'principal',100)
         with self.activity.foreground():
             low=normalize(request)
@@ -108,10 +110,12 @@ class Brain:
             except CortexError as e: return {'kind':'proposal','status':'refused','reason':str(e),'code':e.code}
             alias_source=self.store.one("SELECT g.source_id FROM cx_goal g JOIN cx_source s ON s.source_id=g.source_id WHERE g.name=? AND s.status='accepted'",(normalize(request),))
             alias_refs=['source:'+alias_source['source_id']] if alias_source else []
-            return {'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,cloud_allowed=cloud_allowed)}
+            return {'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,
+                                                     cloud_allowed=cloud_allowed,stops=stops)}
 
     def propose(self,goal: Goal,request: str,*,principal: str,idempotency_key: str | None=None,
-                extra_refs: list[str] | None=None,cloud_allowed: bool=False,wake: tuple | None=None) -> dict:
+                extra_refs: list[str] | None=None,cloud_allowed: bool=False,wake: tuple | None=None,stops: int | None=None) -> dict:
+        stops=self._stop_requests if stops is None else stops
         goal=Goal.from_dict(goal.to_dict()); principal=text(principal,'principal',100)
         if safety_reason(request): raise Denied(safety_reason(request))
         request=text(request,'request',2000)
@@ -194,17 +198,26 @@ class Brain:
                     tested=candidate['validation'] if candidate['status']=='APPROVED' else self.skills.test(candidate['id'],fixture)
                     if tested['ok'] and candidate['status']!='APPROVED' and self.store.policy.auto_publish_verified:
                         self.skills.approve(candidate['id'],candidate['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
-                if self.store.basis(goal)!=basis: raise Stale('memory changed during planning')
                 plan['refs']=sorted(set(plan['refs']+refs))
-                checked=verify(goal,plan['steps'],fixture,self.store.related_rules(goal),self.store.policy,
-                               expected_basis=plan['basis'],actual_basis=self.store.basis(goal))
-                if not checked.ok or not self.store.refs_valid(plan['refs']): raise Stale('plan no longer satisfies current evidence')
                 plan_digest=digest({k:v for k,v in plan.items() if k!='verification'})
-                meta={'digest':plan_digest,'check':checked.to_dict(),'bundle':bundle,'source':source,'note':note,
-                      'derived_memory_id':derived_id,'targets':list(goal.targets),'zone':goal.zone,'mode':self.mode,'composition_calls':0 if skill else 1}
                 with self.store.tx():
-                    self.store.conn.execute("UPDATE episode SET outcome='proposed',plan_json=?,evidence_json=?,planner_calls=?,skill_id=? WHERE id=? AND outcome='preparing'",
-                        (canonical(plan),canonical(meta),calls,skill['id'] if skill else None,ep))
+                    # A STOP since the request began revokes it, as it revokes every pending proposal: one that came
+                    # before this episode existed is caught here, one after this check finds it proposed.
+                    if self._stop_requests!=stops:
+                        self.store.settle(ep,'cancelled',('preparing',),'stop revoked pending proposal')
+                    else:
+                        # The final checks run in the publishing transaction: a revocation lands before them (refused) or
+                        # after it (its invalidation finds the proposal), never in between.
+                        if self.store.basis(goal)!=basis: raise Stale('memory changed during planning')
+                        checked=verify(goal,plan['steps'],fixture,self.store.related_rules(goal),self.store.policy,
+                                       expected_basis=plan['basis'],actual_basis=self.store.basis(goal))
+                        if not checked.ok or not self.store.refs_valid(plan['refs']): raise Stale('plan no longer satisfies current evidence')
+                        changed=self._provenance_changed({'derived_memory_id':derived_id,'skill_id':skill['id'] if skill else None},plan)
+                        if changed: raise Stale(changed+' during planning')
+                        meta={'digest':plan_digest,'check':checked.to_dict(),'bundle':bundle,'source':source,'note':note,
+                              'derived_memory_id':derived_id,'targets':list(goal.targets),'zone':goal.zone,'mode':self.mode,'composition_calls':0 if skill else 1}
+                        self.store.conn.execute("UPDATE episode SET outcome='proposed',plan_json=?,evidence_json=?,planner_calls=?,skill_id=? WHERE id=? AND outcome='preparing'",
+                            (canonical(plan),canonical(meta),calls,skill['id'] if skill else None,ep))
                     # A woken proposal becomes approvable only already linked to its commitment.
                     if wake: self._link(ep,wake)
                 return self.operation(ep)
@@ -404,7 +417,7 @@ class Brain:
         # The in-memory latch is set before it, so nothing new is dispatched; the durable latch follows, even when the
         # robot call itself failed or ended the process's call (re-raised once the latch is stored). If storing fails,
         # the robot stays stopped, the in-memory latch stays set, and the storage error reaches the caller.
-        self._stop_gen+=1; self._stopped.set(); sent=False; crash=None
+        self._stop_gen+=1; self._stop_requests+=1; self._stopped.set(); sent=False; crash=None
         try: self.robot.stop(); sent=True
         except Exception: pass
         except BaseException as e: crash=e

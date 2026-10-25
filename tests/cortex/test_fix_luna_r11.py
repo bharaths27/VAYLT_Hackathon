@@ -93,3 +93,40 @@ def test_guard_a_revocation_inside_an_open_transaction_is_refused_never_deadlock
     with store.tx():
         with pytest.raises(RuntimeError,match='lock order'): store.revoke_source(src)
     assert store.source_state(src)['status']=='accepted'
+
+
+# P2-3 (class A): a STOP revokes a proposal whose request began before it, even one with no episode yet when the STOP's
+# scan ran; and a proposal is published only under the checks it passed, run in the publishing transaction.
+def test_a_stop_before_the_command_created_its_episode_revokes_its_proposal(brain):
+    entered,go=threading.Event(),threading.Event();route=brain.intent.route;out={}
+    def paused(*a,**k): entered.set();go.wait(5);return route(*a,**k)
+    brain.intent.route=paused                                                                # in flight, before its episode
+    t=threading.Thread(target=lambda:out.update(p=brain.command('Go to the shelf b',principal='carther')),daemon=True);t.start()
+    try:
+        assert entered.wait(5) and not brain.store.one('SELECT 1 FROM episode')
+        brain.stop()
+    finally: go.set();t.join(10)
+    p=out['p'];assert p['status']=='cancelled' and p['failure']=='stop revoked pending proposal',p   # was: proposed
+    brain.clear_stop(principal='carther')
+    with pytest.raises(Conflict): approve(brain,p)                                           # was: approved after the clear
+    assert not [c for c in brain.robot.calls if c[0]=='go_to_zone']
+    assert brain.command('Go to the shelf b',principal='carther')['status']=='proposed'     # control: begun after the clear
+
+def test_a_procedure_revoked_while_its_proposal_was_planned_is_not_published(published,monkeypatch):
+    first=published.command('Go to the shelf b',principal='carther');published.reject(first['operation_id'],principal='carther')
+    sid=published.skills.find(Goal('goto',zone='shelf_b'),'carther')['id']
+    import engram.cortex.runtime as runtime
+    real=runtime.verify;calls=[]
+    def revoking(*a,**k):
+        calls.append(1)
+        if len(calls)==1: published.skills.revoke(sid)                                       # lands while it is planned
+        return real(*a,**k)
+    monkeypatch.setattr(runtime,'verify',revoking)
+    with pytest.raises(Stale,match='revoked'): published.command('Go to the shelf b',principal='carther')   # was: proposed
+    assert not published.pending()
+
+@pytest.fixture
+def published(arena,clock):
+    s=Store(clock=clock,policy=Policy(auto_publish_verified=True));s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    yield b
+    b.close()
