@@ -113,7 +113,7 @@ def test_a_stop_word_is_unchanged(lab):
     r = lab.command("Stop.", "test")
     lab.robot.release.set()
     t.join(10)
-    assert r["kind"] == "stopped" and r["stopped"] is True and "needs_clarification" not in r
+    assert r["kind"] == "stopped" and r["stopped"] is True and r["needs_clarification"] is False
     assert outcome(lab, oid) == "aborted"
 
 
@@ -316,8 +316,7 @@ def test_a_robot_stopped_on_its_own_ends_the_run_as_stopped(arena, when):
 def test_every_command_result_states_its_classification(lab, text, kind, cls):
     r = lab.command(text, "test")
     assert (r["kind"], r["classification"]) == (kind, cls), r
-    if kind == "proposal":
-        assert r["needs_clarification"] is (cls != "understood")
+    assert r["needs_clarification"] is (cls != "understood")   # stated both ways, whatever the kind
 
 
 # ---- a planner states how it took every request; the engine fails closed on anything but "understood" ---------
