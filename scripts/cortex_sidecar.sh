@@ -39,6 +39,12 @@ running() {
     ps -p "$pid" -o args= 2>/dev/null | grep -q 'engram.cortex.api:create_app'
 }
 
+# Canonical path (symlinks and .. resolved, also for a path that does not exist yet; '/' separators) and file
+# identity (device + inode, so a hard link counts), both by the Python that runs Cortex: portable beyond GNU
+# realpath/stat. same_file answers with a word, so a failed check can never read as "different".
+canon() { "$(python_bin)" -c 'import os,sys;print(os.path.realpath(sys.argv[1]).replace(os.sep,"/"))' "$1"; }
+same_file() { "$(python_bin)" -c 'import os,sys;a,b=sys.argv[1:];print("same" if os.path.exists(a) and os.path.exists(b) and os.path.samefile(a,b) else "different")' "$1" "$2"; }
+
 url() { case $HOST in *:*) echo "http://[$HOST]:$PORT" ;; *) echo "http://$HOST:$PORT" ;; esac; }
 
 health() {
@@ -59,10 +65,18 @@ refuse_unsafe_config() {
     [ "${CORTEX_CLOUD:-0}" = 0 ] || die "refusing CORTEX_CLOUD=${CORTEX_CLOUD}: the sidecar is local-only"
     [ "${CORTEX_QWEN:-0}" = 0 ] || die "refusing CORTEX_QWEN=${CORTEX_QWEN}: the sidecar does not call Qwen"
     [ -z "${CORTEX_CAMERA_URL:-}" ] || die "refusing CORTEX_CAMERA_URL: the sidecar runs without a camera"
-    [ "$(basename -- "$DB")" != engram.db ] || die "refusing CORTEX_DB=$DB: Cortex never opens the old brain's database"
-    case $STATE/ in
-        "$REPO"/*) die "refusing CORTEX_STATE_DIR=$STATE: the token must live outside the repository" ;;
+    db=$(canon "$DB") && repo=$(canon "$REPO") && state=$(canon "$STATE") || die "cannot resolve the configured paths with $(python_bin)"
+    for name in "$DB" "$db"; do
+        [ "$(basename -- "$name")" != engram.db ] || die "refusing CORTEX_DB=$DB (resolves to $db): Cortex never opens the old brain's database"
+    done
+    for brain in "$REPO/engram.db" "${ENGRAM_DB:-}"; do
+        [ -z "$brain" ] || [ "$(same_file "$DB" "$brain")" = different ] || die "refusing CORTEX_DB=$DB: it is the same file as the old brain's database $brain"
+    done
+    case $state/ in
+        "$repo"/*) die "refusing CORTEX_STATE_DIR=$STATE (resolves to $state): the token must live outside the repository" ;;
     esac
+    # From here on only canonical paths: start() changes directory, so a relative path would move.
+    STATE=$state; DB=$db; TOKEN_FILE=$STATE/token; PID_FILE=$STATE/cortex.pid; LOG=$STATE/cortex.log
     [ -f "$ARENA" ] || die "lab arena not found at $ARENA"
 }
 

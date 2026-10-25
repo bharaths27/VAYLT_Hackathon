@@ -118,7 +118,7 @@ The existing brain (`engram/api.py` on port 8001, `engram.db`) stays the ONLY ex
 | | Sidecar |
 |---|---|
 | Start | `sh scripts/cortex_sidecar.sh start` in the repo checkout on star-pi; also `status`, `stop` |
-| Database | its own, `~/.cortex-sidecar/cortex.db`; a file named `engram.db` is refused |
+| Database | its own, `~/.cortex-sidecar/cortex.db`; a path named, resolving to, or hard-linked to the brain's `engram.db` is refused; the state dir is resolved before the outside-the-repository check |
 | Arena | the real lab arena, `fixtures/lab/arena.json` |
 | Mode | `CORTEX_LIVE=0 CORTEX_CLOUD=0 CORTEX_QWEN=0 CORTEX_IDLE=1`: the fake adapter, every run labeled SIMULATED, no model calls |
 | Network | loopback only: `127.0.0.1:8010` by default (`::1` also allowed); any other bind address is refused |
