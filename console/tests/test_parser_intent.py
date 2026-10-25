@@ -114,6 +114,8 @@ LEFTOVER = [
     "Drive forward 10 cm following calibration.", "Turn left following calibration.",
     "Find the vial following calibration.", "Bring the red cup to zone B following calibration.",
     "Prep the bench for calibration following the meeting.", "Juggle following calibration.",
+    # No grammar and no rule trigger here, so only the deferral words keep these from the model fallback.
+    "Juggle following the meeting.", "Dance pending approval.", "Wave provided it is safe.",
     # words no list knows
     "Open the claw subsequent to calibration.", "Open the claw contingent on calibration.", "Open the claw halfway.",
     "Close the gripper gently.", "Turn left 90 degrees twice.", "Drive forward 10 cm three times.",
