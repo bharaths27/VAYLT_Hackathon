@@ -29,13 +29,21 @@ STOP = [
     # Deliberate false positives (see STOP_WORDS in parser.py): a needless stop costs one Clear Stop,
     # a missed stop can hurt someone.
     "Don't stop the timer.", "Stop sign.", "Remember to stop at zone A.",
+    # "Wait", "Pause", "Hold on", "Hold it" and "Hang on" stop too (they used to refuse, and the robot kept going).
+    "Wait!", "Wait.", "Wait, don't open the claw.", "Wait, open the claw.", "Pause.", "Pause!", "Hold on.",
+    "Hold on, open the claw.", "Hold it!", "Hang on.", "Freeze!", "Open the claw. Wait!",
+    "Remember to wait for the student.",  # deliberate: a rule with a stop word is taught through /rules
 ]
+
+# Phrases, not words: holding something is not a stop.
+NOT_STOP = ["Hold the vial.", "Hold the claw closed.", "Is the gripper holding the vial?",
+            "Put the vial in the waiting area."]
 
 NEGATED = [
     "Don't open the claw", "Don't open the claw.", "Do not open the claw.", "Never open the claw.",
     f"Don{CURLY}t open the claw.", "dont open the claw", "You shouldn't open the claw.",
     "Not now, open the claw.", "No, open the claw.", "No, don't close the gripper.",
-    "Cancel, open the claw.", "Cancel that.", "Wait, don't open the claw.", "Wait, open the claw.",
+    "Cancel, open the claw.", "Cancel that.",
     "Never mind, close the claw.", "Do not bring the red cup to zone B.", "Don't drive forward 10 cm.",
     "Don't turn left.", "In 5 seconds, don't open the claw.",
 ]
@@ -163,6 +171,11 @@ STILL_WORKS = [
 def test_spoken_stop_always_wins(text):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == ("stop", None), (text, r.kind, r.trace)
+
+
+@pytest.mark.parametrize("text", NOT_STOP)
+def test_holding_something_is_not_a_stop(text):
+    assert parse(text, BUNDLE).kind != "stop", text
 
 
 @pytest.mark.parametrize("text", NEGATED)

@@ -13,7 +13,14 @@ STOP = [
     "Stop. Bring Sample B to the bench.", "Stop opening the gripper.",
     # Deliberate: a needless stop costs one clear_stop, a missed stop can hurt someone.
     "Don't stop the timer.", "When the timer ends, stop.", "Remember to stop at the bench.",
+    # "Wait", "Pause", "Hold on", "Hold it" and "Hang on" stop too, by the same rule.
+    "Wait!", "Wait, don't open the gripper.", "Pause.", "Hold on.", "Hold  on, bring Sample B to the bench.",
+    "Hold it!", "Hang on.", "Freeze!",
+    "Remember to wait for the student.",  # deliberate: teach it with POST /memory/sources instead
 ]
+
+# Phrases, not words: holding something is not a stop.
+NOT_STOP = ["Hold the beaker", "Is the gripper holding Sample B?"]
 
 
 def episodes(engine):
@@ -28,6 +35,20 @@ def test_spoken_stop_stops_the_robot(taught, text):
     assert taught.robot.state()["stopped"]
     assert episodes(taught) == before
     assert taught.prospective.list() == []
+
+
+@pytest.mark.parametrize("text", NOT_STOP)
+def test_holding_something_is_not_a_stop(taught, text):
+    assert taught.command(text, "test")["kind"] != "stopped"
+    assert not taught.robot.state()["stopped"]
+
+
+def test_stop_words_are_the_same_on_the_console():
+    # One word list, two places: the console parser and this engine must stop on exactly the same words.
+    from console.server.parser import STOP_WORDS as console_stop_words
+    from engram.engine import STOP_WORDS
+
+    assert STOP_WORDS.pattern == console_stop_words.pattern
 
 
 def test_spoken_stop_blocks_a_pending_plan(taught):

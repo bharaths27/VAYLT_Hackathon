@@ -33,16 +33,19 @@ UNSAFE = [
 PRONOUNS = r"\b(it|that|this|them|those|the thing|the stuff|something)\b"
 
 # STOP always wins: a stop word ANYWHERE in the utterance stops the robot, whatever the case, punctuation or
-# company ("Stop.", "STOP!", "stop, stop", "Please stop.", "Stop. Open the claw."). whisper.cpp writes
-# "Stop." and the old exact match missed it. This deliberately also stops on "don't stop the timer",
-# "stop sign" or "remember to stop at zone A": on a robot a needless stop costs one Clear Stop, a missed
-# stop can hurt someone, so we err toward stopping. ("e-stop" is covered by "stop". Keep in step with
-# STOP_WORDS in engram/engine.py.)
-STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa)\b")
-# Negated or called-off commands ("don't open the claw", "no, ...", "cancel", "wait, don't"). Planning the
+# company ("Stop.", "STOP!", "stop, stop", "Please stop.", "Wait!", "Hold on.", "Stop. Open the claw.").
+# whisper.cpp writes "Stop." and the old exact match missed it. This deliberately also stops on "don't stop
+# the timer", "stop sign", "remember to stop at zone A" or "remember to wait for the student": on a robot a
+# needless stop costs one Clear Stop, a missed stop can hurt someone, so we err toward stopping. A rule with a
+# stop word in it must be taught through /rules. "hold on", "hold it" and "hang on" are phrases, so "hold the
+# vial" is not a stop. ("e-stop" is covered by "stop".) The same pattern as STOP_WORDS in engram/engine.py
+# (tests/test_spoken_stop.py checks that they are equal).
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b")
+# Negated or called-off commands ("don't open the claw", "no, ...", "cancel", "never mind"). Planning the
 # rest of the sentence would do the opposite of what was said, so these refuse. Checked after the rule
 # prefix, so "remember that the vial must never ..." is still taught as a rule (rules never move anything).
-NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never ?mind|wait|hold on)\b")
+# ("wait" and "hold on" are stop words now, checked before this.)
+NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never ?mind)\b")
 # Deferral backstop. A planned command runs NOW, so a command meant for later, on a condition, or chained to
 # another step must not plan. Fail-closed, in two parts (see _deferral):
 #  1. DEFERRAL, anywhere in the command: after(wards), when, once ..., until, before, during, while, if, then,

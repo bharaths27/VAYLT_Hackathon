@@ -29,11 +29,14 @@ from .skills import Skills
 from .teach import extract_rules
 
 APPROVAL_TTL_S = 120.0
-# A stop word anywhere in a command stops the robot ("Stop.", "STOP!", "Please stop.", "Stop. Bring ...").
-# whisper.cpp writes "Stop."; without this it reached the planner and was refused as an unknown object.
-# Deliberately broad ("don't stop the timer" stops too): a needless stop costs one clear_stop, a missed
-# stop can hurt someone. Same words as the console parser's STOP_WORDS.
-STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa)\b", re.IGNORECASE)
+# A stop word anywhere in a command stops the robot ("Stop.", "STOP!", "Please stop.", "Wait!", "Hold on.",
+# "Stop. Bring ..."). whisper.cpp writes "Stop."; without this it reached the planner and was refused as an
+# unknown object. Deliberately broad ("don't stop the timer" stops too, and so does "Remember to wait for the
+# student", which must be taught with POST /memory/sources instead): a needless stop costs one clear_stop, a
+# missed stop can hurt someone. "hold on", "hold it" and "hang on" are phrases, so "hold the beaker" is not a
+# stop. The same pattern as STOP_WORDS in console/server/parser.py (tests/test_spoken_stop.py checks it).
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b",
+                        re.IGNORECASE)
 
 
 class EngineError(Exception):
