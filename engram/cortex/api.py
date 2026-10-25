@@ -15,7 +15,7 @@ from pydantic import BaseModel,ConfigDict,Field
 from .types import *
 from .store import Store
 from .runtime import Brain
-from .planning import CAPS,PHYSICAL,parse_goal
+from .planning import CAPS,PHYSICAL,parse_goal,safety_reason
 from .models import IntentAdvisor,QwenClient
 from .simulation import FakeRobot
 from .media import FrameHub,LocalJPEG
@@ -295,10 +295,20 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.post('/goals/propose')
     def goal(body:GoalInput,principal=Depends(operator)):
         selected=Goal.from_dict(body.goal)
+        if safety_reason(body.request):raise Denied(safety_reason(body.request))
         try:parsed=parse_goal(body.request,b.store)
         except Missing:parsed=None
-        if parsed is not None and parsed!=selected:raise Conflict('typed goal conflicts with the supported request')
-        return present(b.propose(selected,body.request,principal=principal,idempotency_key=body.idempotency_key))
+        if parsed is not None:
+            if parsed!=selected:raise Conflict('typed goal conflicts with the supported request')
+            return present(b.propose(selected,body.request,principal=principal,idempotency_key=body.idempotency_key))
+        # Unparsed text is never shown as the goal: the card shows the typed goal; the text is an operator note.
+        r=b.propose(selected,describe(selected),principal=principal,idempotency_key=body.idempotency_key)
+        if not b.store.one("SELECT 1 FROM operation_event WHERE episode_id=? AND op='operator_note' AND detail=?",(r['operation_id'],body.request[:1000])):
+            b.journal(r['operation_id'],'operator_note',{},'noted',body.request)
+        return {**present(r),'operator_note':body.request}
+    def describe(g:Goal)->str:
+        names={o['id']:o['name'] for o in b.store.objects()};what=' and '.join(names.get(t,t) for t in g.targets)
+        return {'fetch':f'Bring {what} to {g.zone}','goto':f'Go to {g.zone}','inspect':f'Inspect {what}'}.get(g.kind) or f'{g.primitive} {canonical(g.args)}'
     def owned(eid,principal):
         o=b.operation(eid)
         if o['owner']!=principal:raise Denied('operation belongs to another operator')
