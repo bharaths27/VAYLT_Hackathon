@@ -16,6 +16,7 @@ from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
 from .planning import CAPS,PHYSICAL,RECALL,Compiler,parse_goal,safety_reason,validate_step,verify
 from .store import Store
+from .seeding import synthetic_seed_present
 from . import vault_lock
 from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,digest,normalize,text,uid
 
@@ -34,6 +35,8 @@ class Brain:
         store.runtime_mode=self.mode
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
+        if self.mode=='PHYSICAL' and synthetic_seed_present(store):
+            raise Denied('this vault contains synthetic seed data (scripts/cortex_seed.py); a physical runtime must start on a separate, unseeded vault (set CORTEX_DB to a new file)')
         if acquire_lock and store.path!=':memory:':
             self._file_lock=vault_lock.acquire(store.path)
         self.recover()

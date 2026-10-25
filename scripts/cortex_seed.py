@@ -1,4 +1,8 @@
-"""Load reviewed synthetic knowledge into an inactive MOCK review vault, never live."""
+"""Load reviewed synthetic knowledge into an inactive MOCK review vault, never live.
+
+Enforced, not just documented: seeded sources get kind 'synthetic:<kind>' and the seed record
+stays in meta, so a PHYSICAL Brain refuses to start on this vault (use a separate CORTEX_DB).
+"""
 import argparse,json,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT))
