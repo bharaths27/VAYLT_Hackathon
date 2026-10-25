@@ -296,6 +296,7 @@ class Engine:
     # ---- other actions ---------------------------------------------------
 
     def stop(self) -> dict[str, Any]:
+        self.executor.stop_requests += 1  # first: a step this stop interrupts must not read as failed on its own
         self.robot.stop()
         self.executor.journal(new_id("op"), None, "stop", {}, "done", "stop pressed")
         return self.robot.state()

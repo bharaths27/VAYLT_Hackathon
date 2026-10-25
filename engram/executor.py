@@ -32,6 +32,9 @@ class Executor:
         self.conn = conn
         self.robot = robot
         self.memory = memory
+        # Engine.stop() counts here (a stop word, the stop button, a command that needed clarifying), so a step
+        # that a stop interrupted is told apart from a step that failed, or whose outcome is unknown, on its own.
+        self.stop_requests = 0
 
     def journal(self, operation_id: str, episode_id: str | None, op: str, args: dict[str, Any],
                 status: str, detail: str = "") -> None:
@@ -50,6 +53,7 @@ class Executor:
                 self.journal(op_id, episode_id, op, args, "rejected", "robot is stopped")
                 result.outcome, result.failure, result.stopped = "aborted", "stop was pressed", True
                 break
+            stops = self.stop_requests
             self.journal(op_id, episode_id, op, args, "pending")
             out = self.robot.execute(op, args)
             for tag_id, zone in out.observations:
@@ -58,6 +62,9 @@ class Executor:
             result.steps.append({"op": op, "args": args, "status": out.status, "detail": out.detail})
             if out.status == "done":
                 continue
+            if self.stop_requests != stops:  # stopped while it ran (it came back aborted): the stop ended the run
+                result.outcome, result.failure, result.stopped = "aborted", "stop was pressed", True
+                break
             subject = args.get("object_id") or args.get("zone") or op
             if out.status == "unknown":
                 self.robot.stop()

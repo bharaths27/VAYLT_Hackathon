@@ -14,6 +14,7 @@ from conftest import REQUEST, ROOT
 from engram.api import create_app
 from engram.db import connect
 from engram.engine import Engine, clarify_reply
+from engram.robot.base import ActionResult
 from engram.robot.mock import MockRobot
 
 UNCLEAR = "Bring the thing over here"          # no object it knows: "I don't know which object you mean."
@@ -177,3 +178,55 @@ def test_a_run_that_finished_or_needs_a_person_is_not_stopped(engine):
     p = engine.command(REQUEST, "test")
     unknown = engine.approve_and_run(p["operation_id"], p["digest"], "tester")
     assert (unknown["outcome"], unknown["stopped"]) == ("aborted", False)   # a person must check: not a stop
+
+
+# ---- a stop that interrupts a step (the only one, or the last) ends the run as stopped -----------------------
+
+class StopsMidStep(MockRobot):
+    """The step `hold_on` waits until the test lets it finish; if the robot was stopped meanwhile it comes back the
+    way a real robot's does: ABORTED, which the robot adapters report as "unknown" (or "failed")."""
+
+    def __init__(self, arena, hold_on, status):
+        super().__init__(arena)
+        self.hold_on, self.status = hold_on, status
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def execute(self, op, args):
+        if op == self.hold_on and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(10), "the test never let the step finish"
+            if self.stopped:
+                return ActionResult(self.status, "ABORTED E_ESTOP: stopped during the motion")
+        return super().execute(op, args)
+
+
+def run_held(engine, proposal):
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("run", engine.approve_and_run(
+        proposal["operation_id"], proposal["digest"], "tester")))
+    t.start()
+    assert engine.robot.entered.wait(5) and engine.running()
+    return t, out
+
+
+def lessons(engine):
+    return engine.conn.execute("SELECT COUNT(*) FROM negative_memory").fetchone()[0]
+
+
+@pytest.mark.parametrize("status", ["unknown", "failed"])
+@pytest.mark.parametrize("which", ["the only step", "the final step"])
+def test_a_stop_during_a_step_ends_the_run_as_stopped(arena, which, status):
+    hold_on = "go_to_zone" if which == "the only step" else "speak"
+    eng = Engine(connect(":memory:"), StopsMidStep(arena, hold_on, status), set(arena["zones"]))
+    eng.load_arena(arena)
+    eng.overhead_scan()
+    eng.teach("SOP 004", (ROOT / "fixtures/lab/SOP_004.md").read_text())
+    p = eng.propose_rest("home") if which == "the only step" else eng.command(REQUEST, "test")
+    before = lessons(eng)
+    t, out = run_held(eng, p)
+    r = eng.command(UNCLEAR, "test")                         # Carter's rule stops it during that step
+    eng.robot.release.set()
+    t.join(10)
+    assert r["stopped"] is True
+    assert (out["run"]["outcome"], out["run"]["stopped"], out["run"]["failure"]) == ("aborted", True, "stop was pressed")
+    assert lessons(eng) == before                            # a stopped step is no lesson about the step
