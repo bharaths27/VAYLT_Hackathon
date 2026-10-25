@@ -43,20 +43,35 @@ STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa)\b")
 # rest of the sentence would do the opposite of what was said, so these refuse. Checked after the rule
 # prefix, so "remember that the vial must never ..." is still taught as a rule (rules never move anything).
 NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never ?mind|wait|hold on)\b")
-# A future condition or time: an event ("after calibration finishes", "when the vial arrives"), a delay
-# ("in 2 days", "in half an hour", "10 minutes from now", or "in 5 seconds" at the end), a clock time
-# ("at 5 pm", "at 17:30") or a day ("tomorrow", "next week", "on Friday"). Only a leading
-# "In N seconds/minutes, ..." can be scheduled here (PROSPECTIVE); anything else would run NOW, so it asks.
-_UNIT = r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|bit|moment|while)"
-_DAY = r"(?:mon|tues|wednes|thurs|fri|satur|sun)day"
-_PERIOD = rf"(?:morning|afternoon|evening|night|week|weekend|month|year|{_DAY})"
-_CLOCK = r"(?:\d{1,2}(?::\d{2})? ?(?:[ap]\.?m|o'?clock)|\d{1,2}:\d{2}|\w+ (?:[ap]\.?m|o'?clock)|noon|midnight)"
-FUTURE = re.compile(
-    r"\b(after|when|whenever|once(?=\s+\w)|as soon as|until|till"
-    rf"|in (?:\S+ ){{1,4}}?{_UNIT}|from now"
-    rf"|(?:at|by|around) {_CLOCK}"
-    rf"|(?:next|this|coming) {_PERIOD}|next time|{_DAY}|in the (?:morning|afternoon|evening|future)|at night"
-    r"|later|soon|eventually|sometime|someday|today|tonight|tomorrow|overnight)\b")
+# Deferral backstop. A planned command runs NOW, so a command meant for later, on a condition, or chained to
+# another step must not plan. Fail-closed, in two parts (see _deferral):
+#  1. DEFERRAL, anywhere in the command: after(wards), when, once ..., until, before, during, while, if, then,
+#     next, every, later, soon, shortly, eventually, tomorrow, ...; any time unit, singular or plural ("moments",
+#     "a sec", "2 hrs", "a couple of minutes", "several days"; "second", "minute" and "min" only after a number
+#     or quantity, so "the second vial" still parses); or a clock time ("5 pm", "17:30", "noon"). "then" and a
+#     bare "next" count: the console plans one action per command, so "close the claw, then open it" planned
+#     only the close.
+#  2. PLACE_OR_TIME: after in, at, on, by, within, past or around, the words that follow must be a place or
+#     target the grammar knows: a zone or tagged object from memory, "zone A", "tag 5", a scene word ("the bin",
+#     "in front", "in place") or a distance ("by 10 cm"). Anything else ("in a jiffy", "at 5", "on my signal",
+#     "at the end of calibration") asks. The "around" in "turn around" is the turn primitive, not a preposition.
+# Only the leading "In N seconds/minutes, ..." (PROSPECTIVE, checked first) can be scheduled here.
+_NUMWORD = r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|fifty|sixty|ninety"
+DEFERRAL = re.compile(
+    r"\b(after(?:wards?)?|thereafter|when|whenever|once(?=\s+\w)|as soon as|until|till|before|during|while|meanwhile"
+    r"|if|unless|upon|then|next(?!\s+to\b)|every|always|repeatedly|later|soon|shortly|presently|momentarily"
+    r"|eventually|sometime|someday|today|tonight|tomorrow|overnight|from now"
+    r"|moments?|secs?|seconds|mins|minutes|hrs?|hours?|days?|weeks?|weekends?|fortnights?|months?|years?"
+    r"|mornings?|afternoons?|evenings?|nights?|noon|midnight|(?:mon|tues|wednes|thurs|fri|satur|sun)days?"
+    rf"|(?:\d+(?:\.\d+)?\s*|(?:an?|{_NUMWORD}|few|couple(?: of)?|several|some|half|another|this|that|each|per)\s+)"
+    r"(?:second|minute|min)"
+    r"|\d{1,2}(?::\d{2})?\s*[ap]\.?m|[ap]\.m|pm|o'?clock|\d{1,2}:\d{2})\b")
+PLACE_OR_TIME = re.compile(r"\b(in|at|on|by|within|past|(?<!turn )around)\b\s*")
+_DETERMINERS = re.compile(r"(?:(?:the|a|an|this|that|these|those|my|your|our|its|his|her|their)\s+)*")
+_SCENE = (r"(?:bin|tray|table|bench|shelf|shelves|floor|ground|place|front|back|middle|cent(?:er|re)|corner|side"
+          r"|hand|gripper|claw|view|sight|frame|there|here|zone|area|spot|home|tag|marker|aruco)(?:e?s)?")
+_DISTANCE = (rf"(?:\d+(?:\.\d+)?|{_NUMWORD})\s*(?:cm|mm|m|in|inch(?:es)?|(?:centi|milli)?met(?:er|re)s?|ft|feet|foot"
+             r"|deg(?:rees?)?)")
 
 QUIPS = {
     "plan": ["Plan staged. Your signature, please.", "Drafted. Nothing moves until you say so.",
@@ -188,6 +203,26 @@ def is_stop(text: str) -> bool:
     return STOP_WORDS.search(_norm(text)) is not None
 
 
+def _deferral(t: str, bundle: dict) -> tuple[str, str] | None:
+    """(phrase, reason) for the first part of the normalized command that defers, conditions or chains it,
+    or None. See DEFERRAL and PLACE_OR_TIME. Names from memory only ever excuse a place after a preposition:
+    they are never removed before the DEFERRAL check, so a name cannot hide "tomorrow" or "after"."""
+    m = DEFERRAL.search(t)
+    if m:
+        return m.group(1), f"'{m.group(1)}' sounds like later, a condition or another step"
+    names = {_norm(str(n)).strip(" .") for item in bundle.get("zones", []) + bundle.get("bindings", [])
+             for n in [item.get("name", "")] + list(item.get("aliases", []))}
+    known = "".join("|" + re.escape(n) for n in sorted(names - {""}, key=len, reverse=True))
+    place = re.compile(rf"(?:{_SCENE}|{_DISTANCE}{known})\b")
+    for p in PLACE_OR_TIME.finditer(t):
+        rest = t[p.end():]
+        rest = rest[_DETERMINERS.match(rest).end():]
+        if rest[:1].isalnum() and not place.match(rest):  # nothing after it ("4 in.") is fine
+            phrase = " ".join([p.group(1)] + t[p.end():].split()[:2]).rstrip(".,:'-")
+            return phrase, f"I can't tell if '{phrase}' is a place or a time"
+    return None
+
+
 def parse(text: str, bundle: dict) -> ParseResult:
     """Never raises for a request the primitives cannot express: a plan that fails validation
     (for example a tag id outside the allowed range) comes back as a clarification."""
@@ -249,12 +284,13 @@ def _parse(text: str, bundle: dict) -> ParseResult:
         return ParseResult("prospective", text, plan=sub.plan, quip=quip("prospective"),
                            data={"delay_s": secs, "inner": inner}, trace=trace + [f"prospective in {secs:.0f}s"] + sub.trace)
 
-    # 3b. any other future condition must not run now (see FUTURE)
-    m = FUTURE.search(t)
-    if m:
-        return ParseResult("clarify", text, reason=f"That sounds like later ('{m.group(1)}'), so I won't do it now. "
-                           "I can only schedule a timed task: say 'In 5 minutes, ...'", quip=quip("clarify"),
-                           trace=trace + [f"future condition '{m.group(1)}'"])
+    # 3b. a command meant for later, on a condition, or chained to another step must not run now (see DEFERRAL)
+    d = _deferral(t, bundle)
+    if d:
+        phrase, why = d
+        return ParseResult("clarify", text, reason=f"{why}, so I won't do anything now. Say one thing to do now, "
+                           "or 'In 5 minutes, ...' to schedule it.", quip=quip("clarify"),
+                           trace=trace + [f"deferral: '{phrase}'"])
 
     goal = text.strip()
 
