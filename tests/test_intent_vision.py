@@ -19,11 +19,11 @@ REPO = Path(__file__).resolve().parents[1]
 
 def png(w, h, color=(200, 30, 30)):
     """A solid-colour PNG built by hand, so these tests need neither Pillow nor OpenCV to make inputs. Four colour
-    components (r, g, b, alpha) make an RGBA PNG."""
+    components (r, g, b, alpha) make an RGBA PNG, two (gray, alpha) a grayscale-plus-alpha one."""
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
     row = b"\x00" + bytes(color) * w
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6 if len(color) == 4 else 2, 0, 0, 0))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, {2: 4, 3: 2, 4: 6}[len(color)], 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(row * h)) + chunk(b"IEND", b""))
 
 
@@ -426,6 +426,38 @@ def test_transparent_pixels_are_sent_as_white_never_as_their_hidden_colour(monke
     assert r > 200 and g < 60 and b < 60, (r, g, b)
     r, g, b = mean_rgb(iv.prepare_jpeg(png(400, 300, (255, 0, 0, 128))))  # half transparent: pink on white
     assert r > 230 and 100 < g < 160 and 100 < b < 160, (r, g, b)
+
+
+@pytest.mark.parametrize("pillow", [True, False])
+def test_a_transparent_grayscale_png_is_sent_as_white_too(monkeypatch, pillow):
+    # luna round 11 asked about grayscale plus alpha on the OpenCV path (OpenCV 5 expands it to four channels)
+    if not pillow:
+        pytest.importorskip("cv2")
+        monkeypatch.setitem(sys.modules, "PIL", None)
+    r, g, b = mean_rgb(iv.prepare_jpeg(png(400, 300, (90, 0))))
+    assert min(r, g, b) > 245, (r, g, b)
+    r, g, b = mean_rgb(iv.prepare_jpeg(png(400, 300, (90, 255))))  # opaque gray stays gray
+    assert max(abs(r - 90), abs(g - 90), abs(b - 90)) < 12, (r, g, b)
+
+
+def test_a_two_channel_decode_is_composited_onto_white():
+    # an OpenCV build that returns grayscale plus alpha as two channels gets the same composite
+    np = pytest.importorskip("numpy")
+    import types
+
+    hidden = np.zeros((6, 4, 2), np.uint8)
+    hidden[:, :, 0] = 30  # gray value of fully transparent pixels (alpha channel stays 0)
+    fake = types.SimpleNamespace(IMREAD_UNCHANGED=-1, IMREAD_COLOR=1, imdecode=lambda buf, flag: hidden)
+    out = iv._decode_on_white(fake, np, b"not a jpeg")
+    assert out.shape == (6, 4, 3) and out.dtype == np.uint8 and int(out.min()) == 255
+
+
+def test_no_public_method_returns_unvalidated_answers():
+    # luna round 11: ask() checked the reply's keys, not its values, so a direct caller could act on a probability
+    # of 2 or NaN; the raw call is private and the public helpers validate every value (tests above)
+    assert not hasattr(iv.VisionClient, "ask") and hasattr(iv.VisionClient, "_ask")
+    publics = {name for name in dir(iv) if not name.startswith("_") and callable(getattr(iv, name))}
+    assert {"classify_hand_signal", "scene_check", "find_object"} <= publics
 
 
 @pytest.mark.parametrize("url", ["", "star-pi.local:8200", "ftp://star-pi.local", "http://"])

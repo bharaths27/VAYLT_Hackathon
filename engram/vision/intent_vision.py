@@ -169,11 +169,13 @@ def _decode_on_white(cv2, np, data: bytes):
     buf = np.frombuffer(data, np.uint8)
     if data[:2] != b"\xff\xd8":
         raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-        if raw is not None and raw.ndim == 3 and raw.shape[2] == 4:
+        if raw is not None and raw.ndim == 3 and raw.shape[2] in (2, 4):
             full = float(np.iinfo(raw.dtype).max) if raw.dtype.kind == "u" else 1.0
-            alpha = raw[:, :, 3:4].astype(np.float32) / full
-            bgr = raw[:, :, :3].astype(np.float32) / full
-            return np.clip((bgr * alpha + (1.0 - alpha)) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+            alpha = raw[:, :, -1:].astype(np.float32) / full
+            color = raw[:, :, :-1].astype(np.float32) / full
+            if color.shape[2] == 1:  # grayscale + alpha: OpenCV 5 expands it to four channels, other builds may not
+                color = np.repeat(color, 3, axis=2)
+            return np.clip((color * alpha + (1.0 - alpha)) * 255.0 + 0.5, 0, 255).astype(np.uint8)
     return cv2.imdecode(buf, cv2.IMREAD_COLOR)
 
 
@@ -211,8 +213,12 @@ class VisionClient:
         return cls(api_key=env.get("TYPESAFE_API_KEY", "").strip(),
                    model=env.get("TYPESAFE_INTENT_MODEL", "").strip(), **kw)
 
-    def ask(self, image: bytes, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        """Ask questions about `frame` (the image). Returns {"answers", "model", "latency_ms"}."""
+    def _ask(self, image: bytes, questions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """Ask questions about `frame` (the image). Returns {"answers", "model", "latency_ms"}.
+
+        Private: it checks the reply's shape, not the answers' VALUES. The public helpers below validate every value
+        (a probability outside [0, 1], NaN, an unknown label or a bad box is a VisionError), so no caller can act on
+        an unvalidated answer (luna round 11)."""
         jpeg = prepare_jpeg(image, self.max_side)
         ref = f"frame-{uuid.uuid4().hex}"
         body = json.dumps({
@@ -268,7 +274,7 @@ def _choice(answer: Any, options: Mapping[str, str]) -> tuple[str, float, dict[s
 def classify_hand_signal(image: bytes, client: VisionClient | None = None) -> dict[str, Any]:
     """Which hand signal is shown? -> {"signal", "probability", "confidence", "probs", "latency_ms", "model"}."""
     client = client or VisionClient.from_env()
-    out = client.ask(image, {
+    out = client._ask(image, {
         "signal": {"type": "choice",
                    "instructions": "Which hand signal is the person in `frame` making toward the camera?",
                    "criteria": HAND_SIGNALS},
@@ -281,7 +287,7 @@ def classify_hand_signal(image: bytes, client: VisionClient | None = None) -> di
 def scene_check(image: bytes, client: VisionClient | None = None) -> dict[str, Any]:
     """Care-room questions in one call: is someone there, on the floor, asking for help; their posture."""
     client = client or VisionClient.from_env()
-    out = client.ask(image, {
+    out = client._ask(image, {
         "person_present": {"type": "noul", "instructions": "Is at least one person visible in `frame`?"},
         "person_on_floor": {"type": "noul", "instructions":
                             "Is a person in `frame` lying or collapsed on the floor or the ground (not in a bed), "
@@ -312,7 +318,7 @@ def find_object(image: bytes, what: str, client: VisionClient | None = None,
     if not what or len(what) > 80:
         raise ValueError("describe the object in 1 to 80 characters")
     client = client or VisionClient.from_env()
-    out = client.ask(image, {
+    out = client._ask(image, {
         "present": {"type": "noul", "instructions": f"Is there a {what} visible in `frame`?"},
         "where": {"type": "box", "instructions": f"the {what} in `frame`"},
     })
