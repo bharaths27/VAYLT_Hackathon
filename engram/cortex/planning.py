@@ -28,6 +28,12 @@ CAPS = {
     'speak': {'text':str},
 }
 PHYSICAL = set(CAPS) - {'stop','observe','locate_tag','speak'}
+# The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table).
+GOAL_OPS = {'fetch':('observe','locate_tag','pick_tagged_object','place_at_zone'),'goto':('go_to_zone',),'inspect':('observe','locate_tag')}
+def goal_ops(goal: dict | Goal | None) -> tuple[str, ...]:
+    g=goal.to_dict() if isinstance(goal,Goal) else goal or {}
+    return (g.get('primitive'),) if g.get('kind')=='primitive' and g.get('primitive') in CAPS else GOAL_OPS.get(g.get('kind'),())
+
 # Grammar: refuse by default. Anything below means the utterance says more than "move X to Y".
 QUESTION = re.compile(r"\?\s*$|^\s*(?:should|shall|do|does|did|is|are|was|were|am|may|might|must|what|why|how|which|who|whose|whether|where|when|(?:can|could|would|will)\s+(?:i|we)\b)\b", re.I)
 HEDGES = (
@@ -40,7 +46,6 @@ HEDGES = (
 )
 VERBS = {'fetch':r'bring|fetch|move|take|carry|put','goto':r'go|return|drive','inspect':r'find|locate|inspect|look at'}
 FILLER = {'the','a','an','to','on','onto','in','into','at','and','please','kindly','now','for','me','us','here','there','back','can','could','would','will','you','just','ok','okay','hey','um','uh','so','robot'}
-
 
 
 def safety_reason(request: str) -> str | None:
@@ -147,20 +152,24 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
         res.errors.append('unknown goal target/destination'); return res
     if any(r.get('status')!='active' for r in rules if r['subject'] in relevant):
         res.errors.append('unresolved rule conflict'); return res
+    # Effect-set oracle. Allowed ops come from the goal kind alone. A placement is an
+    # effect only if it is REQUIRED: a target to the destination, or a prerequisite to
+    # its required station before its subject is picked later in this same plan.
+    # Unknown (None) positions are never treated as satisfied.
+    allowed=set(goal_ops(goal))
+    def picked_later(oid,i): return any(isinstance(s,dict) and s.get('op')=='pick_tagged_object' and isinstance(s.get('args'),dict) and s['args'].get('object_id')==oid for s in steps[i+1:])
+    def required(oid,zone,i): return (oid in goal_ids and zone==goal.zone) or any(r['object']==oid and r['required_zone']==zone and picked_later(r['subject'],i) for r in rules)
+    placed={}
     try:
-        for step in steps:
+        if goal.kind in {'primitive','goto'} and len(steps)!=1: raise Conflict('extra effect: this goal is exactly one step')
+        for i,step in enumerate(steps):
             validate_step(step,set(objects),zones)
             op,a=step['op'],step['args']; res.steps_checked+=1
-            if op=='speak' and goal.kind!='primitive':raise Conflict('narration is emitted only after verified outcome, not by a motion plan')
+            if op not in allowed: raise Conflict(f'extra effect: {op} is not allowed for a {goal.kind} goal')
             if op in PHYSICAL and stopped: raise Conflict('motion after stop')
-            if op in ('drive_bounded','turn_bounded','gripper_open','gripper_close') and goal.kind!='primitive':
-                raise Conflict('unrequested low-level effect')
-            if op in ('go_to_zone',) and goal.kind not in {'goto','primitive'}:
-                raise Conflict('unrequested navigation')
-            if op in ('pick_tagged_object','place_at_zone','approach_tag') and goal.kind not in {'fetch','primitive'}:
-                raise Conflict('unrequested manipulation')
-            if op in PHYSICAL and goal.kind=='primitive' and (op!=goal.primitive or a!=goal.args):
+            if goal.kind=='primitive' and (op!=goal.primitive or a!=goal.args):
                 raise Conflict('primitive differs from the requested effect')
+            if goal.kind=='goto' and a.get('zone')!=goal.zone: raise Conflict('navigation to a station other than the goal')
             oid=a.get('object_id')
             if oid and goal.kind in {'fetch','inspect'} and oid not in relevant:
                 raise Conflict('plan acts on an unrelated object')
@@ -182,7 +191,10 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
                 at=positions.pop(oid); holding=oid; open_=False
             elif op=='place_at_zone':
                 if holding is None: raise Conflict('placement without a held object')
-                positions[holding]=a['zone']; at=a['zone']; holding=None; open_=True
+                if goal.kind=='fetch' and not required(holding,a['zone'],i):
+                    raise Conflict(f"extra effect: {holding} to {a['zone']} is neither the destination nor a prerequisite station needed later")
+                if placed.get(holding)==a['zone']: raise Conflict('extra effect: repeated move to where this plan already put the object')
+                positions[holding]=placed[holding]=a['zone']; at=a['zone']; holding=None; open_=True
             elif op=='go_to_zone': at=a['zone']
             elif op=='gripper_open':
                 if holding: positions[holding]=at; holding=None
@@ -190,13 +202,10 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
             elif op=='gripper_close': open_=False
         if holding: raise Conflict('task ends with unplaced object')
         if goal.kind=='fetch' and any(positions.get(oid)!=goal.zone for oid in goal.targets):
-            raise Conflict('requested goal was not reached')
+            raise Conflict('requested goal was not reached' if all(original.get(o) is not None for o in goal.targets) else
+                           'requested goal was not reached: a target position is unknown (no fresh observation), so it must be moved, not assumed')
         if goal.kind=='goto' and at!=goal.zone: raise Conflict('wrong final station')
         if goal.kind=='inspect' and not goal_ids<=seen: raise Conflict('inspection did not observe the requested objects')
-        if goal.kind=='primitive' and not any(s['op']==goal.primitive and s['args']==goal.args for s in steps):
-            raise Conflict('requested primitive missing')
-        if goal.kind=='primitive' and sum(s['op'] in PHYSICAL for s in steps)>1:
-            raise Conflict('primitive repeated or additional effect')
         if goal.kind=='fetch' and any(positions.get(k)!=v for k,v in original.items() if k not in relevant):
             raise Conflict('unrelated object changed')
         res.ok=True
@@ -216,11 +225,12 @@ class Compiler:
     def fixture(self, *, mode: str='SIMULATED') -> dict:
         zones=sorted(self.store.zones())
         if not zones: raise Missing('no station registry')
-        # Synthetic practice may fill unknown positions; explicitly not an observation.
-        objects={o['id']:{'tag':o['tag'],'graspable':o['graspable']} for o in self.store.objects()}
-        neutral='home' if 'home' in zones else zones[0]
-        pos={o['id']:o['last_zone'] if o['fresh'] and o['last_zone'] else neutral for o in self.store.objects()}
-        return {'mode':mode,'positions':pos,'objects':objects,'zones':zones,'at_zone':neutral,'assumptions':[o['id'] for o in self.store.objects() if not o['fresh']]}
+        # Only a FRESH observation is a position. Anything else is unknown (None), never
+        # filled in, so neither the planner nor the verifier can rely on an invented world.
+        objs=self.store.objects()
+        objects={o['id']:{'tag':o['tag'],'graspable':o['graspable']} for o in objs}
+        pos={o['id']:o['last_zone'] if o['fresh'] and o['last_zone'] else None for o in objs}
+        return {'mode':mode,'positions':pos,'objects':objects,'zones':zones,'at_zone':None,'unknown_positions':sorted(k for k,v in pos.items() if v is None)}
 
     def compile(self, goal: Goal, fixture: dict | None=None) -> dict:
         goal=Goal.from_dict(goal.to_dict())
@@ -257,7 +267,12 @@ class Compiler:
                 for r in rules:
                     if r['subject']==oid: visit(r['object'],path+(oid,))
             for oid in goal.targets: visit(oid)
-            for oid in goal.targets: place(oid,goal.zone)
+            def needs(oid,acc):
+                for r in rules:
+                    if r['subject']==oid and r['object'] not in acc: acc.add(r['object']); needs(r['object'],acc)
+                return acc
+            # A target that another target needs as a prerequisite is delivered LAST.
+            for oid in sorted(goal.targets,key=lambda t:sum(t in needs(u,set()) for u in goal.targets if u!=t)): place(oid,goal.zone)
         elif goal.kind=='goto': steps=[{'op':'go_to_zone','args':{'zone':goal.zone}}]
         elif goal.kind=='inspect': steps=[{'op':'locate_tag','args':{'object_id':oid}} for oid in goal.targets]
         elif goal.kind=='primitive': steps=[{'op':goal.primitive,'args':goal.args}]
