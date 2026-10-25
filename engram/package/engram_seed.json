@@ -1,0 +1,54 @@
+{
+  "version": "0.1",
+  "note": "Confirmed entities, capabilities and source references only. No sensor state, no secrets, no standing permission. Fixture positions are where the demo arena puts things, not observations. Simulation fixtures live in tests/fixtures, not here.",
+  "built_from_head": "0ceb45b",
+  "sources": [
+    {"id": "arena", "path": "fixtures/lab/arena.json", "sha256": "8f3ce9d4c0136d66d06b3eea8f2388d825b804d53fe0f043edc283be8ab54617", "kind": "configuration"},
+    {"id": "sop_004", "path": "fixtures/lab/SOP_004.md", "sha256": "f7e7f351662c1cf82ca2c009abb93c2d05aa1bec0ec8c2d8da420ce509c2f766", "kind": "document", "title": "SOP 004"},
+    {"id": "sample_list", "path": "fixtures/lab/sample_list.md", "sha256": "a4a78fddc9a9b7b274f91ebcedda9f25e2154a12495d1033cf4d7859cf1aa0d5", "kind": "document", "title": "Sample list"},
+    {"id": "capabilities", "path": "engram/capabilities.py", "sha256": "40b8bd7d7fd58e969a1fc48a23b5a8e2d092aedf40d1ba8e22a20e8ce209ac70", "kind": "code"}
+  ],
+  "tag_dictionary": "DICT_4X4_50",
+  "zones": [
+    {"id": "home", "tag": 10, "source": "arena"},
+    {"id": "shelf_A", "tag": 11, "source": "arena"},
+    {"id": "shelf_B", "tag": 12, "source": "arena"},
+    {"id": "ppe_station", "tag": 13, "source": "arena"},
+    {"id": "bench", "tag": 14, "source": "arena"}
+  ],
+  "objects": [
+    {"id": "sample_a", "name": "Sample A", "tag": 1, "fixture_zone": "shelf_A", "graspable": true, "source": "arena"},
+    {"id": "sample_b", "name": "Sample B", "tag": 2, "fixture_zone": "shelf_A", "graspable": true, "source": "arena"},
+    {"id": "goggles", "name": "Safety goggles", "tag": 3, "fixture_zone": "ppe_station", "graspable": true, "source": "arena"},
+    {"id": "beaker", "name": "Beaker", "tag": 4, "fixture_zone": "shelf_B", "graspable": true, "source": "arena"}
+  ],
+  "capabilities": {
+    "source": "capabilities",
+    "physical": ["drive_bounded", "turn_bounded", "approach_tag", "gripper_open", "gripper_close", "pick_tagged_object", "go_to_zone", "place_at_zone"],
+    "non_physical": ["stop", "observe", "locate_tag", "speak", "ask", "remember", "schedule"],
+    "bounds": {"drive_bounded.distance_m": 0.5, "turn_bounded.degrees": 180.0}
+  },
+  "rules": [
+    {
+      "id": "sop_004.ppe.1",
+      "subject": "sample_b",
+      "requires_object": "goggles",
+      "required_station": "bench",
+      "when": "before handling",
+      "source": "sop_004",
+      "section": "PPE",
+      "text": "Safety goggles must be at the bench before handling Sample B.",
+      "status": "active",
+      "note": "The current extractor (engram/teach.py) stores the object but drops required_station. Keep both."
+    }
+  ],
+  "facts": [
+    {"subject": "sample_a", "statement": "buffer solution, no special handling", "source": "sample_list", "section": "Samples"},
+    {"subject": "sample_b", "statement": "acid sample; see SOP 004 before moving", "source": "sample_list", "section": "Samples"}
+  ],
+  "unresolved": [
+    {"item": "printed tag size", "detail": "Brian's config assumes 40 mm for ids under 20; make_tags.py prints 50 mm by default. Measure the sheets; reprint at 40 mm or add tag_sizes_m overrides.", "owner": "Brian", "ref": "room #53415 reply 22:27Z"},
+    {"item": "physical arena matches arena.json", "detail": "Tag ids are agreed (objects 1-4, zones 10-14). Whether the table layout matches fixture_zone is not observed.", "owner": "Brian"},
+    {"item": "planner model", "detail": "Qwen3-1.7B selected, not installed or tested. The release runs the deterministic RulePlanner.", "owner": "Bharath"}
+  ]
+}

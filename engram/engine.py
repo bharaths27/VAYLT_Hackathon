@@ -19,10 +19,12 @@ from .checker import check_plan
 from .db import now
 from .executor import Executor
 from .hashes import hash_models
+from .heard import record_heard
 from .ids import digest, new_id
 from .memory import Memory
 from .planner import PlanResult, RulePlanner, find_zone, refusal, targets_in
 from .prospective import Prospective, parse_when
+from .recall import Recall, is_memory_question
 from .robot.base import RobotAdapter
 from .skills import Skills
 from .teach import extract_rules
@@ -76,7 +78,12 @@ class Engine:
     # ---- commands --------------------------------------------------------
 
     def command(self, text: str, who: str = "user") -> dict[str, Any]:
-        """One entry point for typed or spoken commands."""
+        """One entry point for typed or spoken commands. What was said is kept as heard memory."""
+        result = self._command(text, who)
+        result["heard_id"] = record_heard(self.conn, text.strip(), who, result)
+        return result
+
+    def _command(self, text: str, who: str) -> dict[str, Any]:
         stripped = text.strip()
         low = stripped.lower()
         if low.startswith("remember"):
@@ -85,6 +92,9 @@ class Engine:
             if body.lower().startswith("that "):
                 body = body[5:]
             return {"kind": "taught", **self.teach(f"Spoken note from {who}", body, kind="spoken", origin=who)}
+        if is_memory_question(stripped):
+            # Answered from memory: never scheduled, never planned, nothing moves (practice check M2).
+            return {"kind": "answer", **Recall(self.memory).recall(stripped)}
         when = parse_when(stripped)
         if when:
             trigger, request = when

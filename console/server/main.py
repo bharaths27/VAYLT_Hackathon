@@ -265,6 +265,8 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
     elif kind == "taught":
         await bus.emit("rule", result=p, text=text)
         await bus.emit("say", text="Got it. I saved that as a new source.")
+    elif kind == "answer":
+        await bus.emit("say", text=p.get("reply") or "I have no record of that.")
     ledger.append("brain_command", text=text, source=source, result_kind=kind, operation_id=p.get("operation_id"))
     return out
 

@@ -19,6 +19,7 @@ Environment:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,7 @@ from pydantic import BaseModel, Field
 from .capabilities import describe_all
 from .db import connect
 from .engine import Engine, EngineError
+from .recall import Recall
 from .robot.mock import MockRobot
 from .skills import SkillError
 
@@ -51,6 +53,22 @@ class QueryIn(BaseModel):
 class CommandIn(BaseModel):
     text: str = Field(min_length=1, max_length=500)
     who: str = "user"
+
+
+class RecallIn(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    kinds: list[str] | None = None
+
+
+def package_info() -> dict[str, Any]:
+    """The ENGRAM boot contract the planner is given, pinned by hash (EC03/EC20)."""
+    path = ROOT / "engram/package/ENGRAM.md"
+    if not path.exists():
+        return {"loaded": False}
+    data = path.read_bytes()
+    seed = json.loads((ROOT / "engram/package/engram_seed.json").read_text())
+    return {"loaded": True, "contract": data.decode().splitlines()[0].lstrip("# ").strip(),
+            "sha256": hashlib.sha256(data).hexdigest(), "words": len(data.split()), "seed_version": seed["version"]}
 
 
 class PlanIn(BaseModel):
@@ -136,6 +154,19 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     @app.get("/memory/facts")
     def memory_facts() -> list[dict[str, Any]]:
         return engine.memory.current_facts()
+
+    @app.post("/memory/recall")
+    def memory_recall(body: RecallIn) -> dict[str, Any]:
+        try:
+            return Recall(engine.memory).recall(body.question, kinds=body.kinds)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+    package = package_info()
+
+    @app.get("/memory/package")
+    def memory_package() -> dict[str, Any]:
+        return package
 
     @app.post("/observations/tag")
     def observe_tag(body: TagIn) -> dict[str, Any]:

@@ -60,6 +60,10 @@ def send_command(server: str, text: str, who: str) -> dict:
 def describe_reply(r: dict) -> tuple[str, str]:
     """(text for the screen, short sentence to say out loud)."""
     kind = r.get("kind")
+    if kind == "answer":
+        lines = [f"FROM MEMORY  {a['kind']}: {a['text']}" for a in r.get("answers", [])[:5]]
+        lines += [f"    unknown: {m}" for m in r.get("missing", [])]
+        return "\n".join(lines) or "FROM MEMORY  nothing recorded", str(r.get("reply"))
     if kind == "taught":
         n = len(r.get("rules", []))
         return f"LEARNED  saved as a source, {n} rule(s) found", f"Got it. I saved that{' and found a rule' if n else ''}."
