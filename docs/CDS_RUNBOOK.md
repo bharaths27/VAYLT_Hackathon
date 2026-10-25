@@ -10,9 +10,11 @@ Repo: **github.com/mrrCarter/VAYLT_Hackathon**, branch **main** (this file is `d
 
 ## 0. What you are working with (two minutes)
 
-**The robot** is a small wheeled rover with a claw (gripper) and a camera, driven by a **Raspberry Pi 5 named
-`star-pi`** (user `starrasp`). It has **one forward ultrasonic sensor**: it stops before driving into something
-in front of it. It has **no LiDAR, no rear sensor, no side sensor**: reversing and turning in place are blind.
+**The robot** is a **Hiwonder MasterPi**: a four-wheel rover with a five-servo arm ending in a claw (gripper) and
+a camera, driven by a **Raspberry Pi 5 named `star-pi`** (user `starrasp`). It has **one forward ultrasonic
+sensor**: it stops before driving into something in front of it. It has **no LiDAR, no rear sensor, no side
+sensor**: reversing and turning in place are blind. Only one program may talk to its motor board at a time: Brian's
+robot server.
 
 Everything runs on star-pi:
 
@@ -55,10 +57,19 @@ Nothing moves without your Approve. A spoken or typed **"Stop"** always stops.
 - [ ] Your phone (its hotspot is the backup network).
 - [ ] The robot, its motor battery (charged) and the Pi's power supply (Pi 5 needs a **5 V / 5 A USB-C**
       supply; a weaker one browns out the camera and motors).
-- [ ] Printed tags (ArUco 4x4). Objects: **Sample A = 1, Sample B = 2, Safety goggles = 3, Beaker = 4.**
-      Zones: **home = 10, shelf A = 11, shelf B = 12, PPE station = 13, bench = 14.** If you need to print them:
-      `python scripts/make_tags.py` on any machine with the repo, print at 100% scale.
+- [ ] **Printed tags, 40 mm.** Print `docs/tags-40mm.pdf` from the repo (on GitHub: open the file, Download) at
+      **100% scale / "actual size"** (not "fit to page"). With a ruler, the black square must measure **40 mm**: the
+      robot's distance math assumes it. Objects: **Sample A = 1, Sample B = 2, Safety goggles = 3, Beaker = 4.**
+      Zones: **home = 10, shelf A = 11, shelf B = 12, PPE station = 13, bench = 14.** Old tags printed at 50 mm make
+      every distance about 25% wrong: reprint.
+- [ ] The objects: something to stand in for Sample A, Sample B, goggles and a beaker, each with its tag on top or
+      on the side where the camera still sees it when the claw is closed; a box or two for zones.
 - [ ] The SSH password or key for `starrasp@star-pi`: **get it from Brian directly, never through the room.**
+- [ ] **The network:** the robot last ran on **Brian's phone hotspot**, so the Pi joins it by itself. Bring Brian's
+      phone, or ask Brian for that hotspot's exact name and password and set **your** phone's hotspot to the same
+      name and password: the Pi will join yours instead. Use a hotspot with a password, never open Wi-Fi: anyone
+      on the robot's network can approve a plan.
+- [ ] A USB-C to Ethernet adapter and an Ethernet cable (backup if Wi-Fi fails, see step 4).
 - [ ] Ideally Brian in person or on a call for step 9 (the real robot).
 
 ---
@@ -72,7 +83,9 @@ Nothing moves without your Approve. A spoken or typed **"Stop"** always stops.
 
 ## 4. Connect your laptop to the robot
 
-The Pi joins the team's network (the team hotspot or the room's Wi-Fi). Put your laptop on **the same network**.
+Turn on the hotspot (Brian's, or yours with the same name and password; see section 2). Wait a minute: the Pi
+shows up in the hotspot's connected devices. Put your laptop on **the same hotspot**. (BU Wi-Fi needs a personal
+login the Pi does not have; do not count on it.)
 
 ```bash
 ssh starrasp@star-pi.local
@@ -86,9 +99,15 @@ ssh starrasp@star-pi.local
 If `star-pi.local` is not found: have Brian (or anyone with a screen on the Pi) run `hostname -I`, then use that
 address: `ssh starrasp@<that address>`. More fixes: Troubleshooting, "Cannot connect".
 
-**Backup network (no Wi-Fi at all):** with a keyboard and screen on the Pi, run
-`bash ~/engram_hub/console/scripts/hotspot.sh`; the Pi becomes its own Wi-Fi called **ENGRAM-LAB** (password
-`engram2026`), and the robot is at `10.42.0.1`.
+**Backup 1, a cable:** plug the Ethernet cable from your laptop's USB-C adapter into the Pi's Ethernet jack.
+Try `ssh starrasp@star-pi.local` again. If it is still not found, the Pi's Ethernet probably has the fixed robot-link
+address: set your laptop's Ethernet adapter to IPv4 address `10.0.0.1`, mask `255.255.255.0`, no gateway
+(Windows: Settings > Network > Ethernet > IP assignment > Edit > Manual), then `ssh starrasp@10.0.0.2`.
+
+**Backup 2, the Pi's own Wi-Fi** (once you are in over SSH, and after step 5, which needs internet):
+`bash ~/engram_hub/console/scripts/hotspot.sh` makes the Pi its own Wi-Fi called **ENGRAM-LAB** (password
+`engram2026`); the iPad joins it and the robot is at `10.42.0.1`. Your SSH session over Wi-Fi drops when it
+switches; reconnect over the cable or by joining ENGRAM-LAB.
 
 ---
 
@@ -142,8 +161,10 @@ Put the iPad on the **same network** as the robot.
 2. Settings > General > **VPN & Device Management** > ENGRAM Local CA > **Install** (twice).
 3. Settings > General > About > **Certificate Trust Settings** > turn **ENGRAM Local CA** on.
 
-**Open the console:** `https://star-pi.local:8443` in Safari. Allow the microphone when asked. The screen should
-show a **SIMULATED** / mock label (that is the pretend robot) and the push-to-talk button.
+**Open the console:** `https://star-pi.local:8443` in Safari (or `https://<robot address>:8443`; the iPad often
+needs the number form, e.g. `https://172.20.10.6:8443`, which `cds_status.sh` prints). Allow the microphone when
+asked. The screen should show a **SIMULATOR** label (that is the pretend robot) and the push-to-talk button.
+**Approving is press-and-hold:** hold the Approve button for about a second.
 
 Verna's 3D rover front page is optional (it embeds this same console): see section 12.
 
@@ -234,9 +255,9 @@ server stopped first, because only one program can use the motor board).
 
 | # | Say | Expected |
 |---|---|---|
-| R1 | "Open the gripper." → Approve | The claw opens; result SUCCEEDED (or UNKNOWN if the claw has no sensor; that is honest, not a failure). |
+| R1 | "Open the gripper." → Approve | The claw opens; result SUCCEEDED (or UNKNOWN if the claw has no sensor; that is honest, not a failure). **If the claw does not move at all**, its open/close values may still be the placeholders (1500/1500): Brian sets `claw_open_us` / `claw_closed_us` in `~/engram_robot/drive_calib.json`. |
 | R2 | "Close the gripper." → Approve | The claw closes. |
-| R3 | Hold the Sample A tag (1) in front of the camera. "Look around." → Approve | The camera looks; tag 1 is listed as seen. |
+| R3 | Hold the Sample A tag (1) **50 cm** in front of the camera (measure). "Look around." → Approve | Tag 1 is listed as seen, at about **0.5 m**. About 0.63 m means the tag was printed at 50 mm, not 40 mm: reprint (section 2) before any motion. |
 
 **10b. Moving (only if all three stop tests passed, floor clear, Brian present):** robot on the floor, 1.5 m
 clear in front, nothing behind, hand on the motor power.
