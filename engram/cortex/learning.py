@@ -4,6 +4,7 @@ This is memory/skill improvement, not reinforcement-learning weight updates.
 """
 from __future__ import annotations
 
+import collections
 import copy
 import json
 import threading
@@ -124,11 +125,20 @@ class Activity:
 
 
 class Dreamer:
+    LIVE_CAP=128                 # per-kind cap on LIVE rows (stale/deleted rows do not count)
+    PRACTICE_WINDOW_S=86400.0    # practice cap is rolling: cases created in the last day
+    BACKOFF_S=(30,60,120,300,600,1800,3600)
+
     def __init__(self, store: Store, skills: Skills, activity: Activity,
-                 qwen: QwenClient | None=None, intent: IntentAdvisor | None=None):
+                 qwen: QwenClient | None=None, intent: IntentAdvisor | None=None, *,
+                 model_window_s: float=600, model_calls_per_window: int | None=None):
         self.store,self.skills,self.activity=store,skills,activity
         self.qwen,self.intent=qwen,intent
         self._stop=threading.Event(); self._thread=None; self._cycle_lock=threading.Lock()
+        # Real model-call cap: at most N idle model calls per rolling window (default N =
+        # policy.max_model_calls_per_dream), plus no repeat of an input already answered.
+        self.model_window_s=model_window_s; self.model_calls_per_window=model_calls_per_window
+        self._model_calls=collections.deque(); self._model_answered=None
 
     def start(self, interval_s: float=5):
         if self._thread and self._thread.is_alive(): return
@@ -151,26 +161,48 @@ class Dreamer:
         try: return self._cycle(force=force)
         finally: self._cycle_lock.release()
 
+    def _model_budget(self) -> bool:
+        cap=self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
+        now=time.monotonic()
+        while self._model_calls and now-self._model_calls[0]>=self.model_window_s: self._model_calls.popleft()
+        return cap>0 and len(self._model_calls)<cap
+
+    def _backoff(self, failed: bool):
+        with self.store.tx():
+            if not failed:
+                self.store.conn.execute("DELETE FROM meta WHERE key='cx_dream_backoff'"); return
+            row=self.store.one("SELECT value FROM meta WHERE key='cx_dream_backoff'")
+            n=(json.loads(row['value'])['failures'] if row else 0)+1
+            value=canonical({'failures':n,'until':self.store.clock()+self.BACKOFF_S[min(n,len(self.BACKOFF_S))-1]})
+            self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_backoff',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
+
     def _cycle(self, *, force: bool=False) -> dict:
         busy,generation,idle=self.activity.snapshot()
         if busy or (not force and idle<self.store.policy.idle_after_s): return {'status':'not_idle'}
-        if self.store.one("SELECT 1 FROM episode WHERE outcome='running'"): return {'status':'robot_busy'}
-        watermark=digest({'epoch':self.store.epoch(),'episodes':self.store.rows("SELECT id,outcome FROM episode ORDER BY started_at DESC LIMIT 16"),
+        # Only Cortex episodes count: a legacy-engine 'running' row is not this robot's activity.
+        if self.store.one("SELECT 1 FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome='running'"): return {'status':'robot_busy'}
+        back=self.store.one("SELECT value FROM meta WHERE key='cx_dream_backoff'")
+        if not force and back and self.store.clock()<json.loads(back['value'])['until']: return {'status':'backoff'}
+        watermark=digest({'epoch':self.store.epoch(),'episodes':self.store.rows("SELECT e.id,e.outcome FROM episode e JOIN cx_episode c ON c.id=e.id ORDER BY e.started_at DESC LIMIT 16"),
                           'commitments':self.store.rows('SELECT id,status FROM prospective_task ORDER BY created_at DESC LIMIT 16')})
         last=self.store.one("SELECT value FROM meta WHERE key='cx_dream_watermark'")
         backlog=self.store.one("SELECT 1 FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('success','failed','unknown','aborted') AND NOT EXISTS (SELECT 1 FROM cx_consolidated k WHERE k.episode_id=e.id AND k.outcome=e.outcome) LIMIT 1")
         if not force and not backlog and last and last['value']==watermark: return {'status':'no_new_evidence'}
-        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]
+        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False
         with self.store.tx(): self.store.conn.execute('INSERT INTO cx_dream VALUES(?,?,?,?,?)',(run,self.store.clock(),None,'running','{}'))
-        def still_idle():
+        def interrupted():
             b,g,_=self.activity.snapshot()
-            return not self._stop.is_set() and b==0 and g==generation and time.monotonic()-started<self.store.policy.dream_budget_s
+            return self._stop.is_set() or b!=0 or g!=generation
+        def still_idle():
+            # Starting NEW work also needs the time budget; a result already computed is kept
+            # unless foreground activity interrupted it.
+            return not interrupted() and time.monotonic()-started<self.store.policy.dream_budget_s
         try:
             self.store.invalidate()
             # Bounded incremental summaries/lessons retain episode provenance and evidence class.
             episodes=self.store.rows("SELECT e.*,c.mode,c.goal_json FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('success','failed','unknown','aborted') AND NOT EXISTS (SELECT 1 FROM cx_consolidated k WHERE k.episode_id=e.id AND k.outcome=e.outcome) ORDER BY e.started_at,e.id LIMIT ?",(self.store.policy.dream_batch,))
             for ep in episodes:
-                if not still_idle(): break
+                if not still_idle(): leftover=True; break
                 kind='summary' if ep['outcome']=='success' else 'lesson'
                 payload={'episode_id':ep['id'],'request':ep['request'],'outcome':ep['outcome'],
                          'evidence_class':ep['mode'],'failure':ep['failure'],
@@ -192,7 +224,6 @@ class Dreamer:
                     rules_now=[]
             objects=self.store.objects(); zones=sorted(self.store.zones())
             proposed=[]
-            allow_practice=True
             for r in rules_now:
                 if r['status']=='active' and zones:
                     dest=next((z for z in zones if z!=r['required_zone']),zones[0])
@@ -202,12 +233,13 @@ class Dreamer:
                 proposed.append((g,['episode:'+ep['id']]))
             seen=set()
             for goal,refs in proposed:
-                if not still_idle() or len(practiced)>=self.store.policy.dream_batch: break
                 if goal.key() in seen: continue
                 seen.add(goal.key())
                 case_id=digest({'goal':goal.to_dict(),'basis':self.store.basis(goal),'verifier':'symbolic-verifier-v1'})
                 if self.store.one('SELECT 1 FROM cx_practice WHERE id=?',(case_id,)): continue
-                if self.store.one('SELECT COUNT(*) n FROM cx_practice')['n']>=128: break
+                # Unpractised goals left for a later cycle are a backlog: the watermark must not hide them.
+                if not still_idle() or len(practiced)>=self.store.policy.dream_batch: leftover=True; break
+                if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(self.store.clock()-self.PRACTICE_WINDOW_S,))['n']>=self.LIVE_CAP: break
                 fixture=compiler.fixture()
                 try:
                     plan=compiler.compile(goal,fixture); plan['refs']=sorted(set(plan['refs']+refs))
@@ -239,7 +271,7 @@ class Dreamer:
                             self.skills.approve(skill['id'],skill['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
                 except CortexError as e: errors.append(type(e).__name__+': '+str(e))
             # Local-model associations are hypotheses only, never automatically factual.
-            if self.qwen and still_idle() and self.store.policy.max_model_calls_per_dream:
+            if self.qwen and still_idle() and self._model_budget():
                 evidence=[]; refs=[]
                 for r in self.store.rules()[:4]:
                     if r['status']=='active':
@@ -252,24 +284,32 @@ class Dreamer:
                 recent_sources=self.store.rows("SELECT c.id,c.source_id,c.text FROM source_chunk c JOIN cx_source s ON s.source_id=c.source_id JOIN source v ON v.id=c.source_id WHERE s.status='accepted' ORDER BY v.created_at DESC LIMIT 3")
                 for c in recent_sources:refs+=['source:'+c['source_id']]
                 refs+=['episode:'+e['id'] for e in episodes[:2]]
-                if refs and self.store.one('SELECT COUNT(*) n FROM cx_derived')['n']<128:
-                    q=None
-                    # The bundle is intentionally small; no whole-vault prompt.
-                    try: q=self.qwen.complete('dream',{'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],'pending_commitments':self.store.rows("SELECT id,trigger,request,status FROM prospective_task WHERE status IN ('waiting','fired','unknown') LIMIT 3"),'approved_skills':self.store.rows("SELECT v.name,v.status FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' LIMIT 3"),'declared_knowledge':declared,'source_passages':recent_sources,'observations':[{'id':o['id'],'statement':o['statement'],'fresh':o['fresh']} for o in objects[:4]]})
+                live=self.store.one("SELECT COUNT(*) n FROM cx_derived WHERE kind='hypothesis' AND status IN ('CANDIDATE','VERIFIED')")['n']
+                # The bundle is intentionally small; no whole-vault prompt.
+                bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],'pending_commitments':self.store.rows("SELECT id,trigger,request,status FROM prospective_task WHERE status IN ('waiting','fired','unknown') LIMIT 3"),'approved_skills':self.store.rows("SELECT v.name,v.status FROM skill_version v JOIN cx_skill c ON c.id=v.id WHERE v.status='APPROVED' LIMIT 3"),'declared_knowledge':declared,'source_passages':recent_sources,'observations':[{'id':o['id'],'statement':o['statement'],'fresh':o['fresh']} for o in objects[:4]]}
+                asked=digest(bundle)
+                if refs and live<self.LIVE_CAP and asked!=self._model_answered:
+                    q=None; self._model_calls.append(time.monotonic())
+                    try: q=self.qwen.complete('dream',bundle)
                     except CortexError as e: errors.append(type(e).__name__)
-                    if q and still_idle():
+                    if q and not interrupted():
+                        self._model_answered=asked
                         for h in q.value.get('candidates',[])[:3]:
-                            if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list): continue
-                            if not set(h['refs'])<=set(refs): continue
-                            sentence=text(h['text'],'hypothesis',600)
-                            m=self.store.derive('hypothesis',{'text':sentence},h['refs'],origin='qwen_idle_hypothesis')
-                            made.append(m['id'])
-            status='complete' if still_idle() else 'yielded'
+                            # One bad candidate never sinks its siblings or the cycle.
+                            try:
+                                if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list) or not all(isinstance(x,str) for x in h['refs']):
+                                    raise Missing('malformed hypothesis candidate')
+                                if not h['refs'] or not set(h['refs'])<=set(refs): raise Missing('hypothesis must cite allowed refs')
+                                m=self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')
+                                made.append(m['id'])
+                            except CortexError as e: errors.append('hypothesis rejected: '+type(e).__name__)
+            status='yielded' if interrupted() else 'complete'
         except Exception as e:
             status='failed'; errors.append(type(e).__name__)
         result={'id':run,'status':status,'derived_ids':list(dict.fromkeys(made)),'practice_ids':practiced,'errors':errors,
                 'mode':'SIMULATED_PRACTICE','physical_actions':0,'weights_updated':False}
         with self.store.tx():
-            if status=='complete': self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(watermark,))
+            if status=='complete' and not leftover: self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(watermark,))
             self.store.conn.execute('UPDATE cx_dream SET finished_at=?,status=?,summary_json=? WHERE id=?',(self.store.clock(),status,canonical(result),run))
+        if status!='yielded': self._backoff(status=='failed')
         return result
