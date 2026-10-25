@@ -282,11 +282,14 @@ class _HTTPSConnection(_Interruptible, http.client.HTTPSConnection):
 
 def _connection(url: str, deadline: float) -> tuple[http.client.HTTPConnection, str]:
     parts = urllib.parse.urlsplit(url)
+    port = parts.port   # ValueError for a port that is not a number in 0-65535
+    if port == 0:       # never a destination; `port or 80` would have sent the body to port 80
+        raise ValueError("port 0 is not a valid destination port")
     if parts.scheme == "https":
-        conn: http.client.HTTPConnection = _HTTPSConnection(parts.hostname, parts.port or 443, deadline,
+        conn: http.client.HTTPConnection = _HTTPSConnection(parts.hostname, 443 if port is None else port, deadline,
                                                             _tls_context())
     elif parts.scheme == "http":
-        conn = _HTTPConnection(parts.hostname, parts.port or 80, deadline)
+        conn = _HTTPConnection(parts.hostname, 80 if port is None else port, deadline)
     else:
         raise ValueError("only http and https URLs are supported")
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")

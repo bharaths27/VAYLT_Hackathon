@@ -8,6 +8,7 @@ digest-bound approval, like every other plan.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,6 +51,12 @@ def _validate() -> None:
 
 
 _validate()
+
+
+def voice_presets_enabled() -> bool:
+    """ENGRAM_VOICE_PRESETS: on unless it is 0, false, no or off. The one reading of the setting, used by
+    the HTTP API (engram/api.py) and by VoiceIntegration alike."""
+    return os.environ.get("ENGRAM_VOICE_PRESETS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def register_presets(engine: Any) -> None:

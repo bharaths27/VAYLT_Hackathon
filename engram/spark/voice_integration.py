@@ -5,6 +5,11 @@
 - A final transcript that selects a preset becomes an ordinary Engine proposal: Engine.propose
   with the preset's canonical request text, so the refusal rules, the checker and the
   digest-bound approval all apply. This module never approves and never runs a plan.
+- The memory bundle a partial prefetched for that request is the proposal's bundle: the final
+  does not retrieve it again while the memory-context version is unchanged (the gate re-reads it
+  after every wait), and retrieves it once if memory changed. Only object freshness in it, which
+  is computed from the clock, can be older, by less than the gate's TTL; the checker reads memory
+  itself, at the proposal and again at approval.
 - A deferred preset ("open the claw after calibration finishes") becomes a "When <event>,
   <task>" commitment through Engine.command, the existing prospective path. When the trigger
   fires, the engine proposes it and a person still approves it.
@@ -19,13 +24,25 @@ from __future__ import annotations
 from typing import Any, Hashable
 
 from ..engine import Engine
+from ..memory import MemoryBundle
 from ..planner import refusal
 from ..skills import APPROVED
 from .audio_windows import AudioOverflow, LiveTranscriber
-from .presets import PRESETS, register_presets
-from .voice import Classifier, GateResult, SpeculationGate
+from .intent_client import IntentDecision
+from .presets import PRESETS, register_presets, voice_presets_enabled
+from .voice import Classifier, GateResult, Prediction, SpeculationGate
 
 ACTING = ("propose", "schedule")   # gate actions that lead to an engine proposal, now or when a trigger fires
+
+
+def _presets_off(text: str, partial: bool) -> IntentDecision:
+    """The classifier while voice presets are turned off: nothing is a preset, and no model is asked."""
+    return IntentDecision(None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, model="presets-off")
+
+
+def _memory(prepared: Prediction | None) -> dict[str, Any] | None:
+    """The memory bundle prefetched for what is being prepared, if it is there yet."""
+    return prepared.bundle.to_dict() if prepared is not None and prepared.bundle is not None else None
 
 
 def memory_version(engine: Engine) -> Hashable:
@@ -46,9 +63,18 @@ def memory_version(engine: Engine) -> Hashable:
 
 class VoiceIntegration:
     def __init__(self, engine: Engine, classifier: Classifier, **gate_options: Any):
+        """With ENGRAM_VOICE_PRESETS off (read as engram/api.py reads it), no preset is registered, the
+        intent model is never asked, and nothing but a stop is acted on.
+
+        Pass on_prediction=... (a quick, thread-safe callable, for example one that queues a call to
+        pump() on the owner's event loop) to hear, from the gate's worker thread, the moment a
+        prediction lands; then call pump() on the thread that owns the database to prefetch its
+        memory bundle before the speaker has finished."""
         self.engine = engine
-        register_presets(engine)
-        self.gate = SpeculationGate(classifier, prefetch=self._prefetch,
+        self.presets_enabled = voice_presets_enabled()
+        if self.presets_enabled:
+            register_presets(engine)
+        self.gate = SpeculationGate(classifier if self.presets_enabled else _presets_off, prefetch=self._prefetch,
                                     context_version=lambda: memory_version(engine), **gate_options)
 
     @staticmethod
@@ -61,8 +87,16 @@ class VoiceIntegration:
         """
         return refusal(r.text, future_ok=(r.action == "schedule"))
 
-    def _prefetch(self, text: str) -> dict[str, Any]:
-        return self.engine.memory.retrieve_memory_bundle(text, self.engine.skills.approved_names()).to_dict()
+    def _prefetch(self, request: str) -> MemoryBundle:
+        """Exactly the retrieval Engine.propose(request) would make, so the proposal can use it."""
+        return self.engine.memory.retrieve_memory_bundle(request, self.engine.skills.approved_names())
+
+    def pump(self) -> dict[str, Any]:
+        """On the owner thread, after on_prediction fired: prefetch the memory bundle of the prediction that
+        just landed. Returns what is being prepared, as on_partial does."""
+        prepared = self.gate.pump()
+        return {"kind": "partial", "status": "pumped", "preparing": prepared.decision.preset if prepared else None,
+                "memory": _memory(prepared)}
 
     def on_partial(self, utterance: int, revision: int, text: str) -> dict[str, Any]:
         r = self.gate.on_partial(utterance, revision, text)
@@ -70,22 +104,25 @@ class VoiceIntegration:
             return {"kind": "stop", "heard": r.text, "state": self.engine.stop()}
         prepared = self.gate.prepared()
         return {"kind": "partial", "status": r.action, "heard": r.text,
-                "preparing": prepared.decision.preset if prepared else None,
-                "memory": prepared.bundle if prepared else None}
+                "preparing": prepared.decision.preset if prepared else None, "memory": _memory(prepared)}
 
     def on_final(self, utterance: int, revision: int, text: str) -> dict[str, Any]:
         r = self.gate.on_final(utterance, revision, text)
         base = {"heard": r.text, "utterance": r.utterance, "revision": r.revision}
         if r.action == "stop":
             return {"kind": "stop", **base, "state": self.engine.stop()}
+        if not self.presets_enabled:
+            return {"kind": "none", **base, "reason": "Voice presets are turned off (ENGRAM_VOICE_PRESETS)."}
         if r.action in ACTING:
             why = self._precheck(r)
             if why:
                 return {"kind": "none", **base, "reason": why}
         if r.action == "propose":
             preset = PRESETS[r.preset]
-            return {**self.engine.command(preset.request, who="voice"), **base, "preset": preset.name,
-                    "reused_prediction": r.reused}
+            # r.bundle was retrieved for preset.request at the memory version the gate has just re-read, so the
+            # proposal uses it instead of retrieving it again.
+            out = self.engine.command(preset.request, who="voice", bundle=r.bundle)
+            return {**out, **base, "preset": preset.name, "reused_prediction": r.reused}
         if r.action == "schedule":
             out = self.engine.command(r.commitment, who="voice")
             if out.get("kind") != "scheduled":

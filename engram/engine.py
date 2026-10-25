@@ -23,7 +23,7 @@ from .executor import Executor
 from .hashes import hash_models
 from .heard import record_heard
 from .ids import digest, new_id
-from .memory import Memory
+from .memory import Memory, MemoryBundle
 from .planner import PlanResult, RulePlanner, find_zone, refusal, targets_in
 from .prospective import Prospective, normalize, parse_when
 from .recall import Recall, asks_question, is_memory_question
@@ -101,13 +101,14 @@ class Engine:
 
     # ---- commands --------------------------------------------------------
 
-    def command(self, text: str, who: str = "user") -> dict[str, Any]:
-        """One entry point for typed or spoken commands. What was said is kept as heard memory."""
-        result = self._command(text, who)
+    def command(self, text: str, who: str = "user", bundle: MemoryBundle | None = None) -> dict[str, Any]:
+        """One entry point for typed or spoken commands. What was said is kept as heard memory.
+        bundle: as for propose(), if the command proposes."""
+        result = self._command(text, who, bundle)
         result["heard_id"] = record_heard(self.conn, text.strip(), who, result)
         return result
 
-    def _command(self, text: str, who: str) -> dict[str, Any]:
+    def _command(self, text: str, who: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
         # A stop wins before anything else (it is still recorded as heard by command()).
         if STOP_WORDS.search(text):
             return {"kind": "stopped", **self.stop()}
@@ -133,9 +134,12 @@ class Engine:
             src = self.memory.add_source(f"Future task from {who}", stripped, kind="spoken", origin=who)
             task_id, created = self.prospective.add(trigger, request, src)
             return {"kind": "scheduled", "task_id": task_id, "created": created, "trigger": trigger, "request": request}
-        return {"kind": "proposal", **self.propose(stripped)}
+        return {"kind": "proposal", **self.propose(stripped, bundle=bundle)}
 
-    def propose(self, request: str) -> dict[str, Any]:
+    def propose(self, request: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
+        """bundle: the memory bundle for this request, if the caller has already retrieved it and memory has not
+        changed since (voice presets prefetch it while the user is still speaking). Without one, or with one
+        retrieved for another request, it is retrieved here."""
         episode_id = new_id("ep")
         why = refusal(request)
         if why:
@@ -143,7 +147,8 @@ class Engine:
             self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", why)
             return {"operation_id": episode_id, "status": "refused", "reason": why}
 
-        bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
+        if bundle is None or bundle.goal != request:
+            bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
         targets = targets_in(request, self.memory)
         zone = find_zone(request, self.zones)
         fixed = self.fixed_requests.get(normalize(request))

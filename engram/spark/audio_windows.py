@@ -1,6 +1,9 @@
 """Audio for partial transcripts: a bounded PCM buffer and an optional local whisper.cpp client.
 
-PcmWindow keeps every sample of the current utterance, in order, up to a maximum duration.
+PcmWindow keeps every sample of the current utterance, in order, up to a maximum duration,
+in one buffer of exactly max_bytes allocated up front and written in place: its memory is
+O(max_bytes) whatever the chunk sizes, and a chunk's size is checked before anything is read
+from it, so an oversized chunk is refused without being copied.
 It never drops the start to make room: the first word may be "don't". When the window is
 full, append() raises AudioOverflow and the utterance is invalid: the window refuses all
 further audio AND every snapshot() until reset(), so nothing can transcribe a clipped
@@ -8,7 +11,9 @@ utterance (the words cut off could be "no, don't"); it must be said again. snaps
 returns a 16 kHz mono 16-bit WAV of everything so far, ready for a partial transcript.
 seal() ends the utterance for its final transcript: the audio is captured atomically and
 any later append() is refused (WindowSealed); audio refused before the final is decided
-(finalize()) makes the utterance invalid too.
+(finalize()) makes the utterance invalid too. So does every other refused chunk, whatever
+the reason (wrong type or sample format, odd length, wrong sequence number, after the seal):
+the audio has a hole, so it is never transcribed, whatever the producer appends next.
 
 WhisperServerClient talks to a resident whisper.cpp server (its HTTP server example,
 POST /inference) on this machine only: the URL must be a loopback IP literal, no proxy is
@@ -32,6 +37,7 @@ from ._http import Cancelled, CancelToken
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2          # bytes per sample: signed 16-bit little endian
+_PCM_FORMATS = ("B", "b", "c", "h", "<h", "=h")   # memoryview formats taken as PCM: raw bytes or int16
 CHANNELS = 1
 DEFAULT_MAX_S = 20.0
 MAX_ALLOWED_S = 120.0
@@ -47,8 +53,9 @@ class WindowSealed(AudioOverflow):
     next utterance."""
 
 
-class OutOfOrder(ValueError):
-    """A chunk arrived with the wrong sequence number."""
+class OutOfOrder(AudioOverflow, ValueError):
+    """A chunk arrived with the wrong sequence number: audio is missing, late or repeated, so the utterance
+    is not whole (until reset()) and must be said again; the missing audio could be "don't"."""
 
 
 def wav_bytes(pcm: bytes) -> bytes:
@@ -87,17 +94,23 @@ class PcmWindow:
         self.max_bytes = int(max_seconds * SAMPLE_RATE) * SAMPLE_WIDTH
         self._lock = threading.Lock()
         self._generation = 0
+        self._buf = bytearray(self.max_bytes)   # all of an utterance's audio, written in place: O(max_bytes)
         self.reset()
 
     def reset(self) -> None:
         """Start a new utterance. A seal of the previous one keeps what it recorded."""
         with self._lock:
-            self._chunks: list[bytes] = []
-            self._size = 0
+            self._size = 0           # bytes of self._buf in use
             self._next_seq = 0
             self._full = False
+            self._refused = False    # a chunk was refused, for any reason: the utterance is not whole
             self._seal: SealedUtterance | None = None
             self._generation += 1
+
+    def _whole(self) -> bool:
+        """(lock held) No chunk of this utterance was refused (overflow, out of order, after the seal, or
+        any other reason)."""
+        return not self._refused
 
     @property
     def generation(self) -> int:
@@ -107,56 +120,96 @@ class PcmWindow:
 
     def seal(self, generation: int | None = None) -> SealedUtterance:
         """End the utterance and capture its final audio, atomically. Raises AudioOverflow (not final) if
-        the utterance overflowed, or if the window has moved on to another utterance than `generation`."""
+        the utterance is not whole, or if the window has moved on to another utterance than `generation`."""
         with self._lock:
-            if generation is not None and generation != self._generation:
-                raise AudioOverflow("the window moved on to another utterance before this one was finished")
-            if self._full or (self._seal is not None and self._seal._clipped):
-                raise AudioOverflow("this utterance is not whole; it must be said again, not transcribed")
+            self._check(generation)
             if self._seal is None:
-                self._seal = SealedUtterance(wav_bytes(b"".join(self._chunks)), self._generation)
+                self._seal = SealedUtterance(wav_bytes(self._buf[:self._size]), self._generation)
             return self._seal
 
     def finalize(self, sealed: SealedUtterance) -> bool:
-        """Decide, once: is the sealed audio still the whole utterance? False if audio for it was refused
-        after the seal. A decision stands; audio arriving later is refused but changes nothing."""
+        """Decide, once: is the sealed audio the whole utterance, and is it still the window's current seal?
+        False if audio for it was refused after the seal, or if the window has moved on (reset()) since:
+        audio meant for it may then have gone to the next utterance. A decision stands; audio arriving
+        later is refused but changes nothing."""
         with self._lock:
             if sealed._decided is None:
-                sealed._decided = not sealed._clipped
+                sealed._decided = sealed is self._seal and not sealed._clipped
             return sealed._decided
+
+    def _check(self, generation: int | None) -> None:
+        """(lock held) The one check for every read of, and decision about, an utterance: it must be the
+        utterance the window holds (`generation`; None means whichever it holds now) and whole. Raises
+        AudioOverflow if not. Callers run it in the same critical section as the read itself."""
+        if generation is not None and generation != self._generation:
+            raise AudioOverflow("the window moved on to another utterance")
+        if not self._whole():
+            raise AudioOverflow("this utterance is not whole; it must be said again, not transcribed")
 
     def append(self, pcm: bytes, seq: int | None = None) -> None:
         """Add the next chunk. When seq is given it must be 0, 1, 2, ... in order.
 
         An empty chunk is checked and uses up its sequence number like any other, but stores
         nothing, so a stream of empty keep-alive chunks cannot grow the window past its bound.
+
+        Any refused chunk, whatever the reason, leaves the utterance not whole until reset(), before
+        the error is raised: a producer that catches it and carries on can never get a transcript of
+        audio with a hole in it. Every check lives in _admit(), so a new one cannot skip this.
         """
+        with self._lock:
+            try:
+                chunk = self._admit(pcm, seq)
+            except BaseException:
+                self._refused = True
+                if self._seal is not None and self._seal._decided is None:
+                    self._seal._clipped = True     # a final being made would miss this audio: not final
+                raise
+            end = self._size + len(chunk)          # within max_bytes: _admit() checked it before any copy
+            self._buf[self._size:end] = chunk
+            self._size = end
+            self._next_seq += 1
+
+    def _admit(self, pcm, seq: int | None):  # noqa: ANN001, ANN202
+        """(lock held) Every check a chunk must pass; returns it as bytes or a byte view, to be copied in
+        place. Its size is checked before anything is read from it, so an oversized chunk is refused
+        without being copied. Anything raised here voids the utterance (see append())."""
+        if self._seal is not None:
+            raise WindowSealed("this utterance has ended; audio for it is refused (reset() starts the next)")
+        if self._full:
+            raise AudioOverflow("the window is full; end the utterance and reset()")
+        if self._refused:
+            raise AudioOverflow("an earlier chunk of this utterance was refused; end it and reset()")
         if not isinstance(pcm, (bytes, bytearray, memoryview)):
             raise TypeError("pcm must be bytes")
-        pcm = bytes(pcm)
-        if len(pcm) % SAMPLE_WIDTH:
+        if isinstance(pcm, memoryview) and pcm.format not in _PCM_FORMATS:
+            raise TypeError(f"pcm must be raw bytes or 16-bit samples, not {pcm.format!r}")
+        nbytes = pcm.nbytes if isinstance(pcm, memoryview) else len(pcm)   # measured, never copied
+        if nbytes % SAMPLE_WIDTH:
             raise ValueError("a chunk must hold whole 16-bit samples")
-        with self._lock:
-            if self._seal is not None:
-                if self._seal._decided is None:
-                    self._seal._clipped = True     # the final being made would miss this audio: not final
-                raise WindowSealed("this utterance has ended; audio for it is refused (reset() starts the next)")
-            if self._full:
-                raise AudioOverflow("the window is full; end the utterance and reset()")
-            if seq is not None and seq != self._next_seq:
-                raise OutOfOrder(f"expected chunk {self._next_seq}, got {seq}")
-            if self._size + len(pcm) > self.max_bytes:
-                # Refuse from here on: accepting a later, smaller chunk would leave a hole mid-utterance.
-                self._full = True
-                raise AudioOverflow(f"utterance longer than {self.max_bytes // (SAMPLE_RATE * SAMPLE_WIDTH)} s")
-            if pcm:
-                self._chunks.append(pcm)
-                self._size += len(pcm)
-            self._next_seq += 1
+        if seq is not None:
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                raise TypeError("seq must be an int")
+            if seq != self._next_seq:
+                raise OutOfOrder(f"expected chunk {self._next_seq}, got {seq}; the utterance is not whole")
+        if self._size + nbytes > self.max_bytes:
+            self._full = True          # refuse from here on: a later, smaller chunk would leave a hole
+            raise AudioOverflow(f"utterance longer than {self.max_bytes // (SAMPLE_RATE * SAMPLE_WIDTH)} s")
+        if isinstance(pcm, memoryview):     # it fits: only now is it read, and at most the room left
+            return pcm.cast("B") if pcm.c_contiguous else pcm.tobytes()
+        return pcm
 
     @property
     def duration_s(self) -> float:
+        """How much audio the window holds now, for display. A read on behalf of one utterance uses
+        duration(generation)."""
         with self._lock:
+            return self._size / (SAMPLE_RATE * SAMPLE_WIDTH)
+
+    def duration(self, generation: int | None = None) -> float:
+        """Seconds of audio of utterance `generation` (None: the one held now). Raises AudioOverflow if the
+        window holds another utterance, or this one is not whole."""
+        with self._lock:
+            self._check(generation)
             return self._size / (SAMPLE_RATE * SAMPLE_WIDTH)
 
     @property
@@ -166,21 +219,22 @@ class PcmWindow:
             return self._full
 
     def intact(self, generation: int) -> bool:
-        """Is utterance `generation` still the one held, and whole (no overflow, no audio refused)?"""
+        """Is utterance `generation` still the one held, and whole (no overflow, no chunk out of order,
+        no audio refused)?"""
         with self._lock:
-            return (generation == self._generation and not self._full
-                    and not (self._seal is not None and self._seal._clipped))
+            return generation == self._generation and self._whole()
 
-    def snapshot(self) -> bytes:
-        """A complete WAV file of everything heard so far, from the very first sample.
+    def snapshot(self, generation: int | None = None) -> bytes:
+        """A complete WAV file of everything heard so far of utterance `generation` (None: the one held
+        now), from the very first sample.
 
-        Raises AudioOverflow once the utterance is not whole (it overflowed, or audio for it was
-        refused after its seal): what was kept is only part of what was said, and must never be
-        transcribed or acted on."""
+        Raises AudioOverflow if the window holds another utterance (checked with the read, so a reset in
+        between can never hand back the next utterance's audio), or once this one is not whole (it
+        overflowed, a chunk was refused, or audio for it was refused after its seal): what was kept is
+        only part of what was said, and must never be transcribed or acted on."""
         with self._lock:
-            if self._full or (self._seal is not None and self._seal._clipped):
-                raise AudioOverflow("this utterance is not whole; it must be said again, not transcribed")
-            pcm = b"".join(self._chunks)
+            self._check(generation)
+            pcm = self._buf[:self._size]           # copied under the lock: a reset cannot tear it
         return wav_bytes(pcm)
 
 
@@ -207,7 +261,11 @@ class WhisperServerClient:
             host = ipaddress.ip_address(parts.hostname or "")
         except ValueError:
             raise ValueError("the whisper server URL must use a loopback IP such as 127.0.0.1") from None
-        if parts.scheme != "http" or not host.is_loopback or parts.username or parts.password \
+        try:
+            port = parts.port   # an explicit port in 1-65535: a missing one or port 0 would mean port 80
+        except ValueError:
+            port = None
+        if parts.scheme != "http" or not host.is_loopback or not port or parts.username or parts.password \
                 or parts.path not in ("", "/") or parts.query or parts.fragment:
             raise ValueError("the whisper server URL must be http://<loopback IP>:<port>")
         if not 0.0 < timeout_s <= 30.0:
@@ -282,6 +340,9 @@ class LiveTranscriber:
     it with poll(), on the caller's own thread (so the gate's database work stays there).
 
     finish() is called at end of speech. Before it transcribes the whole utterance it:
+    - seals the window, before anything else that can take time: audio arriving after that is
+      refused, and if it arrives while the final is being made, the utterance is not final (it
+      must be said again);
     - stops partials: none is started, and none is handed out, after end of speech;
     - drops a partial that was not taken yet;
     - cancels the partial request in flight: its connection is closed at once, so this client
@@ -300,7 +361,8 @@ class LiveTranscriber:
     asks for a repeat (VoiceIntegration.finish_live does) and nothing is proposed.
 
     A transcriber serves the utterance the window holds when it is made; call finish() once the
-    audio producer has delivered all of it.
+    audio producer has delivered all of it. It has at most one partial worker: start() it once, or
+    not at all, before finish().
     """
 
     def __init__(self, client: WhisperServerClient, window: PcmWindow, min_audio_s: float = 0.5,
@@ -321,8 +383,13 @@ class LiveTranscriber:
         self.partials = 0       # partial requests started
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._loop, name="spark-partial-stt", daemon=True)
-        self._thread.start()
+        """Start the one partial worker. Single use: a second start(), or one after finish(), raises
+        RuntimeError, so there is never a worker that finish() does not cancel and join."""
+        with self._lock:
+            if self._thread is not None or self._ended.is_set():
+                raise RuntimeError("a LiveTranscriber starts once, before finish(); make a new one per utterance")
+            self._thread = threading.Thread(target=self._loop, name="spark-partial-stt", daemon=True)
+            self._thread.start()
 
     def poll(self) -> tuple[int, str] | None:
         """The newest partial (revision, text) not taken yet, or None. Never one after finish(), and
@@ -332,36 +399,41 @@ class LiveTranscriber:
             return None if self._ended.is_set() or not self._window.intact(self._generation) else p
 
     def finish(self, join_s: float = 1.0) -> str:
-        """End of speech: stop and cancel partials, then make the final transcript.
+        """End of speech: seal the window, stop and cancel partials, then make the final transcript.
 
-        The window is sealed first: the transcript is of exactly the audio that had arrived, and any
-        later append is refused. Raises AudioOverflow (not final) if the utterance overflowed, if the
-        window moved on to another utterance, or if audio for this one was refused while the final
-        was being made. Never returns a transcript of part of an utterance."""
+        The window is sealed first, before anything that can take time (cancelling the partial in
+        flight included): the transcript is of exactly the audio that had arrived when finish() was
+        called, and any later append is refused. Raises AudioOverflow (not final) if the utterance
+        overflowed, if the window moved on to another utterance, or if audio for this one was refused
+        while the final was being made. Never returns a transcript of part of an utterance."""
         with self._lock:
-            self._ended.set()      # from now on: no new partial, and poll() hands out nothing
-            token = self._token
-        if token is not None:
-            token.cancel()
+            self._ended.set()      # from now on: no new partial or worker, and poll() hands out nothing
+            token, worker = self._token, self._thread
         try:
-            sealed = self._window.seal(self._generation)
+            try:
+                sealed = self._window.seal(self._generation)   # first: no audio from after the end of speech
+            finally:
+                if token is not None:
+                    token.cancel()                             # then the partial, even if the seal refused
             text = speech_only(self._final_client.transcribe(sealed.audio))
             if not self._window.finalize(sealed):
                 raise AudioOverflow("audio for this utterance arrived while its final was made; it must be said again")
             return text
         finally:
-            if self._thread is not None:
-                self._thread.join(join_s)
+            if worker is not None:
+                worker.join(join_s)
 
     def _loop(self) -> None:
         heard = 0.0
         while not self._ended.is_set():
-            if not self._window.intact(self._generation):   # not whole, or another utterance's audio now
+            try:   # every read names this utterance, so the next one's audio is never sent as its partial
+                dur = self._window.duration(self._generation)
+                if dur < self._min_audio_s or dur <= heard:
+                    self._ended.wait(self._poll_s)
+                    continue
+                wav = self._window.snapshot(self._generation)
+            except AudioOverflow:          # not whole, or the window holds another utterance: no more partials
                 break
-            dur = self._window.duration_s
-            if dur < self._min_audio_s or dur <= heard:
-                self._ended.wait(self._poll_s)
-                continue
             token = CancelToken()
             with self._lock:
                 if self._ended.is_set():
@@ -369,12 +441,10 @@ class LiveTranscriber:
                 self._token = token
                 self.partials += 1
             try:
-                text = speech_only(self._client.transcribe(self._window.snapshot(), cancel=token))
+                text = speech_only(self._client.transcribe(wav, cancel=token))
             except Cancelled:
                 with self._lock:
                     self.cancelled += 1
-                break
-            except AudioOverflow:      # snapshot() refuses an overflowed utterance: no more partials
                 break
             except WhisperError:
                 text = ""

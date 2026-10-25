@@ -31,7 +31,7 @@ def make_gate(fake, spawn, clock, ctx=None, prefetch=None, **kw):
 
 def test_partials_only_prepare_and_never_return_a_proposal(fake, spawn, clock):
     prefetched = []
-    gate = make_gate(fake, spawn, clock, prefetch=lambda text: prefetched.append(text) or {"goal": text})
+    gate = make_gate(fake, spawn, clock, prefetch=lambda request: prefetched.append(request) or {"goal": request})
     for rev, text in enumerate(["Open...", "Open the", "Open the claw", "Open the claw"]):
         r = gate.on_partial(1, rev, text)
         spawn.run_all()
@@ -39,7 +39,7 @@ def test_partials_only_prepare_and_never_return_a_proposal(fake, spawn, clock):
     assert not hasattr(gate, "engine")
     p = gate.prepared()
     assert p.decision.preset == "open_gripper" and p.key.text == "Open the claw"
-    assert p.bundle == {"goal": "Open the claw"} and prefetched == ["Open the claw"]
+    assert p.bundle == {"goal": "Open the gripper"} and prefetched == ["Open the gripper"]   # the preset's request
     assert all(partial for _, partial in fake.calls)
 
 
@@ -78,41 +78,58 @@ def test_final_equal_to_prepared_text_reuses_the_prediction(fake, spawn, clock):
     assert len(fake.calls) == 1 and gate.stats.requests == 1 and gate.stats.reused == 1
 
 
-def test_a_below_threshold_partial_answer_is_asked_again_at_the_final(spawn, clock):
-    # Measured on the real model: "Look around." scored 0.47 as a partial and 0.63-0.66 as a final.
+def test_a_below_threshold_answer_for_the_unchanged_text_is_reused_not_asked_again(spawn, clock):
+    # The intent client asks the same question for a partial and a final of the same text, so the
+    # partial's answer IS the final's answer: reused as it is, even below threshold.
     calls = []
 
     def model(text, partial):
         calls.append((text, partial))
-        return decision("look_around", confidence=0.47 if partial else 0.65)
+        return decision("look_around", confidence=0.47)
 
     gate = make_gate(model, spawn, clock)
     gate.on_partial(1, 0, "Look around.")
     spawn.run_all()
     assert gate.prepared() is None                      # below threshold: nothing prepared
     r = gate.on_final(1, 1, "Look around.")
-    assert r.action == "propose" and r.preset == "look_around" and not r.reused
-    assert calls == [("Look around.", True), ("Look around.", False)]   # exactly one extra call
-    assert gate.stats.reused == 0
+    assert r.action == "none" and r.reused              # no action, and no second request
+    assert calls == [("Look around.", True)]
+    assert gate.stats.reused == 1
 
 
-@pytest.mark.parametrize("partial_answer", [
+@pytest.mark.parametrize("answer", [
     decision(None, confidence=0.9),                          # nothing to do
-    decision("open_gripper", ready=0.2),                     # not ready yet
+    decision("open_gripper", ready=0.2),                     # not ready
     decision("open_gripper", directed=0.2),                  # not addressed to the robot
 ], ids=["no preset", "not ready", "not directed"])
-def test_no_action_partial_answers_are_never_reused(spawn, clock, partial_answer):
+def test_an_unchanged_non_actionable_transcript_costs_exactly_one_request(spawn, clock, answer):
     calls = []
 
     def model(text, partial):
         calls.append(partial)
-        return partial_answer if partial else decision("open_gripper")
+        return answer
 
     gate = make_gate(model, spawn, clock)
     gate.on_partial(1, 0, "Open the claw")
     spawn.run_all()
-    assert gate.on_final(1, 1, "Open the claw").action == "propose"
-    assert calls == [True, False]
+    r = gate.on_final(1, 1, "Open the claw")
+    assert r.action == "none" and r.reused
+    assert calls == [True]                                   # exactly one classifier call
+
+
+def test_a_final_with_more_words_than_the_prediction_is_asked_again(spawn, clock):
+    calls = []
+
+    def model(text, partial):
+        calls.append(text)
+        return decision("open_gripper", ready=0.2) if text == "Open the" else decision("open_gripper")
+
+    gate = make_gate(model, spawn, clock)
+    gate.on_partial(1, 0, "Open the")
+    spawn.run_all()
+    r = gate.on_final(1, 1, "Open the claw")                 # more words can change the meaning
+    assert r.action == "propose" and not r.reused
+    assert calls == ["Open the", "Open the claw"]
 
 
 def test_final_that_differs_is_classified_as_a_final(fake, spawn, clock):
@@ -279,16 +296,16 @@ def test_context_and_prefetch_run_only_on_the_callers_thread():
         seen.append(("context", threading.get_ident()))
         return 0
 
-    def prefetch(text):
+    def prefetch(request):
         seen.append(("prefetch", threading.get_ident()))
-        return {"goal": text}
+        return {"goal": request}
 
     gate = SpeculationGate(classifier, prefetch=prefetch, context_version=ctx)   # real worker threads
     for rev, text in enumerate(["Open", "Open the", "Open the claw"]):
         gate.on_partial(1, rev, text)
     assert gate.wait_idle(5)
     gate.on_partial(1, 3, "Open the claw")
-    assert gate.prepared().bundle == {"goal": "Open the claw"}
+    assert gate.prepared().bundle == {"goal": "Open the gripper"}
     assert gate.on_final(1, 4, "Open the claw").action == "propose"
     assert workers and me not in workers                    # the model was asked off-thread
     assert {kind for kind, _ in seen} == {"context", "prefetch"} and {t for _, t in seen} == {me}
@@ -462,10 +479,10 @@ def test_stop_ends_a_final_that_is_waiting_for_the_model():
 def test_stop_during_the_finals_prefetch_discards_the_final(spawn, clock, partial_first):
     entered, release = threading.Event(), threading.Event()
 
-    def slow_prefetch(text):
+    def slow_prefetch(request):
         entered.set()
         assert release.wait(5)
-        return {"goal": text}
+        return {"goal": request}
 
     fake = FakeIntent()
     gate = SpeculationGate(fake, prefetch=slow_prefetch, clock=clock, spawn=spawn)
@@ -483,16 +500,36 @@ def test_stop_during_the_finals_prefetch_discards_the_final(spawn, clock, partia
     assert len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("meanwhile,action", [("stop", "ignored"), ("newer utterance", "none")])
+def test_a_final_voided_while_the_model_answers_prefetches_nothing(spawn, clock, meanwhile, action):
+    fetched = []
+    fake = FakeIntent()
+    fake.hold()
+    gate = SpeculationGate(fake, prefetch=lambda request: fetched.append(request) or {"goal": request},
+                           clock=clock, spawn=spawn)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 0, "Open the claw")))
+    t.start()
+    assert fake.entered.acquire(timeout=5)               # the final is waiting for the model's answer
+    if meanwhile == "stop":
+        assert gate.on_partial(1, 1, "stop").action == "stop"
+    else:
+        assert gate.on_partial(2, 0, "Close the claw").action == "queued"   # the next utterance begins
+    fake.release.set()                                   # an answer that would be actionable arrives
+    t.join(5)
+    assert out["r"].action == action and fetched == []   # voided, and nothing was prefetched for it
+
+
 @pytest.mark.parametrize("partial_first", [True, False], ids=["reused prediction", "fresh final"])
 @pytest.mark.parametrize("advance,expected", [(0.0, "propose"), (2.5, "clarify")], ids=["in time", "expired"])
 def test_a_prediction_that_expires_during_the_prefetch_is_not_acted_on(spawn, clock, partial_first, advance,
                                                                         expected):
     entered, release = threading.Event(), threading.Event()
 
-    def slow_prefetch(text):
+    def slow_prefetch(request):
         entered.set()
         assert release.wait(5)
-        return {"goal": text}
+        return {"goal": request}
 
     fake = FakeIntent()
     gate = SpeculationGate(fake, prefetch=slow_prefetch, clock=clock, spawn=spawn, ttl_s=2.0)
@@ -592,3 +629,79 @@ def test_thresholds_are_explicitly_experimental():
     assert "EXPERIMENTAL" in Thresholds.__doc__
     th = Thresholds()
     assert th.block < min(th.preset, th.ready, th.directed)
+
+
+# ---- a prediction that lands later is announced; the owner prefetches it --------------------------------
+
+
+def test_a_prediction_that_lands_later_is_announced_and_pump_prefetches_it():
+    me = threading.get_ident()
+    landed, fetched = threading.Event(), []
+    fake = FakeIntent()
+    fake.hold()
+
+    def prefetch(request):
+        fetched.append((request, threading.get_ident()))
+        return {"goal": request}
+
+    gate = SpeculationGate(fake, prefetch=prefetch, on_prediction=landed.set)    # real worker threads
+    gate.on_partial(1, 0, "Open the claw")                      # dispatched; the answer is not there yet
+    assert fetched == [] and not landed.is_set()
+    fake.release.set()                                          # it lands after on_partial returned
+    assert landed.wait(2)                                       # the owner is told, from the worker...
+    assert fetched == []                                        # ...which never fetches anything itself
+    gate.pump()                                                 # the owner prefetches, on its own thread
+    assert fetched == [("Open the gripper", me)] and gate.prepared().bundle == {"goal": "Open the gripper"}
+    gate.pump()
+    assert len(fetched) == 1                                    # nothing left to do: fetched once
+
+
+def test_a_dropped_answer_is_not_announced(fake, spawn, clock):
+    told = []
+    gate = make_gate(fake, spawn, clock, on_prediction=lambda: told.append(1))
+    gate.on_partial(1, 0, "Open the claw")
+    gate.on_partial(1, 1, "Open the claw after")               # the first answer will be stale
+    spawn.run_next()
+    assert told == [] and gate.stats.stale_dropped == 1        # dropped, so nothing to announce
+    spawn.run_all()
+    assert told == [1]                                          # the current answer is announced
+
+
+# ---- a rejection is scoped to its own utterance ----------------------------------------------------------
+
+
+def test_a_late_rejection_of_an_older_utterance_leaves_the_newer_one_alone(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Close the claw")
+    spawn.run_all()
+    gate.on_partial(2, 0, "Open the claw")                     # utterance 2 has begun
+    spawn.run_all()
+    assert gate.prepared().decision.preset == "open_gripper"
+    gate.reject(1)                                              # utterance 1's overflow, reported late
+    assert gate.prepared().decision.preset == "open_gripper"   # 2's speculation is untouched
+    r = gate.on_final(2, 1, "Open the claw")
+    assert r.action == "propose" and r.reused
+    assert gate.on_final(1, 9, "Close the claw").action == "ignored"
+
+
+def test_a_rejection_voids_its_own_utterance_and_a_stop_still_voids_everything(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    gate.reject(1)
+    assert gate.prepared() is None
+    assert gate.on_final(1, 1, "Open the claw").action == "ignored"
+    assert gate.on_partial(2, 0, "Open the claw").action == "dispatched"   # the next one starts clean
+    spawn.run_all()
+    assert gate.on_partial(2, 1, "Open the claw, stop").action == "stop"   # a stop is still global
+    assert gate.on_final(2, 2, "Open the claw").action == "ignored"
+
+
+def test_pump_does_not_fetch_for_a_prediction_the_memory_has_moved_past(fake, spawn, clock):
+    ctx, fetched = Ctx(), []
+    gate = make_gate(fake, spawn, clock, ctx=ctx, prefetch=lambda request: fetched.append(request) or {"goal": request})
+    gate.on_partial(1, 0, "Open the claw")
+    spawn.run_all()                                             # the prediction lands
+    ctx.v += 1                                                  # then the memory changes
+    gate.pump()
+    assert fetched == [] and gate.prepared() is None            # stale: nothing fetched for it

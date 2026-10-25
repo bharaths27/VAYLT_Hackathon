@@ -51,6 +51,18 @@ def test_the_model_id_is_required_from_the_environment():
     assert c.model == MODEL
 
 
+@pytest.mark.parametrize("text", ["Look around.", "Open the", "Open the claw after calibration finishes"])
+def test_a_partial_and_a_final_of_the_same_text_ask_the_same_question(text):
+    # So a partial's answer is exactly the final's answer for that text, and the gate may reuse it as it
+    # is. (Measured: told "partial", the model scored "Look around." 0.47; told "final", 0.63-0.66.)
+    t = FakeTransport()
+    c = client(t)
+    c.classify(text, partial=True)
+    c.classify(text, partial=False)
+    assert t.sent[0][1] == t.sent[1][1]                      # byte-for-byte the same request body
+    assert c.request_body(text, True) == c.request_body(text, False)
+
+
 def test_request_shape_goes_to_the_fixed_official_endpoint():
     t = FakeTransport()
     c = IntentClient.from_env({"TYPESAFE_API_KEY": KEY, "TYPESAFE_INTENT_MODEL": MODEL,
@@ -60,7 +72,7 @@ def test_request_shape_goes_to_the_fixed_official_endpoint():
     assert url == ENDPOINT == "https://api.typesafe.ai/v1/systemone"
     assert headers["Authorization"] == f"Bearer {KEY}" and headers["Content-Type"] == "application/json"
     assert body["model"] == MODEL and body["questions"] == QUESTIONS
-    assert body["state"]["transcript"] == "Open the claw" and body["state"]["transcript_is_partial"] is True
+    assert body["state"]["transcript"] == "Open the claw" and body["state"]["transcript_is_partial"] is False
     assert set(QUESTIONS) == {"preset", "ready", "directed", "negated", "future", "correction"}
     assert QUESTIONS["preset"]["type"] == "choice" and QUESTIONS["negated"]["type"] == "noul"
     assert 0 < timeout_s <= 10

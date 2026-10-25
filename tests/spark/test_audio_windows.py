@@ -6,7 +6,9 @@ import socket
 import struct
 import threading
 import time
+import tracemalloc
 import wave
+from array import array
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import pytest
@@ -15,9 +17,10 @@ from engram.spark import _http
 from engram.planner import FUTURE_HINTS, NEGATION
 from engram.spark.audio_windows import (
     SAMPLE_RATE, SOUND_DESCRIPTORS, SOUND_WORDS, AudioOverflow, Cancelled, CancelToken, LiveTranscriber, OutOfOrder,
-    PcmWindow, WhisperError, WhisperServerClient, WindowSealed, speech_only,
+    PcmWindow, SAMPLE_WIDTH, WhisperError, WhisperServerClient, WindowSealed, speech_only,
 )
 from engram.spark.voice import CORRECTION, STOP_WORDS
+from spark_fakes import REJECTIONS, SAMPLES
 
 
 def pcm(*samples):
@@ -63,12 +66,11 @@ def test_overflow_never_drops_the_start_and_makes_the_utterance_invalid():
 def test_chunks_must_arrive_in_order_and_hold_whole_samples():
     w = PcmWindow()
     w.append(pcm(1), seq=0)
-    with pytest.raises(OutOfOrder):
-        w.append(pcm(3), seq=2)
     w.append(pcm(2), seq=1)
     with pytest.raises(ValueError):
         w.append(b"\x01")
-    assert read_wav(w.snapshot())[3] == pcm(1, 2)
+    with pytest.raises(AudioOverflow):
+        w.snapshot()                                            # a refused chunk voids the utterance too
 
 
 def test_empty_chunks_store_nothing_but_keep_their_sequence_number():
@@ -77,12 +79,14 @@ def test_empty_chunks_store_nothing_but_keep_their_sequence_number():
         w.append(b"", seq=i)
     for _ in range(10_000):
         w.append(b"")
-    assert w._chunks == [] and w.duration_s == 0
+    assert w.duration_s == 0
     w.append(pcm(1), seq=20_000)
-    with pytest.raises(OutOfOrder):
-        w.append(b"", seq=5)
     w.append(b"", seq=20_001)
-    assert len(w._chunks) == 1 and read_wav(w.snapshot())[3] == pcm(1)
+    assert w.duration_s == pytest.approx(1 / SAMPLE_RATE) and read_wav(w.snapshot())[3] == pcm(1)
+    with pytest.raises(OutOfOrder):
+        w.append(b"", seq=5)                                    # even an empty chunk out of order...
+    with pytest.raises(AudioOverflow):
+        w.snapshot()                                            # ...means the utterance is not whole
 
 
 def test_window_length_is_bounded():
@@ -102,6 +106,26 @@ def test_window_length_is_bounded():
 def test_whisper_client_refuses_anything_but_a_loopback_ip(url):
     with pytest.raises(ValueError):
         WhisperServerClient(url)
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:0", "http://[::1]:0", "http://127.0.0.1", "http://127.0.0.1:", "http://127.0.0.1:abc",
+    "http://127.0.0.1:65536",
+])
+def test_whisper_client_needs_an_explicit_real_port(url):
+    # port 0 or no port used to pass and then send the audio to port 80, where another local service may listen
+    with pytest.raises(ValueError):
+        WhisperServerClient(url)
+
+
+def test_a_connection_takes_the_default_port_only_when_none_is_given():
+    deadline = time.monotonic() + 5
+    assert _http._connection("http://127.0.0.1/x", deadline)[0].port == 80
+    assert _http._connection("https://127.0.0.1/x", deadline)[0].port == 443
+    assert _http._connection("http://127.0.0.1:8080/x", deadline)[0].port == 8080
+    for url in ("http://127.0.0.1:0/x", "https://127.0.0.1:0/x"):
+        with pytest.raises(ValueError):
+            _http._connection(url, deadline)   # was: port 0 silently became 80 / 443
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:8080", "http://127.0.0.1:8080/", "http://[::1]:9000"])
@@ -321,17 +345,25 @@ class _FakeWhisper:
         self.calls = []
         self.release = threading.Event()
         self.started = threading.Semaphore(0)
+        self.active = 0                                         # partial calls that have not returned
+        self._lock = threading.Lock()
 
     def transcribe(self, wav, cancel=None):
         if cancel is None:
             self.calls.append("final")
             return "[BLANK_AUDIO] Open the claw."
         self.calls.append("partial")
+        with self._lock:
+            self.active += 1
         self.started.release()
-        while not self.release.wait(0.005):
-            if cancel.cancelled:
-                raise Cancelled("cancelled")
-        return " Open the claw (wind) "
+        try:
+            while not self.release.wait(0.005):
+                if cancel.cancelled:
+                    raise Cancelled("cancelled")
+            return " Open the claw (wind) "
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 def test_partials_are_handed_out_by_poll_one_newest_at_a_time():
@@ -394,6 +426,97 @@ def test_no_partial_starts_after_end_of_speech_even_when_none_was_in_flight():
         _speech(window, 1.0)                                    # new audio after the end of speech: refused
     time.sleep(0.15)
     assert fake.calls.count('partial') == 1 and tr.cancelled == 0
+
+
+def test_a_second_start_makes_no_second_worker():
+    fake, window = _FakeWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.started.acquire(timeout=2)                      # its one worker's partial is in flight, held
+    with pytest.raises(RuntimeError, match="once"):
+        tr.start()
+    assert not fake.started.acquire(timeout=0.2)                # no second worker sent a partial
+    assert tr.finish() == "Open the claw." and tr.partials == 1 and tr.cancelled == 1
+    assert fake.active == 0 and fake.calls == ["partial", "final"]   # nothing still holds the server
+
+
+class _SlowCancelWhisper:
+    """Partials whose cancellation is held (inside cancel(), on the cancelling thread) until the test lets
+    it finish; the audio of every final is kept."""
+
+    def __init__(self):
+        self.in_flight, self.cancelling, self.let_cancel = threading.Event(), threading.Event(), threading.Event()
+        self.finals = []
+
+    def transcribe(self, wav, cancel=None):
+        if cancel is None:
+            self.finals.append(wav)
+            return "Open the claw."
+
+        def hold():
+            self.cancelling.set()
+            assert self.let_cancel.wait(5)
+
+        assert cancel._attach(hold)
+        self.in_flight.set()
+        while not cancel.cancelled:
+            time.sleep(0.005)
+        raise Cancelled("cancelled")
+
+
+def test_audio_after_the_end_of_speech_never_reaches_the_final_even_while_the_partial_is_cancelled():
+    fake, window = _SlowCancelWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    heard = window.snapshot()                                   # all of the utterance
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.in_flight.wait(2)                               # a partial is in flight
+    out = {}
+
+    def finish():
+        try:
+            out["text"] = tr.finish()
+        except AudioOverflow as e:
+            out["error"] = e
+
+    t = threading.Thread(target=finish)
+    t.start()
+    try:
+        assert fake.cancelling.wait(2)                          # finish() is inside the cancel, held there
+        with pytest.raises(WindowSealed):
+            _speech(window, 0.3)                                # the next utterance starting: refused
+    finally:
+        fake.let_cancel.set()
+        t.join(5)
+    assert fake.finals == [heard]                               # the final was sent this utterance and no more
+    assert "error" in out and "text" not in out                 # and audio arrived during it: not final
+    assert tr.cancelled == 1
+
+
+def test_a_seal_refused_at_the_end_of_speech_still_cancels_the_partial():
+    fake, window = _FakeWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.started.acquire(timeout=2)                      # a partial is in flight, held
+    with pytest.raises(ValueError):
+        window.append(bytes(1))                                 # half a sample: refused, the utterance is not whole
+    with pytest.raises(AudioOverflow):
+        tr.finish()                                             # the seal refuses: no final
+    assert tr.cancelled == 1 and fake.active == 0               # but the partial was cancelled all the same
+    assert fake.calls == ["partial"]
+
+
+def test_start_after_finish_is_refused():
+    fake, window = _FakeWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    assert tr.finish() == "Open the claw."                      # a final with no partials is fine
+    with pytest.raises(RuntimeError, match="once"):
+        tr.start()                                              # but the utterance is over
+    time.sleep(0.1)
+    assert fake.calls == ["final"] and tr.partials == 0
 
 
 # ---- whisper's noise tags: only known markers are dropped --------------------------------------------------------
@@ -587,21 +710,23 @@ def test_seal_captures_exactly_what_had_arrived_and_decides_once():
         PcmWindow().seal(generation=-1)                         # another utterance than the one held
 
 
-def test_partials_stop_when_the_window_moves_on_to_another_utterance():
+@pytest.mark.parametrize("next_s", [0.6, 0.1], ids=["next utterance long", "next utterance short"])
+def test_partials_stop_when_the_window_moves_on_to_another_utterance(next_s):
     fake, window = _FakeWhisper(), PcmWindow()
     fake.release.set()
     tr = LiveTranscriber(fake, window, poll_s=0.005)
     window.reset()                                              # this transcriber's utterance is gone
-    _speech(window, 0.6)                                        # audio of the next one
+    _speech(window, next_s)                                     # audio of the next one
     tr.start()
-    time.sleep(0.15)
+    tr._thread.join(0.5)
+    assert not tr._thread.is_alive()                            # it stops at once, whatever the next holds
     assert fake.calls == [] and tr.poll() is None               # never sent as this utterance's partial
 
 
 class _ClipsAtSnapshot(PcmWindow):
     """Stops being whole between the partial loop's check and its snapshot (the race, made certain)."""
 
-    def snapshot(self):
+    def snapshot(self, generation=None):
         raise AudioOverflow("clipped between the check and the snapshot")
 
 
@@ -615,3 +740,204 @@ def test_a_window_clipped_between_check_and_snapshot_ends_the_partials_cleanly(m
     tr.start()
     tr._thread.join(1.0)
     assert not tr._thread.is_alive() and crashed == [] and fake.calls == []
+
+
+# ---- a missing or misplaced chunk: the utterance is not whole -------------------------------------------------
+
+
+def test_an_out_of_order_chunk_is_a_kind_of_not_whole():
+    assert issubclass(OutOfOrder, AudioOverflow) and issubclass(OutOfOrder, ValueError)
+
+
+@pytest.mark.parametrize("arrival", [[0, 2, 3], [0, 2, 1, 3], [0, 1, 1, 2]], ids=["dropped", "reordered", "duplicated"])
+def test_an_out_of_order_chunk_makes_the_utterance_invalid_until_reset(arrival):
+    w = PcmWindow()
+    refused = []
+    for seq in arrival:                                         # a caller that catches the error and carries on
+        try:
+            w.append(pcm(seq + 1), seq=seq)
+        except (AudioOverflow, OutOfOrder) as e:
+            refused.append(type(e).__name__)
+    assert refused and refused[0] == "OutOfOrder"
+    first_bad = next(i for i, seq in enumerate(arrival) if seq != i)
+    assert len(refused) == len(arrival) - first_bad              # from the first bad chunk on, all refused
+    assert not w.intact(w.generation)
+    with pytest.raises(AudioOverflow):
+        w.snapshot()                                            # nothing with a hole in it is transcribed
+    with pytest.raises(AudioOverflow):
+        w.seal()                                                # and it can never be finalized
+    w.reset()                                                   # the next utterance starts clean
+    w.append(pcm(9), seq=0)
+    assert read_wav(w.snapshot())[3] == pcm(9)
+
+
+@pytest.mark.parametrize("arrival", [[0, 2, 3], [0, 2, 1, 3]], ids=["dropped", "reordered"])
+def test_an_utterance_with_a_missing_chunk_never_yields_a_final_transcript(arrival):
+    fake, window = _FakeWhisper(), PcmWindow()
+    fake.release.set()
+    for seq in arrival:
+        try:
+            window.append(pcm(*([1] * 8000)), seq=seq)          # 0.5 s of audio per chunk
+        except (AudioOverflow, OutOfOrder):
+            pass
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    time.sleep(0.1)
+    assert tr.poll() is None and "partial" not in fake.calls   # no partial of an utterance with a hole
+    with pytest.raises(AudioOverflow):
+        tr.finish()                                             # and no final transcript
+    assert "final" not in fake.calls
+
+
+# ---- any refused chunk voids the utterance -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", sorted(REJECTIONS))
+def test_any_refused_chunk_voids_the_utterance_until_reset(kind):
+    w = PcmWindow(max_seconds=5.0)
+    w.append(SAMPLES, seq=0)
+    with pytest.raises(Exception):
+        REJECTIONS[kind](w)                                     # refused
+    for _ in range(3):                                          # the producer carries on with valid audio...
+        with pytest.raises(AudioOverflow):
+            w.append(SAMPLES)                                   # ...and is told the utterance is void
+    assert not w.intact(w.generation)
+    with pytest.raises(AudioOverflow):
+        w.snapshot()
+    with pytest.raises(AudioOverflow):
+        w.seal()
+    stt = _FakeWhisper()
+    stt.release.set()
+    with pytest.raises(AudioOverflow):
+        LiveTranscriber(stt, w).finish()
+    assert "final" not in stt.calls
+    w.reset()                                                   # the next utterance starts clean
+    w.append(SAMPLES, seq=0)
+    assert w.intact(w.generation) and read_wav(w.snapshot())[3] == SAMPLES
+
+
+def test_an_empty_chunk_is_not_a_refusal():
+    w = PcmWindow()
+    w.append(SAMPLES, seq=0)
+    w.append(b"", seq=1)                                        # a keep-alive: accepted, nothing stored
+    w.append(SAMPLES, seq=2)
+    assert w.intact(w.generation) and read_wav(w.snapshot())[3] == SAMPLES + SAMPLES
+
+
+# ---- every read of an utterance is checked against its generation, atomically ------------------------------
+
+
+def test_every_read_of_an_utterance_refuses_another_generation():
+    w = PcmWindow()
+    w.append(SAMPLES)
+    old = w.generation
+    sealed = w.seal(old)
+    w.reset()
+    w.append(SAMPLES)                                           # the next utterance
+    assert not w.intact(old)
+    with pytest.raises(AudioOverflow):
+        w.snapshot(old)
+    with pytest.raises(AudioOverflow):
+        w.duration(old)
+    with pytest.raises(AudioOverflow):
+        w.seal(old)
+    assert w.finalize(sealed) is False                          # an older utterance's seal is never final
+    assert read_wav(w.snapshot(w.generation))[3] == SAMPLES and w.duration(w.generation) == pytest.approx(0.05)
+
+
+def test_a_reset_during_the_final_makes_it_not_final():
+    stt, window = _BlockingFinal(), PcmWindow(max_seconds=1.0)
+    _speech(window, 0.6)
+    tr = LiveTranscriber(stt, window)
+    t, out = _finish_in_thread(tr)
+    assert stt.final_started.wait(2)                            # the final transcription is running
+    window.reset()                                              # the producer moves on, with no late append
+    _speech(window, 0.3)                                        # and the next utterance is accepted
+    stt.release.set()
+    t.join(5)
+    assert "text" not in out and isinstance(out["error"], AudioOverflow)
+
+
+class _MovesOnBeforeReading(PcmWindow):
+    """Moves on to the next utterance (reset, then its audio) just before a partial reads the audio: the
+    race between the partial loop's check and its read, made certain."""
+
+    NEXT = (7).to_bytes(2, "little") * 8000                    # the next utterance's audio, recognisable
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.moved_on = False
+
+    def snapshot(self, generation=None):
+        if not self.moved_on:
+            self.moved_on = True
+            self.reset()
+            self.append(self.NEXT)
+        return super().snapshot() if generation is None else super().snapshot(generation)
+
+
+class _RecordingWhisper:
+    def __init__(self):
+        self.sent = []
+
+    def transcribe(self, wav, cancel=None):
+        self.sent.append(wav)
+        return "Open the claw"
+
+
+def test_an_old_transcriber_never_sends_the_next_utterances_audio():
+    stt, window = _RecordingWhisper(), _MovesOnBeforeReading()
+    window.append(SAMPLES * 12)                                 # 0.6 s of this utterance
+    tr = LiveTranscriber(stt, window, poll_s=0.005)
+    tr.start()
+    tr._thread.join(1.0)
+    assert window.moved_on and not tr._thread.is_alive()        # it stopped: its utterance is gone
+    assert not any(_MovesOnBeforeReading.NEXT in wav for wav in stt.sent)
+    assert stt.sent == []                                       # nothing was sent for it at all
+
+
+# ---- the window's memory is bounded by max_bytes, whatever is offered -------------------------------------
+
+
+def _peak_while(fn):
+    """The most memory allocated (above the start) while fn() runs; fn's exception, if any, is swallowed."""
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    base = tracemalloc.get_traced_memory()[0]
+    try:
+        fn()
+    except AudioOverflow:
+        pass
+    peak = tracemalloc.get_traced_memory()[1] - base
+    tracemalloc.stop()
+    return peak
+
+
+@pytest.mark.parametrize("wrap", [lambda b: b, memoryview], ids=["bytearray", "memoryview"])
+def test_an_oversized_buffer_is_refused_before_any_copy(wrap):
+    w = PcmWindow(max_seconds=1.0)                              # 32 000 bytes
+    big = wrap(bytearray(16 * 1024 * 1024))                     # 16 MB offered
+    refused = []
+    peak = _peak_while(lambda: refused.append(1) or w.append(big))
+    assert w.overflowed and not w.intact(w.generation)          # refused, and the utterance is void
+    assert peak < 1024 * 1024                                   # never copied: far less than the 16 MB
+
+
+def test_a_buffer_is_measured_in_bytes_not_items():
+    w = PcmWindow(max_seconds=1000 / (SAMPLE_RATE * SAMPLE_WIDTH))   # 1000 bytes
+    with pytest.raises(AudioOverflow):
+        w.append(memoryview(array("h", [0] * 600)))             # 600 items, but 1200 bytes
+    assert w.overflowed
+
+
+def test_many_tiny_chunks_take_no_more_memory_than_the_window():
+    two_bytes = (1).to_bytes(2, "little")
+    tracemalloc.start()
+    w = PcmWindow(max_seconds=1.0)                              # 32 000 bytes
+    for _ in range(10_000):
+        w.append(two_bytes)                                     # 20 000 bytes of audio in 10 000 chunks
+    held = tracemalloc.get_traced_memory()[0]
+    tracemalloc.stop()
+    assert held < 2 * w.max_bytes                               # the window, not 10 000 objects
+    assert w.duration_s == pytest.approx(20_000 / (SAMPLE_RATE * SAMPLE_WIDTH))
+    assert read_wav(w.snapshot())[3] == two_bytes * 10_000

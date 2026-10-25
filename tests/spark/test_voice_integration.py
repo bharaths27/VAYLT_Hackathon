@@ -1,5 +1,6 @@
 """Voice presets reach the real Engine only as unapproved proposals or future tasks."""
 
+import json
 import sqlite3
 import threading
 import time
@@ -13,11 +14,13 @@ from engram.db import SCHEMA
 from engram.engine import Engine, EngineError
 from engram.planner import refusal
 from engram.robot.mock import MockRobot
-from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscriber, PcmWindow
+from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscriber, OutOfOrder, PcmWindow
 from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
 from engram.spark.voice_integration import VoiceIntegration, memory_version
-from spark_fakes import FakeIntent, RecordingTransport, clock, decision, fake, spawn  # noqa: F401  (fixtures)
+from spark_fakes import (  # noqa: F401  (fixtures)
+    REJECTIONS, SAMPLES, FakeIntent, RecordingTransport, clock, decision, fake, spawn,
+)
 
 OBSERVED_ONLY = [("observe", {})]   # the fixture's overhead scan; nothing else may reach the robot
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +33,25 @@ def count(engine, table):
 def nothing_happened(engine):
     return (count(engine, "episode") == 0 and count(engine, "approval") == 0 and count(engine, "prospective_task") == 0
             and engine.robot.calls == OBSERVED_ONLY)
+
+
+def fetch_spy(engine, monkeypatch):
+    """Every memory bundle retrieval from now on, as (goal, thread)."""
+    fetched = []
+    real = engine.memory.retrieve_memory_bundle
+
+    def spy(goal, *args, **kwargs):
+        fetched.append((goal, threading.get_ident()))
+        return real(goal, *args, **kwargs)
+
+    monkeypatch.setattr(engine.memory, "retrieve_memory_bundle", spy)
+    return fetched
+
+
+def recorded_bundle(engine, operation_id):
+    """The memory bundle the engine stored with a proposal."""
+    row = engine.conn.execute("SELECT evidence_json FROM episode WHERE id = ?", (operation_id,)).fetchone()
+    return json.loads(row["evidence_json"])["bundle"]
 
 
 @pytest.fixture
@@ -54,14 +76,14 @@ def test_prepared_partial_carries_the_prefetched_memory_bundle(voice, spawn):
     voice.on_partial(1, 0, "Open the claw")
     spawn.run_all()
     out = voice.on_partial(1, 0, "Open the claw")
-    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the claw"
+    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the gripper"   # the preset's request
 
 
 def test_a_preset_reaches_engine_propose_and_stays_unapproved(voice, spawn, fake, monkeypatch):
     engine = voice.engine
     asked = []
     real_propose = engine.propose
-    monkeypatch.setattr(engine, "propose", lambda request: asked.append(request) or real_propose(request))
+    monkeypatch.setattr(engine, "propose", lambda request, **kw: asked.append(request) or real_propose(request, **kw))
     voice.on_partial(1, 0, "Open the claw")
     spawn.run_all()
     out = voice.on_final(1, 1, "Open the claw")
@@ -223,7 +245,7 @@ def test_real_threaded_worker_never_touches_a_thread_bound_connection(arena):
     assert voice.on_partial(1, 0, "Open the claw")["status"] == "dispatched"
     assert voice.gate.wait_idle(5)
     out = voice.on_partial(1, 1, "Open the claw")
-    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the claw"
+    assert out["preparing"] == "open_gripper" and out["memory"]["goal"] == "Open the gripper"
     final = voice.on_final(1, 2, "Open the claw")
     assert final["status"] == "proposed" and final["reused_prediction"] and len(fake.calls) == 1
     assert voice.gate.stats.errors == 0 and engine.robot.calls == OBSERVED_ONLY
@@ -325,3 +347,161 @@ def test_audio_arriving_while_the_final_is_made_never_becomes_a_proposal(taught,
     assert out["r"]["kind"] == "clarify"                        # not final: say it again
     assert voice.gate.prepared() is None
     assert nothing_happened(taught)
+
+
+@pytest.mark.parametrize("later", [[2, 3], [2, 1, 3]], ids=["chunk 1 dropped", "chunk 1 late"])
+def test_an_utterance_with_a_missing_chunk_never_becomes_a_proposal(taught, spawn, clock, later):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=5.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)           # chunk 0 arrived; "open the gripper" prepared
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    for seq in later:                                           # a caller that catches the error and carries on
+        try:
+            window.append(bytes(3200), seq=seq)
+        except (AudioOverflow, OutOfOrder):
+            pass
+    out = voice.finish_live(1, 99, tr)
+    assert out["kind"] == "clarify" and voice.gate.prepared() is None
+    assert stt.calls.count("final") == 0
+    assert nothing_happened(taught)
+
+
+@pytest.mark.parametrize("flag", ["0", "false", "no", "off", " Off "])
+def test_presets_turned_off_are_off_in_voice_integration(taught, fake, spawn, clock, monkeypatch, flag):
+    monkeypatch.setenv("ENGRAM_VOICE_PRESETS", flag)
+    voice = VoiceIntegration(taught, fake, spawn=spawn, clock=clock)
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    out = voice.on_final(1, 1, "Open the claw")
+    assert out["kind"] == "none" and "turned off" in out["reason"]
+    later = voice.on_final(2, 0, "Open the claw after calibration finishes")
+    assert later["kind"] == "none" and taught.prospective.list() == []
+    assert fake.calls == []                                     # the intent model is never asked
+    assert count(taught, "episode") == 0 and taught.robot.calls == OBSERVED_ONLY
+    assert voice.on_partial(3, 0, "Stop")["kind"] == "stop"     # a stop still stops
+    assert taught.command("Open the gripper")["status"] == "refused"   # nothing was registered
+
+
+def test_voice_integration_reads_the_setting_exactly_as_the_api_does():
+    import engram.api as api
+    from engram.spark import presets
+
+    assert api.voice_presets_enabled is presets.voice_presets_enabled
+
+
+@pytest.mark.parametrize("kind", sorted(REJECTIONS))
+def test_after_any_refused_chunk_nothing_of_the_utterance_is_proposed(taught, spawn, clock, kind):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=5.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)           # chunk 0 arrived; "open the gripper" prepared
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    with pytest.raises(Exception):
+        REJECTIONS[kind](window)                                # refused
+    for _ in range(3):                                          # the producer catches it and carries on
+        try:
+            window.append(SAMPLES)
+        except AudioOverflow:
+            pass
+    out = voice.finish_live(1, 99, tr)
+    assert out["kind"] == "clarify" and voice.gate.prepared() is None
+    assert stt.calls.count("final") == 0
+    assert nothing_happened(taught)
+
+
+def test_a_reset_during_the_final_never_becomes_a_proposal(taught, spawn, clock):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _BlockingFinalWhisper(), PcmWindow(max_seconds=5.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)           # "open the gripper" prepared
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", voice.finish_live(1, 99, tr)))
+    t.start()
+    assert stt.final_started.wait(2)                            # the final is being made...
+    window.reset()                                              # ...when the window moves on, no late append
+    window.append(SAMPLES)
+    stt.release.set()
+    t.join(5)
+    assert out["r"]["kind"] == "clarify" and voice.gate.prepared() is None
+    assert nothing_happened(taught)
+
+
+def test_a_late_prediction_gets_its_memory_bundle_before_the_final(taught, monkeypatch):
+    me = threading.get_ident()
+    landed, fetched = threading.Event(), fetch_spy(taught, monkeypatch)
+    fake = FakeIntent()
+    fake.hold()
+    voice = VoiceIntegration(taught, fake, on_prediction=landed.set)          # real worker threads
+    out = voice.on_partial(1, 0, "Open the claw")               # one partial; no answer yet
+    assert out["preparing"] is None and fetched == []
+    fake.release.set()                                          # the classifier answers late
+    assert landed.wait(2)                                       # no further transcript event comes
+    prepared = voice.pump()                                     # the owner runs the prefetch it was told of
+    assert prepared["preparing"] == "open_gripper" and prepared["memory"]["goal"] == "Open the gripper"
+    assert fetched == [("Open the gripper", me)]                # before the final, on the owner thread
+    assert count(taught, "episode") == 0                        # preparing only: nothing was proposed
+    final = voice.on_final(1, 1, "Open the claw")
+    assert final["status"] == "proposed" and final["reused_prediction"]
+    assert fetched == [("Open the gripper", me)] and final["memory"] == prepared["memory"]   # used, not retrieved again
+
+
+# ---- the memory bundle a partial prefetched is the one the final proposes with -------------------------------
+
+HINGE = "Open the gripper slowly: the gripper hinge is loose."             # memory the preset's request finds
+TRAY = "Before you open the gripper, check that the tray below is empty."
+
+
+def test_the_final_proposes_with_the_bundle_its_partial_prefetched(voice, spawn, monkeypatch):
+    voice.engine.teach("Note", HINGE)
+    fetched = fetch_spy(voice.engine, monkeypatch)
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    prepared = voice.pump()                                     # the prefetch, while the user is still speaking
+    before_final = len(fetched)
+    final = voice.on_final(1, 1, "Open the claw")
+    assert final["status"] == "proposed" and final["reused_prediction"]
+    assert len(fetched) == before_final == 1                    # the final retrieved nothing again
+    assert fetched == [("Open the gripper", threading.get_ident())]   # the preset's request, on the owner thread
+    assert final["memory"] == prepared["memory"] == recorded_bundle(voice.engine, final["operation_id"])
+    assert [e["text"] for e in final["memory"]["evidence"]] == [HINGE]
+
+
+def test_a_prefetch_that_went_stale_is_retrieved_again_exactly_once(voice, spawn, fake, monkeypatch):
+    voice.engine.teach("Note", HINGE)
+    fetched = fetch_spy(voice.engine, monkeypatch)
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    prepared = voice.pump()
+    before_final = len(fetched)
+    voice.engine.teach("Note", TRAY)                            # memory moves on after the prefetch
+    final = voice.on_final(1, 1, "Open the claw")
+    assert final["status"] == "proposed" and not final["reused_prediction"] and len(fake.calls) == 2
+    assert len(fetched) == before_final + 1 == 2                # one retrieval at the final, not two
+    assert [goal for goal, _ in fetched] == ["Open the gripper"] * 2
+    assert TRAY not in [e["text"] for e in prepared["memory"]["evidence"]]
+    assert TRAY in [e["text"] for e in final["memory"]["evidence"]]    # the proposal has the fresh bundle
+    assert final["memory"] == recorded_bundle(voice.engine, final["operation_id"])
+
+
+@pytest.mark.parametrize("retrieved_for,retrievals", [("Open the gripper", 0), ("Close the gripper", 1)],
+                         ids=["for this request", "for another request"])
+def test_propose_uses_a_given_bundle_only_if_it_is_for_that_request(voice, monkeypatch, retrieved_for, retrievals):
+    engine = voice.engine                                       # presets registered
+    given = engine.memory.retrieve_memory_bundle(retrieved_for, engine.skills.approved_names())
+    fetched = fetch_spy(engine, monkeypatch)
+    out = engine.propose("Open the gripper", bundle=given)
+    assert out["status"] == "proposed" and len(fetched) == retrievals
+    assert out["memory"]["goal"] == "Open the gripper" == recorded_bundle(engine, out["operation_id"])["goal"]
+
+
+def test_a_voice_final_is_a_spoken_command_and_carries_the_prefetched_bundle(voice, spawn, monkeypatch):
+    engine = voice.engine
+    calls = []
+    real_command = engine.command
+    monkeypatch.setattr(engine, "command", lambda text, **kw: calls.append((text, kw)) or real_command(text, **kw))
+    voice.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    prepared = voice.gate.prepared()                            # owner thread: prefetches the bundle
+    out = voice.on_final(1, 1, "Open the claw")
+    assert out["kind"] == "proposal" and out["status"] == "proposed"
+    assert [(text, kw["who"]) for text, kw in calls] == [("Open the gripper", "voice")]   # the one entry point
+    assert calls[0][1]["bundle"] is prepared.bundle             # with the bundle prepared while speaking
