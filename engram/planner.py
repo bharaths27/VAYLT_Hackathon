@@ -168,8 +168,26 @@ def extract_json(text: str) -> dict | None:
     return json.loads(m.group(0)) if m else None
 
 
+def unresolved(plan: dict[str, Any], memory: Memory) -> str:
+    """Why a model's plan does not resolve to what memory knows, or "": it has no steps, or it names an object that
+    memory does not have. The model did not work out what was meant, so the rule planner takes the request instead:
+    it plans it, or refuses it with its own classification ("I don't know which object you mean." is unclear).
+    Handed to the checker as it was, the plan would be turned down as understood, and a running plan would go on."""
+    steps = plan.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return "model plan has no steps"
+    known = {o.object_id for o in memory.objects()}
+    for step in steps:
+        args = step.get("args") if isinstance(step, dict) else None
+        obj = args.get("object_id") if isinstance(args, dict) else None
+        if obj is not None and (not isinstance(obj, str) or obj not in known):
+            return f"model plan names an object memory does not have: {obj!r}"
+    return ""
+
+
 class LlamaCppPlanner:
-    """Ask a local llama.cpp server for the plan. Falls back to rules on any problem."""
+    """Ask a local llama.cpp server for the plan. Falls back to rules on any problem, a plan that does not resolve
+    to what memory knows included (see unresolved)."""
 
     name = "model"
 
@@ -207,6 +225,10 @@ class LlamaCppPlanner:
             plan = extract_json(text)
             if not isinstance(plan, dict):
                 why = "model reply had no JSON plan"
+            else:
+                why = unresolved(plan, memory)
+                if why:  # the model did not work out what was meant: the rules take the request
+                    plan = None
         except Exception as e:
             plan, why = None, f"model call failed: {type(e).__name__}: {e}"
         ms = (time.perf_counter() - t0) * 1000

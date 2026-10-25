@@ -5,7 +5,9 @@ says so ("I stopped. <reason> Please clarify."). With nothing running nothing is
 clarify."). Understood refusals and stop words keep their behaviour. needs_clarification on every proposal
 result is what lets the console tell the two kinds of refusal apart without reading the words.
 """
+import json
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +16,7 @@ from conftest import REQUEST, ROOT
 from engram.api import create_app
 from engram.db import connect
 from engram.engine import Engine, clarify_reply
-from engram.planner import PlanResult
+from engram.planner import LlamaCppPlanner, PlanResult
 from engram.robot.base import ActionResult
 from engram.robot.mock import MockRobot
 
@@ -311,3 +313,73 @@ def test_a_refusal_the_planner_states_understood_while_a_plan_runs_does_not_stop
     t.join(10)
     assert (r["status"], r["classification"], r["needs_clarification"]) == ("refused", "understood", False)
     assert "stopped" not in r and out["run"]["outcome"] == "success"
+
+
+# ---- the model planner: a plan that does not resolve to what memory knows goes to the rules, which say why -----
+
+
+class Model:
+    """A local stand-in for the llama.cpp server (no model runs): every completion is the plan the test sets."""
+
+    def __init__(self):
+        fake, self.plan = self, None
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                data = json.dumps({"content": json.dumps(fake.plan)}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/completion"
+
+
+@pytest.fixture
+def model():
+    m = Model()
+    yield m
+    m.server.shutdown()
+    m.server.server_close()
+
+
+def bring(obj):
+    return {"goal": "bring it", "evidence": [], "steps": [
+        {"op": "locate_tag", "args": {"object_id": obj}}, {"op": "pick_tagged_object", "args": {"object_id": obj}},
+        {"op": "place_at_zone", "args": {"zone": "bench"}}]}
+
+
+@pytest.mark.parametrize("reply", [bring("gizmo"), {"goal": "bring it", "steps": [], "evidence": []}, None],
+                         ids=["names an object memory does not have", "plans nothing", "no model"])
+def test_the_model_planner_s_refusal_while_a_plan_runs_stops_it_and_asks(lab, model, reply):
+    oid, t, out = start_plan(lab)
+    model.plan = reply
+    lab.planner = LlamaCppPlanner(lab.zones, model.url if reply else "http://127.0.0.1:9/completion", timeout_s=0.5)
+    r = lab.command("Bring the gizmo to the bench", "test")
+    lab.robot.release.set()
+    t.join(10)
+    assert (r["status"], r["classification"], r["stopped"]) == ("refused", "unclear", True), r
+    assert r["reply"] == "I stopped. I don't know which object you mean. Please clarify."
+    assert outcome(lab, oid) == "aborted" and lab.robot.state()["stopped"] is True
+
+
+def test_a_model_plan_naming_an_object_memory_does_not_have_goes_to_the_rules(lab, model):
+    model.plan = bring("beaker_1")                              # the model did not resolve "the beaker"; the rules do
+    lab.planner = LlamaCppPlanner(lab.zones, model.url, timeout_s=5)
+    r = lab.command("Bring the beaker to the bench", "test")
+    assert (r["status"], r["source"], r["classification"]) == ("proposed", "fallback", "understood"), r
+    assert "model plan names an object memory does not have: 'beaker_1'" in r["planner_note"]
+
+
+def test_a_model_plan_that_resolves_is_the_model_s(lab, model):
+    model.plan = bring("beaker")
+    lab.planner = LlamaCppPlanner(lab.zones, model.url, timeout_s=5)
+    r = lab.command("Bring the beaker to the bench", "test")
+    assert (r["status"], r["source"], r["classification"]) == ("proposed", "model", "understood"), r
