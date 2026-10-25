@@ -6,7 +6,9 @@ import socket
 import struct
 import threading
 import time
+import tracemalloc
 import wave
+from array import array
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import pytest
@@ -15,7 +17,7 @@ from engram.spark import _http
 from engram.planner import FUTURE_HINTS, NEGATION
 from engram.spark.audio_windows import (
     SAMPLE_RATE, SOUND_DESCRIPTORS, SOUND_WORDS, AudioOverflow, Cancelled, CancelToken, LiveTranscriber, OutOfOrder,
-    PcmWindow, WhisperError, WhisperServerClient, WindowSealed, speech_only,
+    PcmWindow, SAMPLE_WIDTH, WhisperError, WhisperServerClient, WindowSealed, speech_only,
 )
 from engram.spark.voice import CORRECTION, STOP_WORDS
 from spark_fakes import REJECTIONS, SAMPLES
@@ -77,10 +79,10 @@ def test_empty_chunks_store_nothing_but_keep_their_sequence_number():
         w.append(b"", seq=i)
     for _ in range(10_000):
         w.append(b"")
-    assert w._chunks == [] and w.duration_s == 0
+    assert w.duration_s == 0
     w.append(pcm(1), seq=20_000)
     w.append(b"", seq=20_001)
-    assert len(w._chunks) == 1 and read_wav(w.snapshot())[3] == pcm(1)
+    assert w.duration_s == pytest.approx(1 / SAMPLE_RATE) and read_wav(w.snapshot())[3] == pcm(1)
     with pytest.raises(OutOfOrder):
         w.append(b"", seq=5)                                    # even an empty chunk out of order...
     with pytest.raises(AudioOverflow):
@@ -773,3 +775,50 @@ def test_an_old_transcriber_never_sends_the_next_utterances_audio():
     assert window.moved_on and not tr._thread.is_alive()        # it stopped: its utterance is gone
     assert not any(_MovesOnBeforeReading.NEXT in wav for wav in stt.sent)
     assert stt.sent == []                                       # nothing was sent for it at all
+
+
+# ---- the window's memory is bounded by max_bytes, whatever is offered -------------------------------------
+
+
+def _peak_while(fn):
+    """The most memory allocated (above the start) while fn() runs; fn's exception, if any, is swallowed."""
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    base = tracemalloc.get_traced_memory()[0]
+    try:
+        fn()
+    except AudioOverflow:
+        pass
+    peak = tracemalloc.get_traced_memory()[1] - base
+    tracemalloc.stop()
+    return peak
+
+
+@pytest.mark.parametrize("wrap", [lambda b: b, memoryview], ids=["bytearray", "memoryview"])
+def test_an_oversized_buffer_is_refused_before_any_copy(wrap):
+    w = PcmWindow(max_seconds=1.0)                              # 32 000 bytes
+    big = wrap(bytearray(16 * 1024 * 1024))                     # 16 MB offered
+    refused = []
+    peak = _peak_while(lambda: refused.append(1) or w.append(big))
+    assert w.overflowed and not w.intact(w.generation)          # refused, and the utterance is void
+    assert peak < 1024 * 1024                                   # never copied: far less than the 16 MB
+
+
+def test_a_buffer_is_measured_in_bytes_not_items():
+    w = PcmWindow(max_seconds=1000 / (SAMPLE_RATE * SAMPLE_WIDTH))   # 1000 bytes
+    with pytest.raises(AudioOverflow):
+        w.append(memoryview(array("h", [0] * 600)))             # 600 items, but 1200 bytes
+    assert w.overflowed
+
+
+def test_many_tiny_chunks_take_no_more_memory_than_the_window():
+    two_bytes = (1).to_bytes(2, "little")
+    tracemalloc.start()
+    w = PcmWindow(max_seconds=1.0)                              # 32 000 bytes
+    for _ in range(10_000):
+        w.append(two_bytes)                                     # 20 000 bytes of audio in 10 000 chunks
+    held = tracemalloc.get_traced_memory()[0]
+    tracemalloc.stop()
+    assert held < 2 * w.max_bytes                               # the window, not 10 000 objects
+    assert w.duration_s == pytest.approx(20_000 / (SAMPLE_RATE * SAMPLE_WIDTH))
+    assert read_wav(w.snapshot())[3] == two_bytes * 10_000

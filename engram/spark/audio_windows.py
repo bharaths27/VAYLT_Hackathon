@@ -1,6 +1,9 @@
 """Audio for partial transcripts: a bounded PCM buffer and an optional local whisper.cpp client.
 
-PcmWindow keeps every sample of the current utterance, in order, up to a maximum duration.
+PcmWindow keeps every sample of the current utterance, in order, up to a maximum duration,
+in one buffer of exactly max_bytes allocated up front and written in place: its memory is
+O(max_bytes) whatever the chunk sizes, and a chunk's size is checked before anything is read
+from it, so an oversized chunk is refused without being copied.
 It never drops the start to make room: the first word may be "don't". When the window is
 full, append() raises AudioOverflow and the utterance is invalid: the window refuses all
 further audio AND every snapshot() until reset(), so nothing can transcribe a clipped
@@ -91,13 +94,13 @@ class PcmWindow:
         self.max_bytes = int(max_seconds * SAMPLE_RATE) * SAMPLE_WIDTH
         self._lock = threading.Lock()
         self._generation = 0
+        self._buf = bytearray(self.max_bytes)   # all of an utterance's audio, written in place: O(max_bytes)
         self.reset()
 
     def reset(self) -> None:
         """Start a new utterance. A seal of the previous one keeps what it recorded."""
         with self._lock:
-            self._chunks: list[bytes] = []
-            self._size = 0
+            self._size = 0           # bytes of self._buf in use
             self._next_seq = 0
             self._full = False
             self._refused = False    # a chunk was refused, for any reason: the utterance is not whole
@@ -121,7 +124,7 @@ class PcmWindow:
         with self._lock:
             self._check(generation)
             if self._seal is None:
-                self._seal = SealedUtterance(wav_bytes(b"".join(self._chunks)), self._generation)
+                self._seal = SealedUtterance(wav_bytes(self._buf[:self._size]), self._generation)
             return self._seal
 
     def finalize(self, sealed: SealedUtterance) -> bool:
@@ -161,14 +164,15 @@ class PcmWindow:
                 if self._seal is not None and self._seal._decided is None:
                     self._seal._clipped = True     # a final being made would miss this audio: not final
                 raise
-            if chunk:
-                self._chunks.append(chunk)
-                self._size += len(chunk)
+            end = self._size + len(chunk)          # within max_bytes: _admit() checked it before any copy
+            self._buf[self._size:end] = chunk
+            self._size = end
             self._next_seq += 1
 
-    def _admit(self, pcm, seq: int | None) -> bytes:  # noqa: ANN001
-        """(lock held) Every check a chunk must pass; returns its bytes. Anything raised here voids the
-        utterance (see append())."""
+    def _admit(self, pcm, seq: int | None):  # noqa: ANN001, ANN202
+        """(lock held) Every check a chunk must pass; returns it as bytes or a byte view, to be copied in
+        place. Its size is checked before anything is read from it, so an oversized chunk is refused
+        without being copied. Anything raised here voids the utterance (see append())."""
         if self._seal is not None:
             raise WindowSealed("this utterance has ended; audio for it is refused (reset() starts the next)")
         if self._full:
@@ -179,18 +183,20 @@ class PcmWindow:
             raise TypeError("pcm must be bytes")
         if isinstance(pcm, memoryview) and pcm.format not in _PCM_FORMATS:
             raise TypeError(f"pcm must be raw bytes or 16-bit samples, not {pcm.format!r}")
-        data = bytes(pcm)
-        if len(data) % SAMPLE_WIDTH:
+        nbytes = pcm.nbytes if isinstance(pcm, memoryview) else len(pcm)   # measured, never copied
+        if nbytes % SAMPLE_WIDTH:
             raise ValueError("a chunk must hold whole 16-bit samples")
         if seq is not None:
             if isinstance(seq, bool) or not isinstance(seq, int):
                 raise TypeError("seq must be an int")
             if seq != self._next_seq:
                 raise OutOfOrder(f"expected chunk {self._next_seq}, got {seq}; the utterance is not whole")
-        if self._size + len(data) > self.max_bytes:
+        if self._size + nbytes > self.max_bytes:
             self._full = True          # refuse from here on: a later, smaller chunk would leave a hole
             raise AudioOverflow(f"utterance longer than {self.max_bytes // (SAMPLE_RATE * SAMPLE_WIDTH)} s")
-        return data
+        if isinstance(pcm, memoryview):     # it fits: only now is it read, and at most the room left
+            return pcm.cast("B") if pcm.c_contiguous else pcm.tobytes()
+        return pcm
 
     @property
     def duration_s(self) -> float:
@@ -228,7 +234,7 @@ class PcmWindow:
         only part of what was said, and must never be transcribed or acted on."""
         with self._lock:
             self._check(generation)
-            pcm = b"".join(self._chunks)
+            pcm = self._buf[:self._size]           # copied under the lock: a reset cannot tear it
         return wav_bytes(pcm)
 
 
