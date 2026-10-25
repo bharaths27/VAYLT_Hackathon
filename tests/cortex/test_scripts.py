@@ -23,8 +23,7 @@ def test_sqlite_backup_preserves_wal_and_refuses_overwrite(tmp_path):
 def test_opt_in_console_patch_rejects_changed_anchors_and_preserves_voice(tmp_path):
     mod=load_script('cortex_console_patch');root=tmp_path
     (root/'console/server/adapters').mkdir(parents=True)
-    (root/'console/server/brain.py').write_text('import time\n_c = httpx.AsyncClient(timeout=20.0) if URL else None\n')
-    (root/'console/server/adapters/memory.py').write_text('def make_memory():\n    return MockMemory()\n')
+    for f in ('brain.py','adapters/memory.py'):(root/'console/server'/f).write_text((ROOT/'console/server'/f).read_text())
     changed=mod.transforms(root)
     assert len(changed)==2 and all('voice' not in x[0] for x in changed)
     for path,old,new in changed:(root/path).write_text(new)

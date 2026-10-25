@@ -1,12 +1,13 @@
 """Authenticated additive API for Cortex. Defaults to a separate MOCK database.
 
 Run from the repository root with uvicorn engram.cortex.api:create_app --factory
---host 127.0.0.1 --port 8010. Bind/proxy through trusted TLS for iPad access.
+--host 127.0.0.1 --port 8010. On the Pi use scripts/cortex_sidecar.sh (loopback only, reached
+with ssh -L); no LAN exposure has been reviewed.
 No submitted branch, voice stack, or motor service is modified by importing this.
 """
 from __future__ import annotations
-import asyncio,copy,hmac,json,os,time
-from contextlib import asynccontextmanager
+import asyncio,copy,hmac,json,logging,os,time
+from contextlib import AsyncExitStack,asynccontextmanager
 from pathlib import Path
 from typing import Any,Literal
 from fastapi import FastAPI,Depends,Header,HTTPException,Request
@@ -15,7 +16,7 @@ from pydantic import BaseModel,ConfigDict,Field
 from .types import *
 from .store import Store
 from .runtime import Brain
-from .planning import CAPS,PHYSICAL,parse_goal
+from .planning import CAPS,PHYSICAL,parse_goal,safety_reason
 from .models import IntentAdvisor,QwenClient
 from .simulation import FakeRobot
 from .media import FrameHub,LocalJPEG
@@ -86,6 +87,67 @@ class Turn(Input):
     cloud_allowed:bool=False
 
 
+MAX_BODY=300000
+SAFE_METHODS={'GET','HEAD','OPTIONS'}
+SWEEP_S,SWEEP_MAX_S,REPEAT_S=1.0,60.0,600.0
+log=logging.getLogger('engram.cortex.api')
+
+async def sweep_forever(b:Brain):
+    """Timed-task scheduler that never dies. Any failure (clock rollback, 'database is locked')
+    is logged, retried with exponential backoff SWEEP_S..SWEEP_MAX_S, and recorded as a decision
+    once per REPEAT_S while the same failure repeats. Due tasks only ever become proposals."""
+    delay,last,noted=SWEEP_S,None,0.0
+    while True:
+        try:await asyncio.to_thread(b.sweep_due);delay,last=SWEEP_S,None
+        except Exception as e:
+            code=e.code if isinstance(e,CortexError) else type(e).__name__
+            log.warning('timed-task sweep failed: %s; retrying in %.1f s',code,delay)
+            if code!=last or time.monotonic()-noted>=REPEAT_S:
+                try:await asyncio.to_thread(b.store.decision,'clock_sweep','local',None,False,code);last,noted=code,time.monotonic()
+                except Exception:log.exception('could not record the sweep failure')
+            await asyncio.sleep(delay);delay=min(delay*2,SWEEP_MAX_S);continue
+        await asyncio.sleep(delay)
+
+async def stop_task(task):
+    task.cancel();await asyncio.gather(task,return_exceptions=True)
+
+class Guard:
+    """Outermost pure-ASGI gate. A cross-site or uncredentialed mutation is refused before ONE body
+    byte is read; every body is counted as it arrives (declared or chunked) and refused past MAX_BODY.
+    Route dependencies still decide operator versus sensor; this only checks that a credential exists."""
+    def __init__(self,app,*,credentials):self.app=app;self.credentials=[c.encode() for c in credentials]
+    async def __call__(self,scope,receive,send):
+        if scope['type']!='http':return await self.app(scope,receive,send)
+        h={k.decode('latin-1').lower():v.decode('latin-1') for k,v in scope['headers']}
+        if scope['method'] not in SAFE_METHODS:
+            # Refuse cross-site browser mutations; serve through a paired same-origin TLS proxy.
+            if h.get('sec-fetch-site')=='cross-site':return await refuse(send,403,'cross-site mutation refused')
+            auth=h.get('authorization','')
+            if not (auth.startswith('Bearer ') and any(hmac.compare_digest(auth[7:].encode(),c) for c in self.credentials)):
+                return await refuse(send,401,'operator credential required')
+        try:declared=int(h.get('content-length','0'))
+        except ValueError:return await refuse(send,400,'invalid length')
+        if declared>MAX_BODY:return await refuse(send,413,'input too large')
+        body=b'';more=True
+        while more:
+            m=await receive()
+            if m['type']!='http.request':return
+            body+=m.get('body',b'');more=m.get('more_body',False)
+            if len(body)>MAX_BODY:return await refuse(send,413,'input too large')
+        replayed=False
+        async def replay():
+            nonlocal replayed
+            if replayed:return await receive()
+            replayed=True;return {'type':'http.request','body':body,'more_body':False}
+        await self.app(scope,replay,send)
+
+async def refuse(send,status,detail):
+    data=json.dumps({'detail':detail}).encode()
+    await send({'type':'http.response.start','status':status,'headers':[(b'content-type',b'application/json'),(b'content-length',str(len(data)).encode()),
+        (b'cache-control',b'no-store'),(b'x-content-type-options',b'nosniff'),(b'referrer-policy',b'no-referrer'),(b'connection',b'close')]})
+    await send({'type':'http.response.body','body':data})
+
+
 def present(result:dict)->dict:
     """Old iPad card shape, while retaining the exact internal signed goal contract."""
     out=copy.deepcopy(result)
@@ -136,24 +198,15 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     enable_idle=(os.environ.get('CORTEX_IDLE','1')=='1') if start_idle is None else start_idle
     @asynccontextmanager
     async def lifespan(app):
-        # Reconcile durable wakes into proposals only; never resume a physical effect.
-        await asyncio.to_thread(b.reconcile_wakes)
-        async def scheduler():
-            while True:
-                try:await asyncio.to_thread(b.sweep_due)
-                except CortexError as e:b.store.decision('clock_sweep','local',None,False,e.code)
-                await asyncio.sleep(1)
-        timer_task=asyncio.create_task(scheduler()) if b.store.policy.clock_trusted else None
-        if enable_idle:b.dreamer.start()
-        if hub:hub.start()
-        yield
-        if timer_task:
-            timer_task.cancel()
-            try:await timer_task
-            except asyncio.CancelledError:pass
-        if hub:hub.stop()
-        b.dreamer.stop()
-        if not supplied:b.close()
+        async with AsyncExitStack() as cleanup: # every registered step runs at shutdown, even if one raises
+            if not supplied:cleanup.callback(b.close)
+            cleanup.callback(b.dreamer.stop)
+            # Reconcile durable wakes into proposals only; never resume a physical effect.
+            await asyncio.to_thread(b.reconcile_wakes)
+            if b.store.policy.clock_trusted:cleanup.push_async_callback(stop_task,asyncio.create_task(sweep_forever(b)))
+            if enable_idle:b.dreamer.start()
+            if hub:hub.start();cleanup.callback(hub.stop)
+            yield
     app=FastAPI(title='ENGRAM Cortex Memory Runtime',version='0.2.0',lifespan=lifespan)
     app.state.brain=b;app.state.frame_hub=hub
     def operator(authorization:str|None=Header(default=None)):
@@ -176,18 +229,13 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
         code=403 if isinstance(exc,Denied) else 404 if isinstance(exc,Missing) and str(exc).endswith('not found') else 409
         return JSONResponse(status_code=code,content={'code':exc.code,'detail':str(exc)})
     @app.middleware('http')
-    async def bounded(req,call_next):
-        try:length=int(req.headers.get('content-length','0'))
-        except ValueError:return JSONResponse(status_code=400,content={'detail':'invalid length'})
-        if length>300000:return JSONResponse(status_code=413,content={'detail':'input too large'})
-        # Refuse cross-site browser mutations; serve through a paired same-origin TLS proxy.
-        if req.method not in {'GET','HEAD','OPTIONS'} and req.headers.get('sec-fetch-site')=='cross-site':
-            return JSONResponse(status_code=403,content={'detail':'cross-site mutation refused'})
+    async def headers(req,call_next):
         response=await call_next(req)
         response.headers['Cache-Control']='no-store'
         response.headers['X-Content-Type-Options']='nosniff'
         response.headers['Referrer-Policy']='no-referrer'
         return response
+    app.add_middleware(Guard,credentials=[*keys,*skeys]) # added last = outermost
     adapter_label=b.robot.state().get('adapter')
     @app.get('/health')
     def health():return {'ok':True,'robot':adapter_label,'mode':b.mode,'service':'cortex'}
@@ -248,10 +296,20 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.post('/goals/propose')
     def goal(body:GoalInput,principal=Depends(operator)):
         selected=Goal.from_dict(body.goal)
+        if safety_reason(body.request):raise Denied(safety_reason(body.request))
         try:parsed=parse_goal(body.request,b.store)
         except Missing:parsed=None
-        if parsed is not None and parsed!=selected:raise Conflict('typed goal conflicts with the supported request')
-        return present(b.propose(selected,body.request,principal=principal,idempotency_key=body.idempotency_key))
+        if parsed is not None:
+            if parsed!=selected:raise Conflict('typed goal conflicts with the supported request')
+            return present(b.propose(selected,body.request,principal=principal,idempotency_key=body.idempotency_key))
+        # Unparsed text is never shown as the goal: the card shows the typed goal; the text is an operator note.
+        r=b.propose(selected,describe(selected),principal=principal,idempotency_key=body.idempotency_key)
+        if not b.store.one("SELECT 1 FROM operation_event WHERE episode_id=? AND op='operator_note' AND detail=?",(r['operation_id'],body.request[:1000])):
+            b.journal(r['operation_id'],'operator_note',{},'noted',body.request)
+        return {**present(r),'operator_note':body.request}
+    def describe(g:Goal)->str:
+        names={o['id']:o['name'] for o in b.store.objects()};what=' and '.join(names.get(t,t) for t in g.targets)
+        return {'fetch':f'Bring {what} to {g.zone}','goto':f'Go to {g.zone}','inspect':f'Inspect {what}'}.get(g.kind) or f'{g.primitive} {canonical(g.args)}'
     def owned(eid,principal):
         o=b.operation(eid)
         if o['owner']!=principal:raise Denied('operation belongs to another operator')
@@ -319,18 +377,23 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     def camera_status(principal=Depends(operator)):return hub.metadata() if hub else {'available':False,'reason':'not configured'}
     @app.get('/frame.jpg')
     def frame(principal=Depends(operator)):
-        f=hub.latest() if hub else None
+        f=None
+        if hub:
+            hub.touch();f=hub.latest() # a viewer: the poller runs while frames are being requested
+            if not f or time.time()-f.received_at>2:f=hub.latest(after=f.seq if f else 0,wait_s=1)
         if not f or time.time()-f.received_at>2:raise HTTPException(503,'camera frame unavailable/stale')
         return Response(f.jpeg,media_type='image/jpeg',headers={'X-Frame-Sequence':str(f.seq),'X-Frame-Received-At':str(f.received_at),'X-Frame-Captured-At':str(f.captured_at) if f.captured_at else 'unknown'})
     @app.get('/video.mjpg')
     async def video(req:Request,principal=Depends(operator)):
         if not hub:raise HTTPException(503,'camera not configured')
         async def frames():
-            seq=0
-            while not await req.is_disconnected():
-                f=await asyncio.to_thread(hub.latest,after=seq,wait_s=.5)
-                if f and time.time()-f.received_at<2:
-                    seq=f.seq
-                    yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
+            seq=0;hub.watch() # the poller runs while at least one stream is attached
+            try:
+                while not await req.is_disconnected():
+                    f=await asyncio.to_thread(hub.latest,after=seq,wait_s=.5)
+                    if f and time.time()-f.received_at<2:
+                        seq=f.seq
+                        yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
+            finally:hub.unwatch()
         return StreamingResponse(frames(),media_type='multipart/x-mixed-replace; boundary=frame')
     return app

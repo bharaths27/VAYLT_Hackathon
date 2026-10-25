@@ -7,7 +7,7 @@ A supported new task retrieves related current evidence, produces and stores a d
 The submitted release lost required stations, lacked durable future-task cancellation and did not insert ENGRAM.md into the model prompt. A successful JSON parse or actuator ACK was insufficient evidence of goal completion. The earlier speech delivery did not implement this memory combination.
 
 ## Covers
-Additive `engram/cortex` runtime, source-backed tests, synthetic demonstration, Qwen/intent-model clients, scoped sensor/camera interfaces, opt-in console bridge and migration/review documentation. No changes to Warden's speech patch, the submitted branch or the robot's motor firmware. No unrestricted generated code or RL model training.
+Additive `engram/cortex` runtime, source-backed tests, synthetic demonstration, Qwen/intent-model clients, scoped sensor/camera interfaces, a loopback sidecar launcher (`scripts/cortex_sidecar.sh`), a print-only console bridge diff whose `--apply` is blocked until the console authenticates its mutating routes, and migration/review documentation. No changes to Warden's speech patch, the submitted branch or the robot's motor firmware. No unrestricted generated code or RL model training.
 
 ## Readiness
 READY FOR SOFTWARE REVIEW AND MOCK INTEGRATION. Local test results are in the evidence pack. BLOCKED for deployment/physical acceptance until an authorized maintainer applies it, runs the original suite and completes Pi/model/console/sensor checks.
@@ -22,7 +22,7 @@ Existing release 9849350, Alex integration595f339, original SQLite/adapter/conso
 SQLite WAL and transactions, FTS/exact retrieval, bounded prerequisite graph, typed goals, a separate state-transition verifier, provenance/digests, a no-motor fake adapter, an incremental idle worker, strict HTTP model clients, pytest/FastAPI/httpx, separate-process restart demonstration, newest-frame fanout. Real Qwen/intent-model probes run separately and retain failures.
 
 ## Proposed solution
-Apply the additive patch on a review branch. Demonstrate locally. Review the source/adoption contract using a SQLite backup. Merge Alex's answer handling independently. Select one active backend, pair the UI, connect a real calibrated sensor producer and verify hardware stopping before a deliberate cutover. Preserve the old release for rollback.
+Apply the additive patch on a review branch. Demonstrate locally. For the demo, run Cortex as a sidecar beside the existing brain, which stays the only executor (`docs/CORTEX_HANDOFF.md`, Integration 1); rollback is stopping that one process. Review the source/adoption contract using a SQLite backup. Merge Alex's answer handling independently. Before any cutover: authenticate the console's mutating routes, connect a real calibrated sensor producer, verify hardware stopping, and only then select Cortex as the one active backend. Preserve the old release for rollback.
 
 ## What done looks like
 The exact received patch passes its suite and the full original repository suite, the seven-stage demo passes, the Qwen probe logs actual prompt and contract identity with correct goal results, live intent-model advice is either tested and labeled cloud-assisted or explicitly disabled, and the actual Pi/browser/controller acceptance record exists. No blanket DONE for unrelated hardware/research tickets.
