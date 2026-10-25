@@ -113,19 +113,24 @@ switches; reconnect over the cable or by joining ENGRAM-LAB.
 
 ## 5. Update the robot's software to `main` (one time)
 
-This switches the Pi's code to the integrated build. **Anything changed on the Pi is saved first** (a backup
-branch plus a patch file in `~/cds-backup/`), so nothing a teammate left there is lost. Paste all four lines:
+This switches the Pi's code to the integrated build. **Nothing on the Pi is lost:** the commit it was on is kept
+as branch `pre-cds-<date>`, and anything a teammate changed on the Pi is saved first (branch `pi-local-<date>`,
+plus a patch file and a copy of new files in `~/cds-backup/<date>/`). Paste this as **one line**:
 
 ```bash
-cd ~/engram_hub
-git fetch https://github.com/mrrCarter/VAYLT_Hackathon.git main
-git show FETCH_HEAD:scripts/cds_update.sh > /tmp/cds_update.sh
-bash /tmp/cds_update.sh
+cd ~/engram_hub && git fetch https://github.com/mrrCarter/VAYLT_Hackathon.git main && git show FETCH_HEAD:scripts/cds_update.sh > /tmp/cds_update.sh && bash /tmp/cds_update.sh
 ```
 
-Expected: it ends with `done. next: bash .../scripts/cds_up.sh` and prints the exact command to undo. If the Pi has
-no internet, the `git fetch` fails: switch the laptop and the Pi to your phone's hotspot and repeat (the update
-needs internet once; everything after this works offline).
+Expected: it ends with these two lines (the dates differ):
+
+```
+done. next: bash /home/starrasp/engram_hub/scripts/cds_up.sh --restart   (--restart: services already running still run the old code)
+to undo:  cd /home/starrasp/engram_hub && git checkout pre-cds-20261025-...
+```
+
+Keep the undo line (it is also saved in `~/cds-backup/<date>/UNDO.txt`). If the Pi has no internet, the `git
+fetch` fails and **nothing on the Pi changes**: switch the laptop and the Pi to your phone's hotspot and paste the
+line again (the update needs internet once; everything after this works offline).
 
 ---
 
@@ -139,16 +144,19 @@ Expected (the last block it prints):
 
 ```
   OK    brain      ...   plans + memory (mock robot)
-  OK    console    ...   Verna's console (iPad)
+  OK    console    ...   Verna's console (iPad); robot view: SIMULATOR
   OK    cert       ...   certificate download for the iPad
-  OK/DOWN robot    ...   Brian's robot server      <- either is fine for now
-  DOWN  model      ...   (optional)
-  DOWN  cortex     ...   (optional)
+  OK    robot      ...   Brian's robot server (hardware + safety)   <- OK or DOWN: both fine for now
+  DOWN  model      ...   Qwen3 1.7B (optional)
+  DOWN  cortex     ...   memory inspector sidecar (optional)
+
   iPad console:      https://star-pi.local:8443
+  iPad console:      https://172.20.10.6:8443      <- the same console by number; yours may differ
 ```
 
-Check the status any time: `bash ~/engram_hub/scripts/cds_status.sh`. Everything keeps running after you close
-the laptop.
+If it also says it renewed the console certificate, that is normal on a new network. Check the status any time:
+`bash ~/engram_hub/scripts/cds_status.sh`. Everything keeps running after you close the laptop (if a service shows
+DOWN when you come back, run `cds_up.sh` again).
 
 ---
 
@@ -163,7 +171,9 @@ Put the iPad on the **same network** as the robot.
 
 **Open the console:** `https://star-pi.local:8443` in Safari (or `https://<robot address>:8443`; the iPad often
 needs the number form, e.g. `https://172.20.10.6:8443`, which `cds_status.sh` prints). Allow the microphone when
-asked. The screen should show a **SIMULATOR** label (that is the pretend robot) and the push-to-talk button.
+asked. **How to tell the pretend robot from the real one:** during start-up the console lists
+`robot  SIMULATOR (not real hardware)`, and afterwards a small **SIM** control with a "drop obstacle" button stays
+on screen. On the real robot the start-up line shows the robot's address and there is no SIM control.
 **Approving is press-and-hold:** hold the Approve button for about a second.
 
 Verna's 3D rover front page is optional (it embeds this same console): see section 12.
@@ -219,7 +229,8 @@ grep -c '^ENGRAM_ROBOT_SECRET=' ~/engram_robot/robot.env
 ```
 
 Expected: `1`. If `0` or "No such file": stop and ask Brian (`robot/engram_robot/README.md`, "Two-Pi setup",
-step 2). Never paste the secret anywhere.
+step 2). The line must start with `ENGRAM_ROBOT_SECRET=` (not `export ENGRAM_ROBOT_SECRET=`). Never paste the
+secret anywhere.
 
 **9c. Switch the brain to the real robot:**
 
@@ -227,7 +238,10 @@ step 2). Never paste the secret anywhere.
 bash ~/engram_hub/scripts/cds_up.sh --real
 ```
 
-Expected: `brain ... (real robot)` and `robot OK`. The console label changes from SIMULATED to LIVE.
+Expected: `brain ... plans + memory (real robot)`, `console ... robot view: LIVE http://...:8200`, `robot OK` and
+`robot stop latch: off`. If the brain line says `real robot, NOT reaching it`, stop and post the status. On the
+iPad, reload the console: the start-up line now shows the robot's address instead of SIMULATOR, and the SIM
+control is gone.
 
 **9d. The three stop tests (wheels in the air).** The brain plans fetch tasks ("Bring X to Y") and three
 fixed commands (open the gripper, close the gripper, look around); it does not take "turn left" or "drive
@@ -255,7 +269,7 @@ server stopped first, because only one program can use the motor board).
 
 | # | Say | Expected |
 |---|---|---|
-| R1 | "Open the gripper." → Approve | The claw opens; result SUCCEEDED (or UNKNOWN if the claw has no sensor; that is honest, not a failure). **If the claw does not move at all**, its open/close values may still be the placeholders (1500/1500): Brian sets `claw_open_us` / `claw_closed_us` in `~/engram_robot/drive_calib.json`. |
+| R1 | "Open the gripper." → Approve | The claw opens. The result may say **not sensor checked**: this claw has no sensor, so the robot says so honestly; that is not a failure. **If the claw does not move at all**, its open/close values may still be the placeholders (1500/1500): Brian sets `claw_open_us` / `claw_closed_us` in `~/engram_robot/drive_calib.json`. |
 | R2 | "Close the gripper." → Approve | The claw closes. |
 | R3 | Hold the Sample A tag (1) **50 cm** in front of the camera (measure). "Look around." → Approve | Tag 1 is listed as seen, at about **0.5 m**. About 0.63 m means the tag was printed at 50 mm, not 40 mm: reprint (section 2) before any motion. |
 
@@ -264,7 +278,7 @@ clear in front, nothing behind, hand on the motor power.
 
 | # | Say | Expected |
 |---|---|---|
-| R4 | Sample A (tag 1) about 0.8 m in front, bench tag 14 on a box about 1 m to the side. "Bring Sample A to the bench." → read the plan (find Sample A, pick it, place it at the bench) → Approve | It turns to find tag 1, approaches, tries to pick, then goes to the bench. Each step reports SUCCEEDED / FAILED / UNKNOWN. A missed grasp is reported, never claimed. STOP if anything looks wrong. |
+| R4 | Sample A (tag 1) about 0.8 m in front, bench tag 14 on a box about 1 m to the side. "Bring Sample A to the bench." → read the plan (find Sample A, pick it, place it at the bench) → Approve | It turns to find tag 1, approaches, tries to pick, then goes to the bench. Each step reports done, failed or unknown; "not sensor checked" means it ran but no sensor confirmed it. A missed grasp is reported, never claimed. STOP if anything looks wrong. |
 | R5 | Teach the rule (T6), then Sample B (tag 2) and the goggles (tag 3) in reach. "Bring Sample B to the bench." | The plan **moves the goggles first**, then Sample B. Approve step by step only if R4 went well. |
 
 If grasping is unreliable, stop at "it finds and approaches the right tag": that is still a real, sensor-verified
@@ -279,7 +293,7 @@ result. Say so plainly in the demo.
 3. Ask the same task again: the plan **changes** to match the corrected rule.
 4. Ask "What did I say about the goggles?": it answers from memory without moving.
 5. Say clearly which results were simulated, which were the model's suggestion, and which the robot's sensors
-   confirmed (only SUCCEEDED means a sensor confirmed it).
+   confirmed (a step marked "not sensor checked" ran, but no sensor confirmed it).
 
 ---
 
@@ -320,12 +334,13 @@ live run) and **CXV9** (demo rehearsal).
 | `Connection timed out` | Wrong network or address. Check both are on the same Wi-Fi/hotspot. |
 | `Permission denied` | Wrong password/key: ask Brian. |
 | `REMOTE HOST IDENTIFICATION HAS CHANGED` | Stop. Ask Brian before doing anything else. |
-| `git fetch` fails in step 5 | No internet on the Pi: put the Pi and laptop on your phone's hotspot. |
+| `git fetch` fails in step 5 | No internet on the Pi, or the network gives the Pi only IPv6 (GitHub has no IPv6): put the Pi and laptop on your phone's hotspot. Nothing on the Pi changed. |
 | A service shows DOWN after `cds_up.sh` | Look at its log: `tail -50 ~/cds-logs/brain.log` (or `console.log`). Post the last lines. |
-| iPad: "This connection is not private" | The certificate is not trusted yet: step 7, all three parts. |
+| A service stays DOWN but its port is taken | `sudo ss -ltnp 'sport = :8001'` (or 8000 / 8443) shows which program holds it. A copy started by another user or by systemd is invisible to the scripts: stop it (`sudo systemctl stop <service>` or `sudo kill <pid>`), then run `cds_up.sh` again. |
+| iPad: "This connection is not private" | Either the certificate is not trusted yet (step 7, all three parts), or the address you typed is not in the certificate (new network). Run `cds_up.sh` again: it renews the certificate with the same CA, so the iPad still trusts it. `cds_status.sh` warns when this is the problem. |
 | iPad: microphone does not work | Use `https://` (not `http://`), allow the mic in Safari; or type the commands. |
 | Voice understood the wrong words | Type the command instead; post what it heard. |
-| `cds_up.sh --real` says REFUSED | Read the reason it prints: secret missing (9b), or robot server not running (9a). |
+| `cds_up.sh --real` says REFUSED | Read the reason it prints: secret missing or still the default (9b; a line starting with `export` counts as missing), or robot server not running (9a). Nothing that was running was stopped. |
 | Approve gives an error mentioning auth/403 | The brain's and the robot's secrets differ: ask Brian to check `~/engram_robot/robot.env`. |
 | Robot stuck in "stopped" | Re-arm in the console, or `curl -s -X POST http://127.0.0.1:8001/robot/clear_stop`. |
 | Anything moves unexpectedly | "Stop", STOP button, cut motor power. Post what happened. |
