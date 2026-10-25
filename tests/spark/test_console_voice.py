@@ -867,7 +867,7 @@ def multipart(audio: bytes, auto: str = "0") -> bytes:
             "Content-Type: audio/wav\r\n\r\n").encode() + audio + f"\r\n--{BOUNDARY}--\r\n".encode()
 
 
-def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False):
+def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False, root_path=""):
     """Drive the ASGI app directly, the way a server would. Returns (status, body, pulled):
     pulled counts the receive() calls the app made and the body bytes it took."""
     pulled = {"calls": 0, "bytes": 0}
@@ -889,7 +889,7 @@ def _asgi(app, headers, chunks, path="/stt", method="POST", hang_up=False):
         sent.append(message)
 
     scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
-             "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": "",
+             "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": b"", "root_path": root_path,
              "headers": list(headers), "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8000)}
     asyncio.run(app(scope, receive, send))
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")
@@ -925,6 +925,19 @@ def test_a_chunked_stt_upload_is_cut_off_just_past_the_cap(monkeypatch):
     assert status == 413 and json.loads(out)["reason"] == "audio too large: over 4096 bytes"
     assert cap < pulled["bytes"] <= cap + chunk  # cut off at the first chunk past the cap
     assert _queue_is_empty()  # its reservation was released
+
+
+@needs_web
+def test_the_upload_guard_still_applies_when_mounted_under_a_prefix(monkeypatch):
+    from console.server import main
+
+    monkeypatch.setattr(config, "STT_MAX_PENDING_BYTES", 4096)
+    body = multipart(bytes(50_000))
+    status, out, pulled = _asgi(main.app, [FORM_TYPE, (b"content-length", str(len(body)).encode())], [body],
+                                path="/voice/stt", root_path="/voice")
+    assert status == 413 and json.loads(out)["reason"] == "audio too large: over 4096 bytes"
+    assert pulled == {"calls": 0, "bytes": 0}
+    assert _queue_is_empty()
 
 
 @needs_web

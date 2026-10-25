@@ -101,6 +101,13 @@ class _UploadTooLarge(Exception):
     pass
 
 
+def _route_path(scope) -> str:
+    """The path the router matches: scope["path"] without the mount prefix (root_path), as Starlette
+    strips it, so the guard still sees /stt when the app is mounted under a prefix."""
+    path, root = scope["path"], scope.get("root_path", "")
+    return path[len(root):] if root and path.startswith(root) else path
+
+
 class SttUploadGuard:
     """Pure ASGI guard for POST /stt; every other request passes straight through. A body over
     stt_upload_cap() is refused with 413 before Starlette's multipart parser parses or spools
@@ -112,7 +119,7 @@ class SttUploadGuard:
         self.app = app
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] != "/stt":
+        if scope["type"] != "http" or scope["method"] != "POST" or _route_path(scope) != "/stt":
             await self.app(scope, receive, send)
             return
         cap = stt_upload_cap()
