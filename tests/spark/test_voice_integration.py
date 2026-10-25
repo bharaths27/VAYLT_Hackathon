@@ -1,6 +1,8 @@
 """Voice presets reach the real Engine only as unapproved proposals or future tasks."""
 
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ from engram.db import SCHEMA
 from engram.engine import Engine, EngineError
 from engram.planner import refusal
 from engram.robot.mock import MockRobot
+from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscriber, PcmWindow
 from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
 from engram.spark.voice_integration import VoiceIntegration, memory_version
@@ -139,6 +142,18 @@ def test_refusal_future_ok_skips_only_the_deferral_check():
     assert "will not move" in refusal("Don't open the claw after calibration", future_ok=True)
 
 
+@pytest.mark.parametrize("text", ["Wait!", "Hold on", "pause", "Hang on.", "Whoa"])
+def test_new_stop_words_in_a_partial_stop_the_robot(voice, fake, spawn, text):
+    out = voice.on_partial(1, 0, text)
+    assert out["kind"] == "stop" and out["state"]["stopped"] is True
+    assert fake.calls == [] and spawn.jobs == [] and count(voice.engine, "episode") == 0
+
+
+def test_holding_something_in_a_partial_is_not_a_stop(voice, spawn):
+    out = voice.on_partial(1, 0, "Hold the vial")
+    assert out["kind"] == "partial" and voice.engine.robot.state()["stopped"] is False
+
+
 def test_stop_stops_at_once_without_asking_the_model(voice, fake, spawn):
     out = voice.on_partial(1, 0, "Stop")
     assert out["kind"] == "stop" and out["state"]["stopped"] is True
@@ -227,3 +242,86 @@ def test_fixed_requests_only_exist_once_registered(engine, fake):
     assert engine.command("open the gripper.")["status"] == "proposed"
     assert engine.command("Don't open the gripper")["status"] == "refused"
     assert engine.robot.calls == OBSERVED_ONLY
+
+
+class _InstantWhisper:
+    """Transcribes every window as the same words, instantly."""
+
+    def __init__(self, text="Open the claw"):
+        self.text, self.calls = text, []
+
+    def transcribe(self, wav, cancel=None):
+        self.calls.append("partial" if cancel is not None else "final")
+        return self.text
+
+
+def _live_partials(voice, utterance, window, stt, spawn):
+    """Feed 0.6 s of audio, take the first partial through the gate, let the gate classify it."""
+    window.append(b"\x01\x00" * int(0.6 * SAMPLE_RATE))
+    tr = LiveTranscriber(stt, window, poll_s=0.005)
+    tr.start()
+    end, got = time.monotonic() + 2.0, None
+    while got is None and time.monotonic() < end:
+        got = tr.poll()
+        time.sleep(0.005)
+    assert got is not None
+    voice.on_partial(utterance, got[0], got[1])
+    spawn.run_all()
+    return tr
+
+
+def test_an_overflowed_utterance_can_never_reach_a_proposal(taught, spawn, clock):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=1.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)
+    assert voice.gate.prepared().decision.preset == "open_gripper"   # the partials prepared a preset
+    with pytest.raises(AudioOverflow):
+        window.append(b"\x01\x00" * int(0.6 * SAMPLE_RATE))           # "...no, don't" never fits
+    out = voice.finish_live(1, 99, tr)
+    assert out["kind"] == "clarify" and "say it again" in out["reason"]
+    assert stt.calls.count("final") == 0                              # no final transcript at all
+    assert voice.gate.prepared() is None                              # what the partials prepared is void
+    assert voice.on_final(1, 100, "Open the claw")["kind"] == "ignored"   # and can never be reused
+    assert nothing_happened(taught)
+    # Control: the next utterance, which fits, still becomes a proposal through the same path.
+    stt2, window2 = _InstantWhisper(), PcmWindow(max_seconds=1.0)
+    tr2 = _live_partials(voice, 2, window2, stt2, spawn)
+    done = voice.finish_live(2, 99, tr2)
+    assert done["kind"] == "proposal" and done["status"] == "proposed" and done["reused_prediction"]
+    assert taught.robot.calls == OBSERVED_ONLY
+
+
+class _BlockingFinalWhisper:
+    """Partials answer at once; the FINAL transcription blocks until the test releases it."""
+
+    def __init__(self, text="Open the claw"):
+        self.text, self.calls = text, []
+        self.final_started, self.release = threading.Event(), threading.Event()
+
+    def transcribe(self, wav, cancel=None):
+        if cancel is not None:
+            self.calls.append("partial")
+            return self.text
+        self.calls.append("final")
+        self.final_started.set()
+        assert self.release.wait(5), "the test never released the final"
+        return self.text
+
+
+@pytest.mark.parametrize("tail_s", [0.6, 0.05], ids=["tail overflows the window", "tail fits"])
+def test_audio_arriving_while_the_final_is_made_never_becomes_a_proposal(taught, spawn, clock, tail_s):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _BlockingFinalWhisper(), PcmWindow(max_seconds=1.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", voice.finish_live(1, 99, tr)))
+    t.start()
+    assert stt.final_started.wait(2)                            # "Open the claw" is being finalized...
+    with pytest.raises(AudioOverflow):
+        window.append(b"\x01\x00" * int(tail_s * SAMPLE_RATE))  # ...when "no, don't" arrives
+    stt.release.set()
+    t.join(5)
+    assert out["r"]["kind"] == "clarify"                        # not final: say it again
+    assert voice.gate.prepared() is None
+    assert nothing_happened(taught)

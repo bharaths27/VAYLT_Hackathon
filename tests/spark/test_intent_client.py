@@ -1,5 +1,6 @@
 """The intent model client: fixed endpoint, required model id, no redirects, the key never leaks."""
 
+import errno
 import json
 import logging
 import socket
@@ -271,46 +272,47 @@ def test_a_stalled_resolver_cannot_pile_up_workers(monkeypatch):
         _http.post("https://intent.invalid/v1/systemone", b"{}", {}, 1.0)
 
 
-class _StalledSocket:
-    """A socket whose connect is never answered: it waits out the timeout it was given, forever if none."""
+class _StalledSocket(socket.socket):
+    """A real socket whose TCP connect never completes (with _http._writable reporting no progress)."""
 
-    release = threading.Event()
     made: list = []
 
     def __init__(self, *args):
-        self.timeout = None
+        super().__init__(*args)
         _StalledSocket.made.append(self)
 
-    def settimeout(self, t):
-        self.timeout = t
+    def connect_ex(self, sockaddr):
+        return errno.EINPROGRESS
 
-    def connect(self, sockaddr):
-        if not self.release.wait(self.timeout):
-            raise socket.timeout("timed out")
-        raise ConnectionRefusedError("released by the test")
 
-    def close(self):
-        pass
+def _no_progress(sock, timeout):
+    time.sleep(timeout)
+    return False
 
 
 def test_connect_attempts_end_by_the_deadline_so_workers_never_pile_up(monkeypatch):
     assert _no_http_workers_left()
-    _StalledSocket.release.clear()
     _StalledSocket.made.clear()
     monkeypatch.setattr(_http, "_resolve", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
                                                                ("192.0.2.1", 443))])
     monkeypatch.setattr(_http, "_new_socket", _StalledSocket)
-    try:
-        for _ in range(2 * _http.MAX_OUTSTANDING):      # more than the cap: none may be refused as Busy
-            t0 = time.monotonic()
-            with pytest.raises(TimeoutError):
-                _http.post("https://intent.invalid/v1/systemone", b"{}", {}, 0.2)
-            assert time.monotonic() - t0 < 0.6
-            assert _no_http_workers_left(within_s=0.5)  # the connect itself gave up at the deadline
-        assert len(_StalledSocket.made) == 2 * _http.MAX_OUTSTANDING
-        assert all(s.timeout is not None and 0 < s.timeout <= 0.2 for s in _StalledSocket.made)
-    finally:
-        _StalledSocket.release.set()
+    monkeypatch.setattr(_http, "_writable", _no_progress)
+    for _ in range(2 * _http.MAX_OUTSTANDING):          # more than the cap: none may be refused as Busy
+        t0 = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _http.post("https://intent.invalid/v1/systemone", b"{}", {}, 0.2)
+        assert time.monotonic() - t0 < 0.6
+        assert _no_http_workers_left(within_s=0.5)      # the connect itself gave up at the deadline
+    assert len(_StalledSocket.made) == 2 * _http.MAX_OUTSTANDING
+
+
+def test_a_stalled_connect_ends_at_its_own_deadline_even_without_an_abort(monkeypatch):
+    monkeypatch.setattr(_http, "_new_socket", _StalledSocket)
+    monkeypatch.setattr(_http, "_writable", _no_progress)
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        _http._open_tcp("127.0.0.1", 9, time.monotonic() + 0.2, threading.Event())
+    assert time.monotonic() - t0 < 0.5
 
 
 def test_overlong_transcripts_are_refused_and_nothing_is_sent():

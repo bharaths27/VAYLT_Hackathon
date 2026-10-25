@@ -21,6 +21,7 @@ from typing import Any, Hashable
 from ..engine import Engine
 from ..planner import refusal
 from ..skills import APPROVED
+from .audio_windows import AudioOverflow, LiveTranscriber
 from .presets import PRESETS, register_presets
 from .voice import Classifier, GateResult, SpeculationGate
 
@@ -91,3 +92,15 @@ class VoiceIntegration:
                 return {"kind": "none", **base, "reason": "That could not be saved as a future task."}
             return {**out, **base, "preset": r.preset}
         return {"kind": r.action, **base, "reason": r.reason}
+
+    def finish_live(self, utterance: int, revision: int, transcriber: LiveTranscriber) -> dict[str, Any]:
+        """End of speech for audio fed through a LiveTranscriber: transcribe, then on_final.
+
+        An utterance whose audio overflowed the window is refused: no transcript, no proposal, and the
+        gate voids whatever the partials prepared for it, so nothing of it can be reused."""
+        try:
+            text = transcriber.finish()
+        except AudioOverflow:
+            r = self.gate.reject(utterance, "That was too long for me to take in at once. Please say it again.")
+            return {"kind": "clarify", "heard": "", "utterance": utterance, "revision": revision, "reason": r.reason}
+        return self.on_final(utterance, revision, text)

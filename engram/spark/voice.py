@@ -23,7 +23,8 @@ The SpeculationGate enforces these rules:
    asking the intent model. A false stop is safe; a missed one is not. A stop also voids all
    speculation: the prediction, the pending partial and any answer still in flight are
    discarded, and the utterance it was heard in (or the current one, if newer) accepts no
-   further partials or finals. The next utterance starts clean.
+   further partials or finals. The next utterance starts clean. reject() does the same for an
+   utterance that cannot be trusted (its audio overflowed the window), without a stop.
 7. Threads: the worker thread only calls the classifier and the clock. context_version and
    prefetch are called only on the thread that calls on_partial, on_final or prepared, so a
    database connection bound to that thread (sqlite3's default) is safe. The memory bundle
@@ -49,7 +50,11 @@ from .presets import PRESETS
 DEFAULT_TTL_S = 8.0          # a prediction older than this (from when it was asked) is not reused
 DEFAULT_FINAL_WAIT_S = 6.0   # how long on_final waits for the request already in flight
 
-STOP_WORDS = re.compile(r"\b(stop|halt|freeze|abort|emergency)\b", re.IGNORECASE)
+# Exactly the pattern of STOP_WORDS in engram/engine.py and console/server/parser.py (PR #6), so a stop said
+# in a partial stops here just as it would there. "hold on", "hold it" and "hang on" are phrases: "hold the
+# vial" and "holding" are not stops. tests/spark/test_speculation.py pins the pattern.
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b",
+                        re.IGNORECASE)
 # Words that take back or replace part of what was just said. The intent prompt names the same
 # cues; matching them here too means a confident model answer cannot talk past a correction.
 CORRECTION = re.compile(
@@ -125,6 +130,7 @@ class GateStats:
     reused: int = 0          # finals answered by a prediction, with no new request
     errors: int = 0          # intent requests that failed
     stops: int = 0           # stop words heard
+    rejected: int = 0        # utterances rejected as untrustworthy (for example, their audio overflowed)
 
 
 def _clean(text: str) -> str:
@@ -182,7 +188,8 @@ class SpeculationGate:
         self._text = ""
         self._text_since = -1          # revision at which the current text first appeared
         self._final = False
-        self._stopped_utt: int | None = None   # utterances up to this id were stopped
+        self._stopped_utt: int | None = None   # utterances up to this id were stopped or rejected
+        self._void_reason = "stopped"          # why, for the latest of them
         self._ctx_now: Hashable = None         # context version last read on the caller's thread
         self._in_flight: Key | None = None
         self._pending: tuple[int, int, str] | None = None
@@ -309,7 +316,7 @@ class SpeculationGate:
         with self._cv:
             self._ctx_now = ctx
             if self._is_stopped(utterance):
-                return GateResult("ignored", utterance, revision, text, reason="stopped")
+                return GateResult("ignored", utterance, revision, text, reason=self._void_reason)
             if not self._current(key):
                 self.stats.stale_dropped += 1
                 return GateResult("none", utterance, revision, text,
@@ -328,10 +335,21 @@ class SpeculationGate:
         with self._cv:
             self._ctx_now = ctx
 
-    def _latch_stop(self, utterance: Any) -> None:
-        """Void all speculation and refuse further transcripts of the stopped utterance. Never raises."""
+    def reject(self, utterance: int, reason: str = "I could not hear that properly. Please say it again.") -> GateResult:
+        """This utterance cannot be trusted (for example, its audio overflowed the window): void every
+        prediction, pending partial and in-flight answer for it, and refuse its later partials and final,
+        exactly as a stop does, but without asking for a stop."""
+        self._latch_stop(utterance, why="rejected")
+        return GateResult("clarify", utterance, -1, "", reason=reason)
+
+    def _latch_stop(self, utterance: Any, why: str = "stopped") -> None:
+        """Void all speculation and refuse further transcripts of the utterance. Never raises."""
         with self._cv:
-            self.stats.stops += 1
+            if why == "stopped":
+                self.stats.stops += 1
+            else:
+                self.stats.rejected += 1
+            self._void_reason = why
             ids = [u for u in (utterance if _valid_id(utterance) else None, self._utt, self._stopped_utt)
                    if u is not None]
             if ids:
@@ -347,7 +365,7 @@ class SpeculationGate:
         if self._utt is not None and utterance < self._utt:
             return "older utterance"
         if self._is_stopped(utterance):
-            return "stopped"
+            return self._void_reason
         if utterance != self._utt:
             self._utt, self._rev, self._text, self._text_since, self._final = utterance, -1, "", -1, False
             self._pending, self._pred = None, None
