@@ -33,6 +33,8 @@ CAPS = {
 PHYSICAL = set(CAPS) - {'stop','observe','locate_tag','speak'}
 # Ops that move the robot (and so whatever the claw holds).
 NAVIGATION = {'go_to_zone','drive_bounded','turn_bounded','approach_tag'}
+# Ops that act on whatever the claw holds.
+CLAW = {'gripper_open','gripper_close'}
 # The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table).
 GOAL_OPS = {'fetch':('observe','locate_tag','pick_tagged_object','place_at_zone'),'goto':('go_to_zone',),'inspect':('observe','locate_tag')}
 def goal_ops(goal: dict | Goal | None) -> tuple[str, ...]:
@@ -228,7 +230,12 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
                     raise Conflict(f'the claw may be holding {loaded}; opening it would release that object without a placement check')
                 if holding: positions[holding]=at; holding=None
                 open_=True
-            elif op=='gripper_close': open_=False
+            elif op=='gripper_close':
+                # Closing grips whatever the claw holds: a reported object is handled (its constraints are the compiler's
+                # to check); unreported contents are unknown, never "empty".
+                if holding is None and not fixture.get('holding_known'):
+                    raise Conflict('the claw contents are unknown (not reported by the adapter); gripper_close needs a reported claw state')
+                open_=False
         if holding: raise Conflict('task ends with unplaced object')
         if goal.kind=='fetch' and any(positions.get(oid)!=goal.zone for oid in goal.targets):
             raise Conflict('requested goal was not reached' if all(original.get(o) is not None for o in goal.targets) else
@@ -276,10 +283,7 @@ class Compiler:
         goal=Goal.from_dict(goal.to_dict())
         f=copy.deepcopy(fixture or self.fixture(symbolic=True))   # no live world given: the symbolic start state
         rules=self.store.related_rules(goal)
-        relevant=set(goal.targets)|{r['object'] for r in rules}
-        if self.store.unresolved_for(self.store.scope(goal,rules),handles=goal.kind=='fetch'):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
-        if self.store.prohibitions(relevant) and goal.kind=='fetch': raise DeniedPlan('current source prohibits moving an involved object')
-        if any(r['status']!='active' for r in rules): raise Conflict('conflicting applicable source rules need resolution')
+        self.refuse(goal,f,rules)
         if not set(goal.targets)<=set(f['objects']): raise Missing('unregistered goal target')
         if goal.zone and goal.zone not in f['zones']: raise Missing('unregistered destination')
         if goal.kind=='fetch':
@@ -300,6 +304,19 @@ class Compiler:
               'basis':self.store.basis(goal),'policy_hash':self.store.policy.fingerprint(),
               'verification':v.to_dict(),'origin':'composed_from_current_memory' if composed else 'proposed_and_verified'}
         return plan
+
+    @staticmethod
+    def held(goal: Goal, f: dict) -> set[str]:
+        """What a claw primitive handles: the object the adapter reports in the claw (closing grips it, opening releases it)."""
+        return {f['holding']} if goal.kind=='primitive' and goal.primitive in CLAW and f.get('holding_known') and f.get('holding') else set()
+
+    def refuse(self, goal: Goal, f: dict, rules: list[dict]) -> None:
+        """Raise the refusal current memory sets for this goal in this world: an unresolved statement or a prohibition on
+        what it involves or handles (a claw primitive handles the held object), or conflicting applicable rules."""
+        held=self.held(goal,f); handles=goal.kind=='fetch' or bool(held)
+        if self.store.unresolved_for(self.store.scope(goal,rules)|held,handles=handles):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
+        if self.store.prohibitions(set(goal.targets)|{r['object'] for r in rules}|held) and handles: raise DeniedPlan('current source prohibits moving an involved object')
+        if any(r['status']!='active' for r in rules): raise Conflict('conflicting applicable source rules need resolution')
 
     def _compose(self, goal: Goal, f: dict, rules: list[dict]) -> list[dict]:
         positions=dict(f['positions']); steps=[]; ancestry=set()

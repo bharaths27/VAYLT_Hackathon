@@ -2,7 +2,7 @@
 import pytest
 from engram.cortex.integration import GuardedUpstream
 from engram.cortex.learning import Skills
-from engram.cortex.planning import Compiler,parse_goal,verify
+from engram.cortex.planning import Compiler,DeniedPlan,parse_goal,verify
 from engram.cortex.runtime import Brain
 from engram.cortex.seeding import load_seed,synthetic_seed_present
 from engram.cortex.simulation import FakeRobot,Result
@@ -62,7 +62,7 @@ def test_open_claw_is_refused_when_the_held_object_is_unknown(arena,clock):
 def test_open_claw_is_refused_when_loaded_even_after_proposal(brain):
     brain.store.teach('Restriction','Never move Sample B.',owner='carther')
     brain.robot.holding='sample_b'                                                 # the adapter reports Sample B in the claw
-    with pytest.raises(Conflict,match='holding sample_b'): brain.command('Open the claw',principal='carther')
+    with pytest.raises((Conflict,DeniedPlan)): brain.command('Open the claw',principal='carther')   # held, and prohibited (round 10)
     with pytest.raises(Conflict,match='already holds sample_b'): brain.command('Bring Sample A to the bench.',principal='carther')
     brain.robot.holding=None
     p=brain.command('Open the claw',principal='carther'); assert p['status']=='proposed'   # control: reported empty

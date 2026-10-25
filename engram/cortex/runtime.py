@@ -281,7 +281,11 @@ class Brain:
                     if plan['basis']!=self.store.basis(goal) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
                         raise Stale('rule, binding, source or policy changed after proposal')
                     if self.store.prohibitions(set(goal.targets)|{r['object'] for r in self.store.related_rules(goal)}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
-                    v=verify(goal,plan['steps'],self._fixture(),self.store.related_rules(goal),self.store.policy)
+                    # The live world decides too: what the claw holds now is what a claw primitive handles, with its constraints.
+                    world=self._fixture()
+                    try: self.compiler.refuse(goal,world,self.store.related_rules(goal))
+                    except CortexError as e: raise Denied(str(e)) from None
+                    v=verify(goal,plan['steps'],world,self.store.related_rules(goal),self.store.policy)
                     if not v.ok: raise Denied('; '.join(v.errors))
                     claimed=self.store.conn.execute("UPDATE episode SET outcome='running' WHERE id=? AND outcome='proposed'",(ep,)).rowcount
                     if claimed!=1: raise Conflict('operation already claimed')
