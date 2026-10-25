@@ -561,6 +561,62 @@ def test_resident_piper_voice_is_reused_until_the_voice_changes(piper, monkeypat
     assert len(loads) == 2  # new voice on disk -> reloaded
 
 
+def _fake_piper(monkeypatch, loads, spoken, fail_load=False, load_seconds=0.0):
+    class FakePiperVoice:
+        @classmethod
+        def load(cls, path):
+            loads.append(path)
+            time.sleep(load_seconds)
+            if fail_load:
+                raise RuntimeError("not an onnx model")
+            return cls()
+
+        def synthesize_wav(self, text, wf):
+            spoken.append(text)
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(22050)
+            wf.writeframes(b"\x00\x01" * 2000)
+
+    fake = types.ModuleType("piper")
+    fake.PiperVoice = FakePiperVoice
+    monkeypatch.setitem(sys.modules, "piper", fake)
+    monkeypatch.setattr(voice, "_synth_py", _real_synth_py)
+
+
+def test_warming_up_loads_the_voice_and_speaks_once_so_the_first_reply_is_fast(piper, monkeypatch):
+    loads, spoken = [], []
+    _fake_piper(monkeypatch, loads, spoken)
+    assert run(voice.warm_tts()) is True
+    assert len(loads) == 1 and spoken == ["Ready."]  # loaded, and its first (slow) synthesis done
+    assert not piper.cache.exists() or list(piper.cache.iterdir()) == []  # the throwaway is not cached
+    assert run(voice.synthesize("Opening the claw."))
+    assert len(loads) == 1 and spoken == ["Ready.", "Opening the claw."]  # the reply reused it
+
+
+def test_a_reply_asked_for_during_the_warm_up_waits_for_it_instead_of_loading_again(piper, monkeypatch):
+    loads, spoken = [], []
+    _fake_piper(monkeypatch, loads, spoken, load_seconds=0.2)  # a load slow enough to overlap
+
+    async def both():
+        return await asyncio.gather(voice.warm_tts(), voice.synthesize("Stopped."))
+
+    warmed, reply = run(both())
+    assert warmed is True and reply.exists() and len(loads) == 1
+
+
+@pytest.mark.parametrize("missing", ["piper-package", "model", "broken-model"])
+def test_warming_up_without_a_usable_voice_is_harmless(piper, monkeypatch, missing):
+    loads, spoken = [], []
+    _fake_piper(monkeypatch, loads, spoken, fail_load=missing == "broken-model")
+    if missing == "piper-package":
+        monkeypatch.setitem(sys.modules, "piper", None)  # import piper -> ImportError
+    if missing == "model":
+        piper.model.unlink()
+    assert run(voice.warm_tts()) is False and spoken == []
+    assert (voice._TTS.jobs, voice._TTS.bytes) == (0, 0)
+
+
 
 # ------------------------------------------------------------------ voice_probe
 def test_word_error_rate():
@@ -959,6 +1015,28 @@ def test_the_console_closes_the_whisper_pool_on_shutdown(monkeypatch):
     with TestClient(main.app):
         assert closed == []
     assert closed == [1]
+
+
+@needs_web
+def test_the_console_warms_the_voice_at_startup_without_waiting_for_it(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from console.server import main
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    async def slow_warm_up():  # a first load that takes a while
+        started.set()
+        await asyncio.to_thread(release.wait, 5)
+        finished.set()
+        return True
+
+    monkeypatch.setattr(main.voice, "warm_tts", slow_warm_up)
+    with TestClient(main.app) as client:
+        assert started.wait(5)  # began at startup...
+        assert client.get("/health").status_code == 200  # ...and the console serves meanwhile,
+        assert not finished.is_set()  # before the warm-up is done
+        release.set()
 
 
 def multipart(audio: bytes, auto: str = "0") -> bytes:

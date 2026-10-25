@@ -71,6 +71,7 @@ async def lifespan(app):
     tasks = [asyncio.create_task(f()) for f in (_state_loop, _net_loop, _expiry_loop)]
     if brain.enabled():
         tasks.append(asyncio.create_task(_brain_pending_loop()))
+    tasks.append(asyncio.create_task(voice.warm_tts()))  # load Piper now, not on the first reply
     yield
     for t in tasks:
         t.cancel()
