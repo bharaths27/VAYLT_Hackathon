@@ -90,7 +90,7 @@ def test_template_that_ignores_thinking_off_is_refused_before_completion():
     assert [n for n,_ in t.calls]==['apply-template'] and q.last_trace['thinking_disabled'] is False and q.last_trace['stage']=='template'
 
 # --- E: model id is the GGUF file name, not a host path ----------------------------------------
-@pytest.mark.parametrize('reported',['H:/_scratch/llama/models/Qwen3-1.7B-Q8_0.gguf','H:\\llama\\models\\Qwen3-1.7B-Q8_0.gguf','/home/pi/models/Qwen3-1.7B-Q8_0.gguf'])
+@pytest.mark.parametrize('reported',['D:/models/Qwen3-1.7B-Q8_0.gguf','H:\\llama\\models\\Qwen3-1.7B-Q8_0.gguf','/home/pi/models/Qwen3-1.7B-Q8_0.gguf'])
 def test_reported_model_path_is_reduced_to_basename(reported):
     out=QwenClient(transport=Fake(model=reported)).complete('plan',{},goal=Goal('primitive',primitive='gripper_open').to_dict())
     assert out.model=='Qwen3-1.7B-Q8_0.gguf' and out.trace['stop_type']=='eos' and out.trace['thinking_disabled'] is True
