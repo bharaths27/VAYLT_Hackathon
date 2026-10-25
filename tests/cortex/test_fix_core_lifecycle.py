@@ -74,6 +74,7 @@ def test_fix_core_approval_racing_the_wake_link_is_recorded(brain):
     real = brain.propose
     def propose(*a, **k):
         prop = real(*a, **k)
+        assert task_row(brain, t['task_id'])['proposal_id'] == prop['operation_id']   # linked before it is approvable
         assert approve(brain, prop)['status'] == 'success'   # operator approves from the pending list at once
         return prop
     brain.propose = propose
@@ -82,6 +83,19 @@ def test_fix_core_approval_racing_the_wake_link_is_recorded(brain):
     op = out[0]['proposal']['operation_id']
     assert task_row(brain, t['task_id']) == {'status': 'done', 'proposal_id': op}
     assert brain.store.one('SELECT status,proposal_id FROM cx_wake')== {'status': 'linked', 'proposal_id': op}
+
+
+def test_fix_core_stop_during_wake_planning_settles_commitment(brain):
+    t = make_task(brain)
+    real = brain.store.bundle
+    def bundle(*a, **k):
+        brain.stop()                                     # stop lands while the woken proposal is being prepared
+        return real(*a, **k)
+    brain.store.bundle = bundle
+    fire(brain)
+    brain.store.bundle = real
+    assert brain.store.one('SELECT outcome FROM episode')['outcome'] == 'cancelled'
+    assert task_row(brain, t['task_id'])['status'] == 'cancelled'   # not left 'fired' forever
 
 
 def test_fix_core_commitment_withdrawn_during_planning_never_becomes_approvable(brain):
