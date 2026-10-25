@@ -49,9 +49,13 @@ def test_memories_built_from_a_commitment_stay_its_owners(brain):
     assert brain.trigger('the tray arrives',event_id='ev1',principal='alice')[0]['proposal']['status']=='proposed'
     fsid=brain.store.one("SELECT id FROM source WHERE kind='future'")['id']
     cites=lambda items,key='refs':[x for x in items if 'source:'+fsid in (x[key] if key else x['definition']['refs'])]
-    assert cites(brain.store.derived())                                                      # the premise: a recipe cites it
-    assert cites(brain.store.bundle('anything at all',None,principal='alice')['derived'])
+    recipe=cites(brain.store.derived())                                                      # the premise: a recipe cites it
+    assert recipe and cites(brain.store.bundle('anything at all',None,principal='alice')['derived'])
     assert not cites(brain.store.bundle('anything at all',None,principal='bob')['derived'])  # was: shown to bob
+    assert not cites(brain.store.bundle('anything at all',None)['derived'])                  # no principal: nobody
+    note=brain.store.derive('summary',{'about':'that recipe'},['derived:'+recipe[0]['id']],origin='test',verified=True,verifier='episodic-summary-v1')
+    shown=lambda who:[d['id'] for d in brain.store.bundle('anything at all',None,principal=who)['derived']]
+    assert note['id'] in shown('alice') and note['id'] not in shown('bob')                   # cited through a derived memory
     with TestClient(create_app(brain,tokens={TA:'alice',TB:'bob'},start_idle=False)) as c:
         assert cites(c.get('/skills',headers={'Authorization':'Bearer '+TA}).json(),None)
         assert not cites(c.get('/skills',headers={'Authorization':'Bearer '+TB}).json(),None)
@@ -98,6 +102,17 @@ def test_guard_a_refusal_is_no_gap_and_never_reaches_the_model(store,arena,monke
     b=model_brain(store,arena,GOOD)
     with pytest.raises(Missing,match='structured review'): b.command('Bring Sample A to the bench.',principal='carther')
     assert b.qwen.calls==0
+
+
+def test_guard_a_model_plan_meets_the_cyclic_prerequisite_refusal_too(store,arena):
+    for sub,pre,zone in (('sample_b','goggles','ppe_station'),('goggles','sample_b','bench')):               # a cycle
+        store.teach('Rule','Cyclic.',owner='carther',rules=[{'subject':sub,'prerequisite':pre,'required_zone':zone}])
+    store.observe('goggles','ppe_station',origin='camera',mode='OPERATOR');store.observe('sample_b','bench',origin='camera',mode='OPERATOR')
+    steps=[{'op':'locate_tag','args':{'object_id':'sample_b'}},{'op':'pick_tagged_object','args':{'object_id':'sample_b'}},
+           {'op':'place_at_zone','args':{'zone':'shelf_b'}}]                                  # passes the step check alone
+    q=Planner(steps);q.planning_order='model_first';b=Brain(store,FakeRobot(arena),qwen=q)
+    with pytest.raises(Conflict,match='cyclic'): b.command('Bring Sample B to the shelf b.',principal='carther')
+    assert q.calls==1
 
 
 # P2-4: deleting a source also purges its task aliases' episodes that never got a plan.
