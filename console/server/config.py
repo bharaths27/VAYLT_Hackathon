@@ -1,5 +1,6 @@
 """All runtime settings come from environment variables so the same code runs
 on a laptop (mocks) and on the Pi 5 (real robot + memory) with no edits."""
+import math
 import os
 from pathlib import Path
 
@@ -8,6 +9,35 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
+
+
+def _seconds(name: str, default: float, cap: float) -> float:
+    """A finite number of seconds with 0 < t <= cap; anything else (inf, nan, <= 0, too big,
+    not a number) gives the default."""
+    try:
+        t = float(_env(name, str(default)))
+    except ValueError:
+        return default
+    return t if math.isfinite(t) and 0 < t <= cap else default
+
+
+def _count(name: str, default: int, cap: int) -> int:
+    """A whole number with 0 < n <= cap; anything else gives the default."""
+    try:
+        n = int(_env(name, str(default)))
+    except ValueError:
+        return default
+    return n if 0 < n <= cap else default
+
+
+def _audio_ctx(name: str, default: int) -> int:
+    """0 (whisper's own default, all 1500) or 384..1500; anything else gives the default. Below
+    ~384 whisper starts repeating words (256 measured unsafe: multi-second hallucinations)."""
+    try:
+        n = int(_env(name, str(default)))
+    except ValueError:
+        return default
+    return n if n == 0 or 384 <= n <= 1500 else default
 
 
 # Where Brian's robot adapter lives. "mock" = built-in simulator.
@@ -32,6 +62,34 @@ PIPER_BIN = _env("ENGRAM_PIPER_BIN", "piper")
 WHISPER_BIN = _env("ENGRAM_WHISPER_BIN", str(ROOT / "vendor" / "whisper.cpp" / "build" / "bin" / "whisper-cli"))
 WHISPER_MODEL = _env("ENGRAM_WHISPER_MODEL", str(ROOT / "models" / "ggml-tiny.en.bin"))
 FFMPEG_BIN = _env("ENGRAM_FFMPEG_BIN", "ffmpeg")
+# Optional resident whisper.cpp server (keeps the model loaded between requests), e.g.
+# http://127.0.0.1:8178. Empty = off. Loopback hosts only (127.0.0.1, localhost, ::1); any other
+# host is ignored so audio never leaves the board. Any server failure falls back to WHISPER_BIN.
+WHISPER_SERVER_URL = _env("ENGRAM_WHISPER_SERVER_URL", "")
+# One overall deadline for the whole server request (connect, upload, answer), at most 120 s.
+WHISPER_SERVER_TIMEOUT_S = _seconds("ENGRAM_WHISPER_SERVER_TIMEOUT_S", 30.0, 120.0)
+# whisper's audio context (encoder frames; 1500 = 30 s). Our clips are a few seconds, so a smaller
+# context is much faster: 0 = whisper's default, else 384..1500. Passed to whisper-cli as -ac N,
+# and to the whisper server with every request as its audio_ctx form field (whisper.cpp's
+# /inference reads it per request; the server's own -ac start flag is only its default).
+WHISPER_AUDIO_CTX = _audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 512)
+# Initial prompt naming the robot's vocabulary, so whisper hears "claw" rather than "cloth" or
+# "clock". Passed to whisper-cli as --prompt and to the server as its prompt form field; empty =
+# none. A sentence of nouns, not a list of commands: measured, a bare word list did not help and a
+# prompt full of command phrases gets copied into transcripts.
+WHISPER_PROMPT = _env("ENGRAM_WHISPER_PROMPT", "A lab robot with a claw (its gripper), a beaker, goggles, "
+                      "a sample, a bench, a shelf, a tray and a station.").strip()[:500]
+# Longest clip STT accepts, measured on the decoded audio (at most 120 s). ffmpeg stops decoding
+# just past it, and longer clips are refused before whisper sees them.
+STT_MAX_SECONDS = _seconds("ENGRAM_STT_MAX_SECONDS", 30.0, 120.0)
+# How long /stt waits for the whole upload to arrive (at most 120 s). A client that stalls
+# part way is answered 408 and the room it reserved in the STT queue is given back.
+STT_UPLOAD_TIMEOUT_S = _seconds("ENGRAM_STT_UPLOAD_TIMEOUT_S", 20.0, 120.0)
+# Speech queues: past these, requests are refused as busy instead of piling up in memory.
+# Counts include the job that is running. STT also caps the audio bytes its queued jobs hold.
+STT_MAX_PENDING = _count("ENGRAM_STT_MAX_PENDING", 4, 64)
+STT_MAX_PENDING_BYTES = _count("ENGRAM_STT_MAX_PENDING_BYTES", 32 * 1024 * 1024, 1024 * 1024 * 1024)
+TTS_MAX_PENDING = _count("ENGRAM_TTS_MAX_PENDING", 8, 64)
 
 # Folder whose files are SHA-256 hashed and shown on the HUD (proves weights unchanged)
 MODELS_DIR = Path(_env("ENGRAM_MODELS_DIR", str(ROOT / "models")))

@@ -11,10 +11,13 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.datastructures import UploadFile as FormFile
+from starlette.formparsers import MultiPartParser
+from starlette.requests import ClientDisconnect
 
 from . import brain, config, llm, voice
 from .adapters.memory import make_memory
@@ -71,9 +74,104 @@ async def lifespan(app):
     yield
     for t in tasks:
         t.cancel()
+    await asyncio.to_thread(voice.close)  # the whisper server's connection pool
+
+
+# ------------------------------------------------------------------ /stt upload limits
+STT_FORM_OVERHEAD = 16 * 1024  # multipart boundaries, part headers and the small "auto" field
+
+
+def stt_upload_cap() -> int:
+    """Largest /stt request body accepted: one clip at the STT queue's byte limit, plus room
+    for the multipart framing around it."""
+    return config.STT_MAX_PENDING_BYTES + STT_FORM_OVERHEAD
+
+
+def _audio_too_large(limit: int) -> JSONResponse:
+    return JSONResponse({"ok": False, "reason": f"audio too large: over {limit} bytes"}, status_code=413)
+
+
+def _declared_length(value: str | bytes | None) -> int | None:
+    """The Content-Length as a number, or None when there is none (chunked) or it is not one."""
+    if value is None:
+        return None
+    value = value.decode("latin-1") if isinstance(value, bytes) else value
+    return int(value) if value.strip().isdigit() else None
+
+
+class _UploadTooLarge(Exception):
+    pass
+
+
+async def _read_stt_form(request: Request, deadline: float):
+    """Parse the multipart /stt body within `deadline` seconds (asyncio.TimeoutError past it).
+    On any way out but success (timeout, client gone, malformed body, the guard's cut-off) the
+    partly written spool files are closed here rather than left for the garbage collector."""
+    parser = MultiPartParser(request.headers, request.stream(), max_files=1, max_fields=2)
+    try:
+        return await asyncio.wait_for(parser.parse(), deadline)
+    except BaseException:
+        for spool in getattr(parser, "_files_to_close_on_error", ()):  # the spool files it opened
+            spool.close()
+        raise
+
+
+def _route_path(scope) -> str:
+    """The path the router matches: scope["path"] without the mount prefix (root_path), as Starlette
+    strips it, so the guard still sees /stt when the app is mounted under a prefix."""
+    path, root = scope["path"], scope.get("root_path", "")
+    return path[len(root):] if root and path.startswith(root) else path
+
+
+class SttUploadGuard:
+    """Pure ASGI guard for POST /stt; every other request passes straight through. A body over
+    stt_upload_cap() is refused with 413 before Starlette's multipart parser parses or spools
+    it: a declared Content-Length over the cap is refused without reading any of the body, and
+    a chunked (or unknown-length) body is counted as it streams through receive() and cut off
+    as soon as the count passes the cap."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["method"] != "POST" or _route_path(scope) != "/stt":
+            await self.app(scope, receive, send)
+            return
+        cap = stt_upload_cap()
+        declared = _declared_length(dict(scope["headers"]).get(b"content-length"))
+        if declared is not None and declared > cap:
+            await _audio_too_large(config.STT_MAX_PENDING_BYTES)(scope, receive, send)
+            return
+        seen, refused, started = 0, False, False
+
+        async def counted_receive():
+            nonlocal seen, refused
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > cap:
+                    refused = True
+                    raise _UploadTooLarge(f"/stt body passed {cap} bytes")
+            return message
+
+        async def send_unless_refused(message):
+            nonlocal started
+            if refused:
+                return  # the app's answer to a refused upload is dropped; the 413 goes out instead
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, counted_receive, send_unless_refused)
+        except Exception:
+            if not refused:
+                raise
+        if refused and not started:
+            await _audio_too_large(config.STT_MAX_PENDING_BYTES)(scope, receive, send)
 
 
 app = FastAPI(title="ENGRAM Cortex Console", lifespan=lifespan)
+app.add_middleware(SttUploadGuard)
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
@@ -421,17 +519,54 @@ async def ledger_tail(n: int = 100):
 # ------------------------------------------------------------------ voice
 @app.get("/tts")
 async def tts(text: str):
-    p = await voice.synthesize(text)
+    try:
+        p = await voice.synthesize(text)
+    except voice.VoiceBusy as e:
+        raise HTTPException(503, f"{e}; client should use speechSynthesis")
     if not p:
         raise HTTPException(404, "piper not available; client should use speechSynthesis")
     return FileResponse(p, media_type="audio/wav")
 
 
 @app.post("/stt")
-async def stt(audio: UploadFile = File(...), auto: str = Form("1")):
-    data = await audio.read()
-    suffix = Path(audio.filename or "a.webm").suffix or ".webm"
-    text, why = await voice.transcribe(data, suffix)
+async def stt(request: Request):
+    """Multipart form: audio (the clip) and auto ("1": run it as a command). Room in the STT
+    queue is reserved BEFORE any of the upload is parsed or read, for the declared length (or
+    the queue's byte limit when none is declared): a full queue answers 503 busy, unread. The
+    clip is then read bounded by that reservation, which is trimmed to its real size."""
+    limit = config.STT_MAX_PENDING_BYTES
+    declared = _declared_length(request.headers.get("content-length"))
+    try:
+        reservation = voice.reserve_stt(limit if declared is None else min(declared, limit))
+    except voice.VoiceBusy as e:
+        return JSONResponse({"ok": False, "reason": str(e)}, status_code=503)
+    with reservation:  # released on every way out unless the STT job has taken it over
+        if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            return JSONResponse({"ok": False, "reason": "no audio file in the upload"}, status_code=422)
+        deadline = config.STT_UPLOAD_TIMEOUT_S
+        try:
+            form = await _read_stt_form(request, deadline)
+        except asyncio.TimeoutError:
+            return JSONResponse({"ok": False, "reason": f"upload not received within {deadline:g} s"}, status_code=408)
+        except ClientDisconnect:
+            return Response(status_code=400)  # the client has gone; nobody reads this
+        except Exception as e:  # noqa: BLE001 - a malformed (or, past the guard's cap, cut off) upload
+            return JSONResponse({"ok": False, "reason": f"unreadable upload: {type(e).__name__}"}, status_code=400)
+        try:
+            audio, auto = form.get("audio"), form.get("auto", "1")
+            if not isinstance(audio, FormFile):
+                return JSONResponse({"ok": False, "reason": "no audio file in the upload"}, status_code=422)
+            data = await audio.read(reservation.size + 1)  # never more than the room reserved
+            if len(data) > reservation.size:
+                return _audio_too_large(reservation.size)
+            reservation.trim(len(data))
+            suffix = Path(audio.filename or "a.webm").suffix or ".webm"
+        finally:
+            await form.close()
+        try:
+            text, why = await voice.transcribe(data, suffix, reservation=reservation)
+        finally:
+            del data  # the queue released its byte reservation: the handler must not keep the clip either
     if not text:
         return JSONResponse({"ok": False, "reason": why}, status_code=503)
     res = {"ok": True, "text": text}
