@@ -43,11 +43,20 @@ STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa)\b")
 # rest of the sentence would do the opposite of what was said, so these refuse. Checked after the rule
 # prefix, so "remember that the vial must never ..." is still taught as a rule (rules never move anything).
 NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never ?mind|wait|hold on)\b")
-# A future condition ("after calibration finishes", "when the vial arrives") or a trailing delay ("open the
-# claw in 5 seconds"). Only a leading timer ("In 5 seconds, ...") can be scheduled here; anything else
-# would run NOW, so it asks instead.
-FUTURE = re.compile(r"\b(after|when|whenever|once(?=\s+\w)|as soon as|until|till|later|soon|tomorrow|tonight"
-                    r"|in a (?:bit|moment|while)|in \S+ (?:seconds?|secs?|minutes?|mins?|hours?))\b")
+# A future condition or time: an event ("after calibration finishes", "when the vial arrives"), a delay
+# ("in 2 days", "in half an hour", "10 minutes from now", or "in 5 seconds" at the end), a clock time
+# ("at 5 pm", "at 17:30") or a day ("tomorrow", "next week", "on Friday"). Only a leading
+# "In N seconds/minutes, ..." can be scheduled here (PROSPECTIVE); anything else would run NOW, so it asks.
+_UNIT = r"(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|bit|moment|while)"
+_DAY = r"(?:mon|tues|wednes|thurs|fri|satur|sun)day"
+_PERIOD = rf"(?:morning|afternoon|evening|night|week|weekend|month|year|{_DAY})"
+_CLOCK = r"(?:\d{1,2}(?::\d{2})? ?(?:[ap]\.?m|o'?clock)|\d{1,2}:\d{2}|\w+ (?:[ap]\.?m|o'?clock)|noon|midnight)"
+FUTURE = re.compile(
+    r"\b(after|when|whenever|once(?=\s+\w)|as soon as|until|till"
+    rf"|in (?:\S+ ){{1,4}}?{_UNIT}|from now"
+    rf"|(?:at|by|around) {_CLOCK}"
+    rf"|(?:next|this|coming) {_PERIOD}|next time|{_DAY}|in the (?:morning|afternoon|evening|future)|at night"
+    r"|later|soon|eventually|sometime|someday|today|tonight|tomorrow|overnight)\b")
 
 QUIPS = {
     "plan": ["Plan staged. Your signature, please.", "Drafted. Nothing moves until you say so.",
@@ -228,7 +237,13 @@ def _parse(text: str, bundle: dict) -> ParseResult:
         secs = n * (60 if m.group(2).startswith("min") else 1)
         inner = m.group(3)
         sub = parse(inner, bundle)
-        if sub.kind not in ("plan",):
+        if sub.kind == "prospective":  # "In 5 minutes, in 5 seconds, ..." would schedule 5 s and drop the 5 min
+            return ParseResult("clarify", text, reason="Give one delay, for example 'In 5 minutes, open the claw'",
+                               quip=quip("clarify"), trace=trace + ["nested delay"])
+        if sub.kind != "plan" or sub.plan is None:
+            # Only a plan is scheduled. Anything else (stop, refusal, question) comes back as itself, and never
+            # goes to the LLM fallback, which would plan the task for NOW and drop the delay.
+            sub.data.pop("llm_eligible", None)
             sub.trace = trace + ["prospective inner command failed"] + sub.trace
             return sub
         return ParseResult("prospective", text, plan=sub.plan, quip=quip("prospective"),

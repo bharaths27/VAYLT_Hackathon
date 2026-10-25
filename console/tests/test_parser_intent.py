@@ -47,6 +47,31 @@ FUTURE = [
     "Bring the vial to zone B after the beep.", "Whenever the bench is clear, open the claw.",
     "Open the claw later.", "Open the claw in 5 seconds.", "Drive forward 10 cm in two minutes.",
     "In 5 seconds, open the claw after calibration.",
+    # Review round 2: durations and times the console cannot schedule ("in 2 days" planned an open NOW).
+    "Open the claw in 2 days.", "Open the claw in 3 hours.", "Open the claw in an hour.",
+    "Open the claw in half an hour.", "Open the claw in two and a half hours.", "Open the claw in 2 weeks.",
+    "Open the claw in a month.", "Open the claw in 1 year.", "Open the claw 10 minutes from now.",
+    "Open the claw tomorrow.", "Open the claw tonight.", "Open the claw later today.", "Open the claw today.",
+    "Open the claw next week.", "Open the claw next Monday.", "Open the claw on Friday.",
+    "Open the claw this afternoon.", "Open the claw in the morning.", "Open the claw next time.",
+    "Open the claw at 5 pm.", "Open the claw at 5pm.", "Open the claw at 5 p.m.", "Open the claw at 17:30.",
+    "Open the claw at five o'clock.", "Open the claw at noon.", "Drive forward 10 cm by 5 pm.",
+    "In 2 days, open the claw.", "In 3 hours, close the claw.", "In an hour, open the claw.",
+    "Tomorrow, open the claw.", "Next week, bring the vial to zone B.", "At 5 pm, open the claw.",
+]
+
+# The leading "In N seconds/minutes, <task>" form schedules only a plan. Anything else the inner task
+# parses to comes back as itself, never as a prospective without a plan, and never to the LLM fallback.
+PROSPECTIVE_INNER = [
+    ("In 5 seconds, open the claw after calibration.", "clarify"),
+    ("In 5 seconds, open the claw tomorrow.", "clarify"),
+    ("In 5 minutes, in 5 seconds, open the claw.", "clarify"),  # would schedule 5 s and drop the 5 min
+    ("In 5 seconds, don't open the claw.", "abstain"),
+    ("In 5 seconds, cancel that.", "abstain"),
+    ("In 5 seconds, bring it here.", "clarify"),
+    ("In 5 seconds, juggle.", "abstain"),  # no grammar: the LLM would plan it for NOW
+    ("In 5 seconds, stop.", "stop"),
+    ("In 2 minutes, open the claw. Stop!", "stop"),
 ]
 
 STILL_WORKS = [
@@ -60,6 +85,9 @@ STILL_WORKS = [
     ("What do you see?", "plan", "observe"),
     ("In 5 seconds, open the claw.", "prospective", "gripper_open"),
     ("After 5 seconds, close the claw.", "prospective", "gripper_close"),
+    ("In 2 minutes, bring the red cup to zone B.", "prospective", "search_tag"),
+    ("In five minutes, open the claw.", "prospective", "gripper_open"),
+    ("Bring the cup next to the vial to zone B.", "plan", "search_tag"),
     ("Remember that the vial must never leave zone B.", "rule", None),
     ("From now on, do not drive into zone A.", "rule", None),
 ]
@@ -82,6 +110,13 @@ def test_negated_command_is_refused_not_planned(text):
 def test_future_condition_is_not_run_now(text):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
+
+
+@pytest.mark.parametrize("text,kind", PROSPECTIVE_INNER)
+def test_prospective_schedules_only_a_plan(text, kind):
+    r = parse(text, BUNDLE)
+    assert (r.kind, r.plan) == (kind, None), (text, r.kind, r.trace)
+    assert not r.data.get("llm_eligible"), "the LLM fallback would plan the task now and drop the delay"
 
 
 @pytest.mark.parametrize("text,kind,first_op", STILL_WORKS)
