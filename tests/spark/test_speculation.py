@@ -609,3 +609,79 @@ def test_thresholds_are_explicitly_experimental():
     assert "EXPERIMENTAL" in Thresholds.__doc__
     th = Thresholds()
     assert th.block < min(th.preset, th.ready, th.directed)
+
+
+# ---- a prediction that lands later is announced; the owner prefetches it --------------------------------
+
+
+def test_a_prediction_that_lands_later_is_announced_and_pump_prefetches_it():
+    me = threading.get_ident()
+    landed, fetched = threading.Event(), []
+    fake = FakeIntent()
+    fake.hold()
+
+    def prefetch(text):
+        fetched.append((text, threading.get_ident()))
+        return {"goal": text}
+
+    gate = SpeculationGate(fake, prefetch=prefetch, on_prediction=landed.set)    # real worker threads
+    gate.on_partial(1, 0, "Open the claw")                      # dispatched; the answer is not there yet
+    assert fetched == [] and not landed.is_set()
+    fake.release.set()                                          # it lands after on_partial returned
+    assert landed.wait(2)                                       # the owner is told, from the worker...
+    assert fetched == []                                        # ...which never fetches anything itself
+    gate.pump()                                                 # the owner prefetches, on its own thread
+    assert fetched == [("Open the claw", me)] and gate.prepared().bundle == {"goal": "Open the claw"}
+    gate.pump()
+    assert len(fetched) == 1                                    # nothing left to do: fetched once
+
+
+def test_a_dropped_answer_is_not_announced(fake, spawn, clock):
+    told = []
+    gate = make_gate(fake, spawn, clock, on_prediction=lambda: told.append(1))
+    gate.on_partial(1, 0, "Open the claw")
+    gate.on_partial(1, 1, "Open the claw after")               # the first answer will be stale
+    spawn.run_next()
+    assert told == [] and gate.stats.stale_dropped == 1        # dropped, so nothing to announce
+    spawn.run_all()
+    assert told == [1]                                          # the current answer is announced
+
+
+# ---- a rejection is scoped to its own utterance ----------------------------------------------------------
+
+
+def test_a_late_rejection_of_an_older_utterance_leaves_the_newer_one_alone(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Close the claw")
+    spawn.run_all()
+    gate.on_partial(2, 0, "Open the claw")                     # utterance 2 has begun
+    spawn.run_all()
+    assert gate.prepared().decision.preset == "open_gripper"
+    gate.reject(1)                                              # utterance 1's overflow, reported late
+    assert gate.prepared().decision.preset == "open_gripper"   # 2's speculation is untouched
+    r = gate.on_final(2, 1, "Open the claw")
+    assert r.action == "propose" and r.reused
+    assert gate.on_final(1, 9, "Close the claw").action == "ignored"
+
+
+def test_a_rejection_voids_its_own_utterance_and_a_stop_still_voids_everything(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Open the claw")
+    spawn.run_all()
+    gate.reject(1)
+    assert gate.prepared() is None
+    assert gate.on_final(1, 1, "Open the claw").action == "ignored"
+    assert gate.on_partial(2, 0, "Open the claw").action == "dispatched"   # the next one starts clean
+    spawn.run_all()
+    assert gate.on_partial(2, 1, "Open the claw, stop").action == "stop"   # a stop is still global
+    assert gate.on_final(2, 2, "Open the claw").action == "ignored"
+
+
+def test_pump_does_not_fetch_for_a_prediction_the_memory_has_moved_past(fake, spawn, clock):
+    ctx, fetched = Ctx(), []
+    gate = make_gate(fake, spawn, clock, ctx=ctx, prefetch=lambda text: fetched.append(text) or {"goal": text})
+    gate.on_partial(1, 0, "Open the claw")
+    spawn.run_all()                                             # the prediction lands
+    ctx.v += 1                                                  # then the memory changes
+    gate.pump()
+    assert fetched == [] and gate.prepared() is None            # stale: nothing fetched for it

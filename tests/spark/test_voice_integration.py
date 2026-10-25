@@ -403,3 +403,28 @@ def test_a_reset_during_the_final_never_becomes_a_proposal(taught, spawn, clock)
     t.join(5)
     assert out["r"]["kind"] == "clarify" and voice.gate.prepared() is None
     assert nothing_happened(taught)
+
+
+def test_a_late_prediction_gets_its_memory_bundle_before_the_final(taught, monkeypatch):
+    me = threading.get_ident()
+    landed, fetched = threading.Event(), []
+    real = taught.memory.retrieve_memory_bundle
+
+    def spy(goal, *args, **kwargs):
+        fetched.append((goal, threading.get_ident()))
+        return real(goal, *args, **kwargs)
+
+    monkeypatch.setattr(taught.memory, "retrieve_memory_bundle", spy)
+    fake = FakeIntent()
+    fake.hold()
+    voice = VoiceIntegration(taught, fake, on_prediction=landed.set)          # real worker threads
+    out = voice.on_partial(1, 0, "Open the claw")               # one partial; no answer yet
+    assert out["preparing"] is None and fetched == []
+    fake.release.set()                                          # the classifier answers late
+    assert landed.wait(2)                                       # no further transcript event comes
+    prepared = voice.pump()                                     # the owner runs the prefetch it was told of
+    assert prepared["preparing"] == "open_gripper" and prepared["memory"]["goal"] == "Open the claw"
+    assert fetched == [("Open the claw", me)]                   # before the final, on the owner thread
+    assert count(taught, "episode") == 0                        # preparing only: nothing was proposed
+    final = voice.on_final(1, 1, "Open the claw")
+    assert final["status"] == "proposed" and final["reused_prediction"]

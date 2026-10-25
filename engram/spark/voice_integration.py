@@ -53,7 +53,12 @@ def memory_version(engine: Engine) -> Hashable:
 class VoiceIntegration:
     def __init__(self, engine: Engine, classifier: Classifier, **gate_options: Any):
         """With ENGRAM_VOICE_PRESETS off (read as engram/api.py reads it), no preset is registered, the
-        intent model is never asked, and nothing but a stop is acted on."""
+        intent model is never asked, and nothing but a stop is acted on.
+
+        Pass on_prediction=... (a quick, thread-safe callable, for example one that queues a call to
+        pump() on the owner's event loop) to hear, from the gate's worker thread, the moment a
+        prediction lands; then call pump() on the thread that owns the database to prefetch its
+        memory bundle before the speaker has finished."""
         self.engine = engine
         self.presets_enabled = voice_presets_enabled()
         if self.presets_enabled:
@@ -73,6 +78,13 @@ class VoiceIntegration:
 
     def _prefetch(self, text: str) -> dict[str, Any]:
         return self.engine.memory.retrieve_memory_bundle(text, self.engine.skills.approved_names()).to_dict()
+
+    def pump(self) -> dict[str, Any]:
+        """On the owner thread, after on_prediction fired: prefetch the memory bundle of the prediction that
+        just landed. Returns what is being prepared, as on_partial does."""
+        prepared = self.gate.pump()
+        return {"kind": "partial", "status": "pumped", "preparing": prepared.decision.preset if prepared else None,
+                "memory": prepared.bundle if prepared else None}
 
     def on_partial(self, utterance: int, revision: int, text: str) -> dict[str, Any]:
         r = self.gate.on_partial(utterance, revision, text)
