@@ -134,6 +134,37 @@ test("a transcript that comes back after a newer press is dropped, never run", a
   assert.deepEqual(cmd.runs, [["stop", turnB]]);
 });
 
+test("a late failed or broken STT reply from an older turn is dropped silently", async () => {
+  const { V, stt } = loadVoice();
+  const cmd = commandRunner(V);
+  await V.startRec(null);                                    // turn A
+  const failedA = V.voiceCommand(await V.stopRec(), cmd.run);
+  await V.startRec(null);                                    // turn B
+  const brokenB = V.voiceCommand(await V.stopRec(), cmd.run);
+  await V.startRec(null);                                    // turn C is recording
+  stt.respond(0, { ok: false, json: { ok: false, reason: "whisper failed" } });
+  stt.calls[1].reject(new Error("network down"));
+  assert.equal((await failedA).status, "dropped", "no 'STT offline' over turn C");
+  assert.equal((await brokenB).status, "dropped", "no 'STT failed' toast over turn C");
+  assert.deepEqual(cmd.runs, []);
+});
+
+test("the current turn's STT failures are still reported", async () => {
+  const { V, stt } = loadVoice();
+  const cmd = commandRunner(V);
+  await V.startRec(null);
+  const a = await V.stopRec();
+  const failed = V.voiceCommand(a, cmd.run);
+  stt.respond(0, { ok: false, json: { ok: false, reason: "whisper failed" } });
+  const v = await failed;
+  assert.equal(v.status, "unavailable");
+  assert.equal(v.reason, "whisper failed");
+  const broken = V.voiceCommand(a, cmd.run);
+  stt.calls[1].reject(new Error("network down"));
+  await assert.rejects(broken, /network down/);
+  assert.deepEqual(cmd.runs, []);
+});
+
 test("a recording still stopping when the next press lands keeps its own turn and audio", async () => {
   const { V, h, recorders, stt } = loadVoice({ autoStop: false });
   const cmd = commandRunner(V);

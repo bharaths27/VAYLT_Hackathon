@@ -109,16 +109,20 @@
   // Transcribe a stopped recording (auto=0: transcript only, the server runs
   // nothing) and hand the text to runCommand(text, turn) with the turn that
   // recorded it. If a newer push-to-talk turn began while it was being
-  // transcribed, the transcript is dropped and never run.
-  // Resolves { status: "sent" | "dropped" | "unavailable", text, reason }.
+  // transcribed, the result is dropped: never run, and no error shown over
+  // the newer turn. Resolves { status: "sent" | "dropped" | "unavailable",
+  // text, reason }; throws only for the current turn's network errors.
+  // /stt is not tracked: with auto=0 it broadcasts nothing (pinned by
+  // console/tests/test_stt_transcript_only.py).
   V.voiceCommand = async function (a, runCommand) {
     const fd = new FormData();
     fd.append("audio", a.blob, "speech" + a.ext);
     fd.append("auto", "0");
-    const r = await fetch("/stt", { method: "POST", body: fd });
-    const j = await r.json();
+    let j = null, err = null;
+    try { j = await (await fetch("/stt", { method: "POST", body: fd })).json(); } catch (e) { err = e; }
+    if (a.turn !== ctl.current()) return { status: "dropped", text: j && j.text };
+    if (err) throw err;
     if (!j.ok) return { status: "unavailable", reason: j.reason };
-    if (a.turn !== ctl.current()) return { status: "dropped", text: j.text };
     runCommand(j.text, a.turn);
     return { status: "sent", text: j.text };
   };
