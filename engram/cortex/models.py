@@ -22,6 +22,8 @@ from .types import CortexError, Denied, Missing, canonical, finite
 
 class ModelUnavailable(CortexError):
     code='MODEL_UNAVAILABLE'
+    def __init__(self, message: str='model unavailable', *, http_status: int | None=None):
+        super().__init__(message); self.http_status=http_status
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -29,12 +31,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ModelUnavailable('redirects are disabled for model requests')
 
 
+def _wire(payload: dict) -> bytes:
+    # Key order is kept on purpose: llama.cpp builds the json_schema grammar in property
+    # order, so sorted keys made the model write "args" before choosing its "op".
+    # canonical() (sorted) is for hashing only.
+    return json.dumps(payload,separators=(',',':'),ensure_ascii=False,allow_nan=False).encode()
+
+
 def _request_json_blocking(url: str, payload: dict, headers: dict, timeout: float) -> dict:
-    raw=canonical(payload).encode()
+    raw=_wire(payload)
     if len(raw)>128000: raise ModelUnavailable('model request too large')
     req=urllib.request.Request(url,data=raw,headers={'Content-Type':'application/json',**headers},method='POST')
     try:
-        opener=urllib.request.build_opener(NoRedirect())
+        # No environment proxy: memory text must never leave through HTTP(S)_PROXY.
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
         with opener.open(req,timeout=timeout) as response:
             body=response.read(256001)
             if len(body)>256000: raise ModelUnavailable('model response too large')
@@ -42,28 +52,40 @@ def _request_json_blocking(url: str, payload: dict, headers: dict, timeout: floa
         if not isinstance(obj,dict): raise ValueError('expected object')
         return obj
     except ModelUnavailable: raise
+    except urllib.error.HTTPError as e:
+        raise ModelUnavailable(f'model request failed: HTTP {e.code}',http_status=e.code) from None
     except Exception as e:
         # Do not embed response bodies, request headers, source content, or secrets.
         raise ModelUnavailable('model request failed: '+type(e).__name__) from None
 
 
+def _is_loopback(url: str) -> bool:
+    return urllib.parse.urlsplit(url).hostname in {'127.0.0.1','localhost','::1'}
+
+
 # DNS may ignore a socket timeout. Bound caller latency and abandoned workers.
-# Threads cannot safely be killed; at most two daemon requests may remain in flight.
-_HTTP_SLOTS=threading.BoundedSemaphore(2)
+# Separate pools: a stalled cloud advisor can never take the local model's slot.
+# The local slot stays held until llama-server answers (up to LOCAL_DRAIN_S), even after
+# the caller's deadline, because the server is still generating; a new local request
+# then fails fast instead of queueing behind (or poisoning) the abandoned one.
+_SLOTS={'local':threading.BoundedSemaphore(1),'cloud':threading.BoundedSemaphore(2)}
+LOCAL_DRAIN_S=600.0
 def request_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
-    timeout=finite(timeout,'HTTP deadline',.01,120)
-    if not _HTTP_SLOTS.acquire(blocking=False):raise ModelUnavailable('model HTTP capacity busy')
+    timeout=finite(timeout,'HTTP deadline',.01,600)
+    pool='local' if _is_loopback(url) else 'cloud'; slots=_SLOTS[pool]
+    if not slots.acquire(blocking=False):
+        raise ModelUnavailable('local model still busy with an earlier (possibly abandoned) request; not stacking another' if pool=='local' else 'cloud model HTTP capacity busy')
     result=queue.Queue(maxsize=1)
     def worker():
         try:
-            result.put((True,_request_json_blocking(url,payload,headers,timeout)))
-        except Exception as e:
-            result.put((False,type(e).__name__))
-        finally:_HTTP_SLOTS.release()
-    threading.Thread(target=worker,name='engram-bounded-http',daemon=True).start()
+            try: out=(True,_request_json_blocking(url,payload,headers,max(timeout,LOCAL_DRAIN_S) if pool=='local' else timeout))
+            except Exception as e: out=(False,e if isinstance(e,ModelUnavailable) else ModelUnavailable('model HTTP failed: '+type(e).__name__))
+        finally: slots.release()
+        result.put(out)
+    threading.Thread(target=worker,name='engram-bounded-http-'+pool,daemon=True).start()
     try:ok,value=result.get(timeout=timeout)
     except queue.Empty:raise ModelUnavailable('model HTTP wall-clock deadline exceeded') from None
-    if not ok:raise ModelUnavailable('model HTTP failed: '+value)
+    if not ok:raise ModelUnavailable(str(value),http_status=value.http_status) from None
     return value
 
 
