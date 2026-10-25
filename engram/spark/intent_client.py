@@ -196,11 +196,16 @@ class IntentClient:
         if not isinstance(text, str) or len(text) > MAX_TEXT:
             # Never classify a prefix: the words after the cut could be "no, don't" or "after ...".
             raise IntentError(f"transcript longer than {MAX_TEXT} characters; not classified")
+        # Every transcript, partial or final, is asked about as the whole utterance: the request is the
+        # same for both, so a partial's answer is exactly the final's answer for that text, and the gate
+        # reuses it as it is (no second request). `partial` is not sent. (Measured: told "partial", the
+        # model scored "Look around." 0.47; told "final", 0.63-0.66, so a partial answer asked the other
+        # way could not stand in for the final's.)
         return {
             "model": self.model,
             "state": {
                 "transcript": text,
-                "transcript_is_partial": bool(partial),
+                "transcript_is_partial": False,
                 "listener": "a small lab robot with a gripper and a camera",
             },
             "questions": QUESTIONS,

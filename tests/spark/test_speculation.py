@@ -78,41 +78,58 @@ def test_final_equal_to_prepared_text_reuses_the_prediction(fake, spawn, clock):
     assert len(fake.calls) == 1 and gate.stats.requests == 1 and gate.stats.reused == 1
 
 
-def test_a_below_threshold_partial_answer_is_asked_again_at_the_final(spawn, clock):
-    # Measured on the real model: "Look around." scored 0.47 as a partial and 0.63-0.66 as a final.
+def test_a_below_threshold_answer_for_the_unchanged_text_is_reused_not_asked_again(spawn, clock):
+    # The intent client asks the same question for a partial and a final of the same text, so the
+    # partial's answer IS the final's answer: reused as it is, even below threshold.
     calls = []
 
     def model(text, partial):
         calls.append((text, partial))
-        return decision("look_around", confidence=0.47 if partial else 0.65)
+        return decision("look_around", confidence=0.47)
 
     gate = make_gate(model, spawn, clock)
     gate.on_partial(1, 0, "Look around.")
     spawn.run_all()
     assert gate.prepared() is None                      # below threshold: nothing prepared
     r = gate.on_final(1, 1, "Look around.")
-    assert r.action == "propose" and r.preset == "look_around" and not r.reused
-    assert calls == [("Look around.", True), ("Look around.", False)]   # exactly one extra call
-    assert gate.stats.reused == 0
+    assert r.action == "none" and r.reused              # no action, and no second request
+    assert calls == [("Look around.", True)]
+    assert gate.stats.reused == 1
 
 
-@pytest.mark.parametrize("partial_answer", [
+@pytest.mark.parametrize("answer", [
     decision(None, confidence=0.9),                          # nothing to do
-    decision("open_gripper", ready=0.2),                     # not ready yet
+    decision("open_gripper", ready=0.2),                     # not ready
     decision("open_gripper", directed=0.2),                  # not addressed to the robot
 ], ids=["no preset", "not ready", "not directed"])
-def test_no_action_partial_answers_are_never_reused(spawn, clock, partial_answer):
+def test_an_unchanged_non_actionable_transcript_costs_exactly_one_request(spawn, clock, answer):
     calls = []
 
     def model(text, partial):
         calls.append(partial)
-        return partial_answer if partial else decision("open_gripper")
+        return answer
 
     gate = make_gate(model, spawn, clock)
     gate.on_partial(1, 0, "Open the claw")
     spawn.run_all()
-    assert gate.on_final(1, 1, "Open the claw").action == "propose"
-    assert calls == [True, False]
+    r = gate.on_final(1, 1, "Open the claw")
+    assert r.action == "none" and r.reused
+    assert calls == [True]                                   # exactly one classifier call
+
+
+def test_a_final_with_more_words_than_the_prediction_is_asked_again(spawn, clock):
+    calls = []
+
+    def model(text, partial):
+        calls.append(text)
+        return decision("open_gripper", ready=0.2) if text == "Open the" else decision("open_gripper")
+
+    gate = make_gate(model, spawn, clock)
+    gate.on_partial(1, 0, "Open the")
+    spawn.run_all()
+    r = gate.on_final(1, 1, "Open the claw")                 # more words can change the meaning
+    assert r.action == "propose" and not r.reused
+    assert calls == ["Open the", "Open the claw"]
 
 
 def test_final_that_differs_is_classified_as_a_final(fake, spawn, clock):
