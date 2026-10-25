@@ -63,6 +63,7 @@ def test_open_claw_is_refused_when_loaded_even_after_proposal(brain):
     brain.store.teach('Restriction','Never move Sample B.',owner='carther')
     brain.robot.holding='sample_b'                                                 # the adapter reports Sample B in the claw
     with pytest.raises(Conflict,match='holding sample_b'): brain.command('Open the claw',principal='carther')
+    with pytest.raises(Conflict,match='already holds sample_b'): brain.command('Bring Sample A to the bench.',principal='carther')
     brain.robot.holding=None
     p=brain.command('Open the claw',principal='carther'); assert p['status']=='proposed'   # control: reported empty
     brain.robot.holding='sample_b'                                                 # loaded between proposal and approval
