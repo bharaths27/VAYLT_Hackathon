@@ -32,7 +32,7 @@ def taken(result: dict,classification: str) -> dict:
 
 # A clear "don't": the explicit negations among the safety check's NEGATED words, which also has cancellations
 # such as "wait" or "hold on" (those are not one).
-CLEAR_DONT=re.compile(r"\b(do not|don't|dont|never|no need to|must not|mustn't)\b",re.I)
+CLEAR_DONT=re.compile(r"\b(do not|don't|dont|never(?!\s+mind)|no need to|must not|mustn't)\b",re.I)  # "never mind" cancels: unclear
 
 
 def refusal_taken(request: str,error: CortexError | None=None) -> str:

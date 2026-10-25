@@ -91,6 +91,9 @@ def refusal(request: str, future_ok: bool = False) -> str | None:
 # "here" / "there". With no zone named, "in a minute" reads as one too: unclear either way, and never planned now.
 PLACE = re.compile(r"\b(?:to|into|onto|on|at|in)\s+(?:the|my|your|our|his|her|their|a|an|this|that)\s+\w"
                    r"|\b(?:here|there)\b")
+# A destination with no article, ending the request ("Bring the beaker to kitchen."). Only at the end: inside a
+# request "to <word>" is usually a verb ("I need you to pick it up").
+PLACE_END = re.compile(r"\b(?:to|into|onto)\s+(\w+)\s*[.!?]*\s*$")
 
 
 def find_zone(request: str, zones: set[str]) -> str | None:
@@ -101,9 +104,9 @@ def find_zone(request: str, zones: set[str]) -> str | None:
     for z in zones:
         low = re.sub(rf"\bfrom\s+(?:the\s+)?{re.escape(z.replace('_', ' ').lower())}\b", " ", low)
     for z in sorted(zones, key=len, reverse=True):
-        if z.replace("_", " ").lower() in low:
+        if re.search(rf"\b{re.escape(z.replace('_', ' ').lower())}\b", low):   # whole words: "workbench" is not "bench"
             return z
-    return None if PLACE.search(low) else DEFAULT_ZONE
+    return None if PLACE.search(low) or PLACE_END.search(low) else DEFAULT_ZONE
 
 
 def targets_in(request: str, memory: Memory) -> list[str]:

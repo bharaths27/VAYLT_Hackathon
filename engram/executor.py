@@ -56,7 +56,11 @@ class Executor:
                 break
             self.journal(op_id, episode_id, op, args, "pending")
             out = self.robot.execute(op, args)
-            stopped = self.stop_requests != stops  # read at once, whatever the step returned (done included)
+            # read at once, whatever the step returned (done included): a stop pressed here, or the robot's own
+            # latch set while a step that still reports done ran (on the last step no pre-step check follows to see
+            # it). A failed or unknown step keeps its own handling: an adapter latches itself on an unknown outcome.
+            stopped = self.stop_requests != stops or (
+                op != "stop" and out.status == "done" and bool(self.robot.state().get("stopped")))
             for tag_id, zone in out.observations:
                 self.memory.observe_tag(tag_id, zone, source="robot")
             self.journal(op_id, episode_id, op, args, out.status, out.detail)

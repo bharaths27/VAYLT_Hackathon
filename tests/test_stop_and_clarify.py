@@ -241,17 +241,22 @@ class StopsAfterTheCheck(MockRobot):
 
     def __init__(self, arena):
         super().__init__(arena)
-        self.engine, self.executed, self.fired = None, [], False
+        self.engine, self.executed, self.fired, self.calls_since_step = None, [], False, 0
 
     def execute(self, op, args):
         self.executed.append(op)
+        self.calls_since_step = 0
         return super().execute(op, args)
 
     def state(self):
         seen = super().state()
         if self.engine is not None and self.executed and not self.fired:
-            self.fired = True
-            self.engine.stop()
+            self.calls_since_step += 1
+            # The first state() read after a done step is the executor's post-step latch check; the second is the
+            # pre-step check of the next step. Fire in that one, the window this test is about.
+            if self.calls_since_step == 2:
+                self.fired = True
+                self.engine.stop()
         return seen
 
 
@@ -511,3 +516,47 @@ def test_a_model_plan_naming_a_place_that_is_not_a_zone_goes_to_the_rules(lab, m
     r = lab.command("Bring the beaker to the bench", "test")
     assert (r["status"], r["source"]) == ("proposed", "fallback") and zones_of(r) == {"bench"}, r
     assert "model plan names a place that is not a zone: 'workbench'" in r["planner_note"]
+
+
+# ---- warden, from luna's review of round 5 (fork PR #4) --------------------------------------------------
+
+from engram.cortex.runtime import refusal_taken  # noqa: E402
+from engram.planner import DEFAULT_ZONE, find_zone  # noqa: E402
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Bring the beaker to the workbench", None),     # "workbench" is not "bench": an unknown place, asked
+    ("Bring the beaker to kitchen", None),           # no article, at the end: still a destination
+    ("Bring the beaker to kitchen.", None),
+    ("Bring the beaker to the bench", "bench"),
+    ("Bring the beaker to bench", "bench"),
+    ("I need you to pick it up", DEFAULT_ZONE),      # "to pick" inside the request is a verb, not a place
+    ("Pick up the beaker", DEFAULT_ZONE),
+])
+def test_a_destination_is_a_whole_zone_name_or_it_is_unclear(arena, text, expected):
+    assert find_zone(text, set(arena["zones"])) == expected
+
+
+def test_never_mind_is_a_cancellation_not_an_understood_refusal():
+    assert refusal_taken("Never mind.") == "unclear"
+    assert refusal_taken("Never open the claw.") == "understood"
+
+
+class LatchesDuringStep(MockRobot):
+    """The robot's own stop latch trips while a motion step runs, and the step still reports done."""
+
+    def execute(self, op, args):
+        res = super().execute(op, args)
+        if op == "drive_bounded":
+            self.stopped = True
+        return res
+
+
+def test_a_latch_set_during_the_final_step_ends_the_run_stopped(arena):
+    eng = Engine(connect(":memory:"), LatchesDuringStep(arena), set(arena["zones"]))
+    eng.load_arena(arena)
+    eng.register_fixed_request("Move forward", [{"op": "drive_bounded", "args": {"distance_m": 0.2}}])
+    p = eng.command("Move forward", "test")
+    assert p["status"] == "proposed", p
+    run = eng.approve_and_run(p["operation_id"], p["digest"], "tester")
+    assert run["outcome"] == "aborted", run          # not "success": the robot latched its stop during the step
