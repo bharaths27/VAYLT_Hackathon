@@ -561,7 +561,8 @@ class Brain:
             r=self.store.one('SELECT p.*,c.owner FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.id=?',(tid,))
             if not r: raise Missing('task not found')
             if r['owner']!=principal: raise Denied('not the task owner')
-            if r['status']=='done': raise Conflict('cannot cancel an already completed task')
+            # Only an open commitment is withdrawn: a settled one (done, failed, expired, unknown, cancelled) keeps its outcome.
+            if r['status'] not in ('waiting','fired'): raise Conflict(f"cannot cancel a {r['status']} task: its outcome stands")
             if not self.store.withdraw_commitment(tid,'commitment cancelled'):
                 raise Conflict('effect may have started; stop/reconcile it, do not claim cancellation')
         return {'task_id':tid,'status':'cancelled'}

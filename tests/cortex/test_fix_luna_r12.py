@@ -151,3 +151,19 @@ def test_a_source_retrieved_for_a_model_plan_backs_it_even_uncited(store,arena):
     store.revoke_source(note)
     assert b.operation(p['operation_id'])['status']=='invalidated'                                # was: still proposed
     assert store.derived(p['derived_memory_id'])['status']=='STALE'
+
+
+# P3-4: only a waiting or fired commitment can be cancelled; a settled one keeps its outcome.
+@pytest.mark.parametrize('outcome',['failed','expired'])
+def test_a_settled_commitment_is_never_withdrawn_to_cancelled(brain,clock,outcome):
+    if outcome=='expired':
+        t=brain.schedule('the tray arrives','bring Sample A to the bench',principal='carther',expires_at=clock()+10)['task_id']
+        clock.advance(11)
+    else:
+        brain.store.teach('Rule','Never move Sample A.',owner='carther')                       # its wake is refused: failed
+        t=brain.schedule('the tray arrives','bring Sample A to the bench',principal='carther')['task_id']
+    brain.trigger('the tray arrives',event_id='ev1',principal='carther')
+    status=lambda:brain.store.one('SELECT status FROM prospective_task WHERE id=?',(t,))['status']
+    assert status()==outcome
+    with pytest.raises(Conflict,match='outcome stands'): brain.cancel_task(t,principal='carther')   # was: cancelled
+    assert status()==outcome
