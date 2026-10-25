@@ -22,17 +22,25 @@ def main():
     out={'evidence_class':'SYNTHETIC_TEST','physical_actions':0,'qwen':[],'intent':[]}
     s=Store();s.register_arena(json.loads((ROOT/'fixtures/cortex/arena.json').read_text()))
     source=s.teach('Probe rule','Safety goggles must be at the ppe station before handling Sample B.',owner='probe',cloud_ok=False)
-    if args.model_file:out['model_sha256_before']=fingerprint(args.model_file)
+    if args.model_file:
+        out['model_sha256_before']=fingerprint(args.model_file)
+        out['model_file']={'name':args.model_file.name,'sha256':out['model_sha256_before']}   # file name only, never the host path
     if args.qwen:
-        q=QwenClient(endpoint=args.url,timeout_s=60,input_budget=3072)
+        q=QwenClient(endpoint=args.url,timeout_s=120,input_budget=3072)
         for zone in ['ppe_station','shelf_b']:
             if zone=='shelf_b':s.teach('Probe corrected rule','Safety goggles must be at shelf B before handling Sample B.',owner='probe',supersedes=source['source_id'])
             g=Goal('fetch',('sample_b',),'bench');beg=time.perf_counter()
             try:
                 r=q.complete('plan',s.bundle('Bring Sample B to bench',g),goal=g.to_dict())
                 v=verify(g,r.value['steps'],Compiler(s).fixture(),s.related_rules(g),s.policy)
-                out['qwen'].append({'status':'response_received','correct':v.ok,'expected_prerequisite_zone':zone,'errors':v.errors,'result':r.value,'model':r.model,'input_tokens':r.input_tokens,'elapsed_ms':r.elapsed_ms,'contract_sha256':r.contract_hash,'prompt_sha256':r.prompt_hash})
-            except Exception as e:out['qwen'].append({'status':'failed','exception':type(e).__name__,'request_elapsed_ms':round((time.perf_counter()-beg)*1000,3),'note':'Failure duration is not inference latency'})
+                out['qwen'].append({'status':'response_received','correct':v.ok,'expected_prerequisite_zone':zone,'errors':v.errors,'result':r.value,'model':r.model,
+                    'model_sha256':out.get('model_file',{}).get('sha256') if out.get('model_file',{}).get('name')==r.model else None,
+                    'input_tokens':r.input_tokens,'elapsed_ms':r.elapsed_ms,'contract_sha256':r.contract_hash,'prompt_sha256':r.prompt_hash,'trace':r.trace})
+            except Exception as e:
+                # Which stage failed (template/tokenize/completion/parse), its HTTP status, stop type,
+                # server timings and whether the applied template really disabled thinking.
+                out['qwen'].append({'status':'failed','exception':type(e).__name__,'reason':str(e)[:200],'trace':dict(q.last_trace),
+                    'request_elapsed_ms':round((time.perf_counter()-beg)*1000,3),'note':'Failure duration is not inference latency'})
     if args.intent:
         j=IntentAdvisor(enabled=True,max_calls=3)
         for utterance in ['Open the claw.','Do not open the claw.']:
