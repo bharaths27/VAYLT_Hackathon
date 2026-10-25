@@ -62,6 +62,15 @@ def test_request_grammar_eval_table(store,request_text,expected):
         g=parse_goal(request_text,store)
         assert (g.kind,tuple(g.targets),g.zone)==expected
 
+@pytest.mark.parametrize('request_text,named',[
+    ('Bring Sample A but not Sample B to the bench','exclusion'),('Bring Sample A to the bench without the goggles','exclusion'),
+    ('Take Sample A off the bench','source location'),('Take Sample B out of the ppe station','source location'),
+    ('Bring Sample A or Sample B to the bench','alternatives'),('Bring Sample A to the bench if it is clean','condition'),
+    ('Put Sample A next to the bench','relative position'),('Bring Sample A to the bench and then open the claw','sequence'),
+    ('Should I bring Sample A to the bench?','question'),('Cancel that: bring Sample A to the bench','cancelled')])
+def test_clarification_names_what_was_not_guessed(store,request_text,named):
+    with pytest.raises(Missing,match=named): parse_goal(request_text,store)
+
 def test_eval_table_is_large_enough_and_balanced():
     assert len(TABLE)>=25 and sum(e is REFUSE for _,e in TABLE)>=20 and sum(e is not REFUSE for _,e in TABLE)>=10
 

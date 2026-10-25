@@ -47,9 +47,12 @@ def test_model_calls_are_capped_per_time_window(arena,clock):
     b=idle_brain(arena,clock); b.store.teach('SOP',SOP,owner='op')
     stub=Stub(lambda bundle:[]); b.dreamer.qwen=stub
     for i in range(6):
-        b.store.teach(f'Note {i}',f'The operator prefers label colour number {i}.',owner='op')   # new evidence every cycle
+        clock.advance(1); b.store.teach(f'Note {i}',f'The operator prefers label colour number {i}.',owner='op')   # new evidence every cycle
         assert b.dreamer.cycle()['status']=='complete'
     assert stub.calls==b.store.policy.max_model_calls_per_dream==2
+    b.dreamer._model_calls.clear()                                              # the window has passed
+    clock.advance(1); b.store.teach('Note 7','The operator prefers label colour number 7.',owner='op'); b.dreamer.cycle()
+    assert stub.calls==3
     b.close()
 
 def test_late_model_result_is_kept_unless_foreground_interrupted(arena,clock):
