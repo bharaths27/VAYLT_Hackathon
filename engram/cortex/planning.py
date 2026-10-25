@@ -16,6 +16,9 @@ from .types import Conflict, CortexError, Goal, Missing, Policy, canonical, dige
 NEGATED = re.compile(r"\b(do not|don't|dont|never|no need to|must not|mustn't|not now|stop moving|cancel|cancell?ed|never ?mind|scratch that|forget (?:it|that)|hold on|hold off|wait|undo|abort)\b", re.I)
 FUTURE = re.compile(r'\b(when|once|after|until|later|tomorrow|tonight|in\s+\d+\s+(?:seconds?|minutes?|hours?))\b', re.I)
 FORBIDDEN = re.compile(r'\b(delete|erase|wipe|dump|dispose|discard|throw|pour|hit|break|override|disable)\b', re.I)
+# The stop vocabulary of the brain (engram/engine.py) and the console parser, deliberately broad: any utterance that
+# contains one is a STOP ("don't stop the timer" too). A needless stop costs one clear_stop; a missed one can hurt someone.
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b", re.I)
 RECALL = re.compile(r'\b(what happened|where (?:is|was|are|were)|what did|what do you (?:know|remember)|what is pending|what have|why did|show (?:my|the) memor|recall)\b', re.I)
 
 # This is a subset of the team's verified adapter interface, not newly invented motor behavior.
@@ -28,6 +31,8 @@ CAPS = {
     'speak': {'text':str},
 }
 PHYSICAL = set(CAPS) - {'stop','observe','locate_tag','speak'}
+# Ops that move the robot (and so whatever the claw holds).
+NAVIGATION = {'go_to_zone','drive_bounded','turn_bounded','approach_tag'}
 # The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table).
 GOAL_OPS = {'fetch':('observe','locate_tag','pick_tagged_object','place_at_zone'),'goto':('go_to_zone',),'inspect':('observe','locate_tag')}
 def goal_ops(goal: dict | Goal | None) -> tuple[str, ...]:
@@ -182,6 +187,11 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
             op,a=step['op'],step['args']; res.steps_checked+=1
             if op not in allowed: raise Conflict(f'extra effect: {op} is not allowed for a {goal.kind} goal')
             if op in PHYSICAL and stopped: raise Conflict('motion after stop')
+            # The claw's initial content travels with every navigation and blocks every pickup: a reported load, or an
+            # unreported (unknown) content, fails closed. Opening the claw is checked below.
+            if loaded is not None and (op in NAVIGATION or op=='pick_tagged_object'):
+                raise Conflict(f'the claw already holds {loaded}; {op} would carry it or needs an empty claw' if fixture.get('holding_known') else
+                               f'the claw contents are unknown (not reported by the adapter); {op} needs a reported empty claw')
             if goal.kind=='primitive' and (op!=goal.primitive or a!=goal.args):
                 raise Conflict('primitive differs from the requested effect')
             if goal.kind=='goto' and a.get('zone')!=goal.zone: raise Conflict('navigation to a station other than the goal')
@@ -199,7 +209,6 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
                 if op=='approach_tag':
                     at=positions[oid]; continue
                 if holding: raise Conflict('already holding an object')
-                if fixture.get('holding_known') and fixture.get('holding') is not None: raise Conflict(f"the claw already holds {fixture['holding']}")
                 if not objects[oid].get('graspable',True): raise DeniedPlan('object not graspable')
                 for r in rules:
                     if r['subject']==oid and positions.get(r['object'])!=r['required_zone']:
@@ -231,7 +240,7 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
         res.ok=True
     except CortexError as e:
         res.errors.append(str(e))
-    res.final_state={'positions':positions,'at_zone':at,'holding':holding,'gripper_open':open_,'stopped':stopped}
+    res.final_state={'positions':positions,'at_zone':at,'holding':holding if holding is not None else loaded,'gripper_open':open_,'stopped':stopped}
     return res
 
 
@@ -242,7 +251,7 @@ class Compiler:
     """Deterministic synthesis from a supported goal and CURRENT accepted rules."""
     def __init__(self, store: Store): self.store=store
 
-    def fixture(self, *, mode: str='SIMULATED') -> dict:
+    def fixture(self, *, mode: str='SIMULATED', symbolic: bool=False) -> dict:
         zones=sorted(self.store.zones())
         if not zones: raise Missing('no station registry')
         # Only a FRESH observation is a position. Anything else is unknown (None), never
@@ -251,12 +260,14 @@ class Compiler:
         objects={o['id']:{'tag':o['tag'],'graspable':o['graspable']} for o in objs}
         pos={o['id']:o['last_zone'] if o['fresh'] and o['last_zone'] else None for o in objs}
         # What the claw holds is the adapter's to report (Brain._fixture); the store alone never knows, so: unknown.
+        # A symbolic start state (practice, skill tests, a plan composed without a live world) declares an empty claw;
+        # live proposal and approval re-verify against the adapter's report.
         return {'mode':mode,'positions':pos,'objects':objects,'zones':zones,'at_zone':None,'unknown_positions':sorted(k for k,v in pos.items() if v is None),
-                'holding':None,'holding_known':False}
+                'holding':None,'holding_known':symbolic}
 
     def compile(self, goal: Goal, fixture: dict | None=None) -> dict:
         goal=Goal.from_dict(goal.to_dict())
-        f=copy.deepcopy(fixture or self.fixture())
+        f=copy.deepcopy(fixture or self.fixture(symbolic=True))   # no live world given: the symbolic start state
         rules=self.store.related_rules(goal)
         relevant=set(goal.targets)|{r['object'] for r in rules}
         if self.store.unresolved_for(self.store.scope(goal,rules)):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')

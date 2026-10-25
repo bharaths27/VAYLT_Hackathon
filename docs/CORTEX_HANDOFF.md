@@ -49,7 +49,7 @@ export CORTEX_IDLE=1
 uvicorn engram.cortex.api:create_app --factory --host 127.0.0.1 --port 8010
 ```
 
-This is the workstation review path. On the Pi use `scripts/cortex_sidecar.sh` (see Integration), which sets all of this, keeps the token in a 0600 file and refuses a non-loopback bind. Do not print the token. `/cortex` is an optional inspection page; its token stays in page memory, not localStorage or URLs. Keep Cortex on loopback and reach it with `ssh -L`; no LAN exposure has been reviewed. Camera and memory reads also require authentication. A mutation without a credential gets 401 before its body is read; an authenticated body over 300 KB, declared or chunked, gets 413. Cortex never touches the existing brain's stop path.
+This is the workstation review path. On the Pi use `scripts/cortex_sidecar.sh` (see Integration), which sets all of this, keeps the token in a 0600 file and refuses a non-loopback bind. Do not print the token. `/cortex` is an optional inspection page; its token stays in page memory, not localStorage or URLs. Keep Cortex on loopback and reach it with `ssh -L`; no LAN exposure has been reviewed. Camera and memory reads also require authentication. Mutations are refused before any body byte is read: a cross-site browser request (Sec-Fetch-Site: cross-site) gets 403 first, then a missing or wrong credential gets 401. A body over 300 KB, declared or chunked, gets 413 (a malformed Content-Length, 400). Cortex never touches the existing brain's stop path.
 
 The included arena is SYNTHETIC and intentionally not a physical calibration. For live acceptance set the actual reviewed `ENGRAM_ARENA`; do not use synthetic positions/tag dimensions as physical facts.
 

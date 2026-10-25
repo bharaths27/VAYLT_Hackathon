@@ -77,12 +77,16 @@ def test_eval_table_is_large_enough_and_balanced():
 
 # On the command path a question is answered from memory (needle benchmark), still with nothing proposed; when only
 # the "?" made it a question, the answer keeps the hint to say it as an instruction.
+# A stop word wins before anything else (the brain's and console's vocabulary): these utterances stop the robot.
+STOPPED={'Wait, hold on, put Sample A on the bench','Bring Sample A to the bench please, no wait'}
 ANSWERED={'What do you see?':False,'Should I bring Sample A to the bench?':False,'Can I move the tray to shelf B':False,'Bring Sample A to the bench?':True,'Open the claw?':True}
 
 @pytest.mark.parametrize('request_text',[r for r,e in TABLE if e is REFUSE])
 def test_refused_request_creates_no_proposal_and_explains(brain,request_text):
     out=brain.command(request_text,principal='carther')
-    if request_text in ANSWERED:
+    if request_text in STOPPED:
+        assert out['kind']=='stop' and brain._stopped.is_set()
+    elif request_text in ANSWERED:
         assert out['kind']=='answer' and out['reply'] and ('without the question mark' in out['reply'])==ANSWERED[request_text]
     else:
         assert out['status']=='refused' and out['reason'] and out.get('kind')!='scheduled'

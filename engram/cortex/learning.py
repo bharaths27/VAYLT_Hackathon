@@ -55,7 +55,7 @@ class Skills:
         if s['status'] not in {'CANDIDATE','TESTED'}: raise Conflict('only a candidate/tested skill may be validated')
         if digest(d)!=s['digest'] or not self.store.refs_valid(d['refs']): raise Stale('skill or its evidence changed')
         compiler=Compiler(self.store)
-        f=copy.deepcopy(fixture or compiler.fixture())
+        f=copy.deepcopy(fixture or compiler.fixture(symbolic=True))
         # Validate on multiple controlled arrangements, not merely its authored example.
         variants=[f]
         zones=sorted(self.store.zones())
@@ -70,7 +70,9 @@ class Skills:
             for i,oid in enumerate(sorted(variant['objects'])):
                 ring=[zones[(i+shift+k)%len(zones)] for k in range(len(zones))]
                 variant['positions'][oid]=next((z for z in ring if z not in moves.get(oid,())),ring[0])
-            # The robot starts somewhere else too, away from the goal's station: a goto must actually travel.
+            # The robot starts somewhere else too, away from the goal's station: a goto must actually travel. Each
+            # hypothetical arrangement starts with an empty claw (the skill's precondition; live use re-verifies).
+            variant.update(holding=None,holding_known=True)
             variant['at_zone']=next((z for z in zones[shift:]+zones[:shift] if z!=g.zone),None)
             variants.append(variant)
         results=[]
@@ -152,6 +154,7 @@ class Dreamer:
     LIVE_CAP=128                 # per-kind cap on LIVE rows (stale/deleted rows do not count)
     PRACTICE_WINDOW_S=86400.0    # practice cap is rolling: cases created in the last day
     BACKOFF_S=(30,60,120,300,600,1800,3600)
+    MODEL_ATTEMPTS=5             # failed model attempts on one input before it is explicitly abandoned
 
     def __init__(self, store: Store, skills: Skills, activity: Activity,
                  qwen: QwenClient | None=None, intent: IntentAdvisor | None=None, *,
@@ -162,7 +165,16 @@ class Dreamer:
         # Real model-call cap: at most N idle model calls per rolling window (default N =
         # policy.max_model_calls_per_dream), plus no repeat of an input already answered.
         self.model_window_s=model_window_s; self.model_calls_per_window=model_calls_per_window
-        self._model_calls=collections.deque(); self._model_answered=None; self.monotonic=time.monotonic
+
+    def _model_state(self) -> dict:
+        """Vault-persisted model bookkeeping, so a restart neither resets the call cap nor forgets pending input:
+        call stamps (store clock) in the rolling window, the last input answered, and the input still pending."""
+        row=self.store.one("SELECT value FROM meta WHERE key='cx_dream_model'")
+        return json.loads(row['value']) if row else {'calls':[],'answered':None,'input':None,'attempts':0}
+
+    def _save_model_state(self, st: dict):
+        with self.store.tx():
+            self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(canonical(st),))
 
     def start(self, interval_s: float=5):
         if self._thread and self._thread.is_alive(): return
@@ -187,9 +199,10 @@ class Dreamer:
 
     def _model_budget(self) -> bool:
         cap=self.store.policy.max_model_calls_per_dream if self.model_calls_per_window is None else self.model_calls_per_window
-        now=self.monotonic()
-        while self._model_calls and now-self._model_calls[0]>=self.model_window_s: self._model_calls.popleft()
-        return cap>0 and len(self._model_calls)<cap
+        st=self._model_state(); now=self.store.clock()
+        calls=[t for t in st['calls'] if now-t<self.model_window_s]    # a stamp ahead of a stepped-back clock still counts
+        if calls!=st['calls']: st['calls']=calls; self._save_model_state(st)
+        return cap>0 and len(calls)<cap
 
     def _backoff(self, failed: bool):
         with self.store.tx():
@@ -212,7 +225,7 @@ class Dreamer:
         last=self.store.one("SELECT value FROM meta WHERE key='cx_dream_watermark'")
         backlog=self.store.one("SELECT 1 FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('success','failed','unknown','aborted') AND NOT EXISTS (SELECT 1 FROM cx_consolidated k WHERE k.episode_id=e.id AND k.outcome=e.outcome) LIMIT 1")
         if not force and not backlog and last and last['value']==watermark: return {'status':'no_new_evidence'}
-        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False
+        started=time.monotonic(); run=uid('dream'); made=[]; practiced=[]; errors=[]; leftover=False; model_pending=model_failed=False
         with self.store.tx(): self.store.conn.execute('INSERT INTO cx_dream VALUES(?,?,?,?,?)',(run,self.store.clock(),None,'running','{}'))
         def interrupted():
             b,g,_=self.activity.snapshot()
@@ -264,7 +277,7 @@ class Dreamer:
                 # Unpractised goals left for a later cycle are a backlog: the watermark must not hide them.
                 if not still_idle() or len(practiced)>=self.store.policy.dream_batch: leftover=True; break
                 if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(self.store.clock()-self.PRACTICE_WINDOW_S,))['n']>=self.LIVE_CAP: leftover=True; break
-                fixture=compiler.fixture()
+                fixture=compiler.fixture(symbolic=True)
                 try:
                     plan=compiler.compile(goal,fixture); plan['refs']=sorted(set(plan['refs']+refs))
                     closure=self.store.related_rules(goal)
@@ -295,7 +308,10 @@ class Dreamer:
                             self.skills.approve(skill['id'],skill['digest'],principal='policy:'+self.store.policy.fingerprint(),automatic=True)
                 except CortexError as e: errors.append(type(e).__name__+': '+str(e))
             # Local-model associations are hypotheses only, never automatically factual.
-            if self.qwen and still_idle() and self._model_budget():
+            # Model work stays pending until the model answered this input or it was explicitly abandoned: a skipped
+            # (time or call budget) or failed attempt keeps the watermark open, and a failure also backs off.
+            if self.qwen and not (still_idle() and self._model_budget()): model_pending=True
+            elif self.qwen:
                 evidence=[]; refs=[]
                 for r in self.store.rules()[:4]:
                     if r['status']=='active':
@@ -315,12 +331,22 @@ class Dreamer:
                 bundle={'rules':evidence,'allowed_refs':sorted(set(refs)),'episodes':[{'id':e['id'],'outcome':e['outcome'],'mode':e['mode']} for e in episodes[:2]],
                         'declared_knowledge':declared,'source_passages':recent_sources}
                 asked=digest(bundle)
-                if refs and live<self.LIVE_CAP and asked!=self._model_answered:
-                    q=None; self._model_calls.append(self.monotonic())
+                st=self._model_state()
+                if refs and live<self.LIVE_CAP and asked!=st['answered']:
+                    q=None; st['calls'].append(self.store.clock()); self._save_model_state(st)
                     try: q=self.qwen.complete('dream',bundle)
                     except CortexError as e: errors.append(type(e).__name__)
+                    st=self._model_state()
+                    if q is None:
+                        n=st['attempts']+1 if st['input']==asked else 1
+                        if n>=self.MODEL_ATTEMPTS:
+                            st.update(answered=asked,input=None,attempts=0)    # explicitly abandoned, and recorded
+                            self.store.decision('dream_model','local',None,False,f'input abandoned after {n} failed model attempts')
+                        else: st.update(input=asked,attempts=n); model_pending=model_failed=True
+                    elif interrupted(): model_pending=True                     # a late answer is not kept: asked again
+                    else: st.update(answered=asked,input=None,attempts=0)
+                    self._save_model_state(st)
                     if q and not interrupted():
-                        self._model_answered=asked
                         for h in q.value.get('candidates',[])[:3]:
                             # One bad candidate never sinks its siblings or the cycle.
                             try:
@@ -330,13 +356,13 @@ class Dreamer:
                                 m=self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')
                                 made.append(m['id'])
                             except CortexError as e: errors.append('hypothesis rejected: '+type(e).__name__)
-            status='yielded' if interrupted() else 'complete'
+            status='yielded' if interrupted() else 'complete'; leftover=leftover or model_pending
         except Exception as e:
             status='failed'; errors.append(type(e).__name__)
-        result={'id':run,'status':status,'derived_ids':list(dict.fromkeys(made)),'practice_ids':practiced,'errors':errors,
+        result={'id':run,'status':status,'derived_ids':list(dict.fromkeys(made)),'practice_ids':practiced,'errors':errors,'model_pending':model_pending,
                 'mode':'SIMULATED_PRACTICE','physical_actions':0,'weights_updated':False}
         with self.store.tx():
             if status=='complete' and not leftover: self.store.conn.execute("INSERT INTO meta VALUES('cx_dream_watermark',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(watermark,))
             self.store.conn.execute('UPDATE cx_dream SET finished_at=?,status=?,summary_json=? WHERE id=?',(self.store.clock(),status,canonical(result),run))
-        if status!='yielded': self._backoff(status=='failed')
+        if status!='yielded': self._backoff(status=='failed' or model_failed)
         return result

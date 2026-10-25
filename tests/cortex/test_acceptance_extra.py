@@ -59,14 +59,14 @@ def test_varied_prerequisite_graphs_match_independent_final_state(store,seed):
     store.teach('generated fixture','Symbolic rule fixture, not observed physics.',owner='tester',rules=[
       {'subject':'sample_b','prerequisite':'goggles','required_zone':zone}])
     g=Goal('fetch',('sample_b',),'bench');c=Compiler(store);p=c.compile(g)
-    v=verify(g,p['steps'],c.fixture(),store.related_rules(g),store.policy)
+    v=verify(g,p['steps'],c.fixture(symbolic=True),store.related_rules(g),store.policy)
     assert v.ok
     placements=[s['args']['zone'] for s in p['steps'] if s['op']=='place_at_zone']
     assert placements[-1]=='bench' and v.final_state['positions']['goggles']==zone
     wrong=copy.deepcopy(p['steps'])
     for step in reversed(wrong):
         if step['op']=='place_at_zone':step['args']['zone']='shelf_b';break
-    assert not verify(g,wrong,c.fixture(),store.related_rules(g),store.policy).ok
+    assert not verify(g,wrong,c.fixture(symbolic=True),store.related_rules(g),store.policy).ok
 
 def test_actual_loopback_http_qwen_contract_round_trip(store):
     calls=[]

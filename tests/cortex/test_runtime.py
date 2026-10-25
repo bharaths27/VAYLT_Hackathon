@@ -121,7 +121,7 @@ def test_physical_adapter_disabled_by_default(arena,store):
     with pytest.raises(Denied): Brain(store,PhysicalLike(arena))
 
 def test_symbolic_oracle_rejects_wrong_goal_and_extras(store):
-    g=Goal('fetch',('sample_a',),'bench'); c=Compiler(store); plan=c.compile(g); f=c.fixture()
+    g=Goal('fetch',('sample_a',),'bench'); c=Compiler(store); plan=c.compile(g); f=c.fixture(symbolic=True)
     assert verify(g,plan['steps'],f,[],store.policy).ok
     bad=copy.deepcopy(plan['steps']); bad[-1]['args']['zone']='shelf_b'
     assert not verify(g,bad,f,[],store.policy).ok
@@ -131,7 +131,7 @@ def test_symbolic_oracle_rejects_wrong_goal_and_extras(store):
 @pytest.mark.parametrize('value',[float('nan'),float('inf'),True,100,-100,'0.1'])
 def test_primitive_bounds_and_types(store,value):
     goal=Goal('primitive',primitive='drive_bounded',args={'distance_m':0.1})
-    assert not verify(goal,[{'op':'drive_bounded','args':{'distance_m':value}}],Compiler(store).fixture(),[],store.policy).ok
+    assert not verify(goal,[{'op':'drive_bounded','args':{'distance_m':value}}],Compiler(store).fixture(symbolic=True),[],store.policy).ok
 
 def test_new_derived_recipe_cannot_skip_real_observation(brain):
     p=propose(brain)

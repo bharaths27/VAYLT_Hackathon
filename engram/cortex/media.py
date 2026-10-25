@@ -5,7 +5,7 @@ Transport freshness is NOT capture freshness. Unknown capture timestamps remain
 unknown, including when a camera service repeats an old JPEG with a new response.
 """
 from __future__ import annotations
-import hashlib,threading,time,urllib.request
+import hashlib,math,threading,time,urllib.request
 from dataclasses import dataclass
 from typing import Callable
 from .models import NoRedirect,validate_loopback
@@ -96,4 +96,7 @@ class LocalJPEG:
         with urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect).open(request,timeout=self.timeout) as response:
             data=response.read(1_000_001)
             captured=response.headers.get('X-Frame-Captured-At')
-        return data,float(captured) if captured else None
+        # 'unknown' (what this API itself sends) or any non-numeric or non-finite value: capture time unknown, frame kept.
+        try: at=float(captured) if captured else None
+        except ValueError: at=None
+        return data,at if at is not None and math.isfinite(at) else None

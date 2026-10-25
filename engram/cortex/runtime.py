@@ -14,7 +14,7 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
-from .planning import CAPS,PHYSICAL,RECALL,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,PHYSICAL,RECALL,STOP_WORDS,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
@@ -78,7 +78,8 @@ class Brain:
         request=text(request,'request',2000); principal=text(principal,'principal',100)
         with self.activity.foreground():
             low=normalize(request)
-            if low in {'stop','stop now','halt','emergency stop'}: return {'kind':'stop',**self.stop()}
+            # A stop wins before anything else, with the same vocabulary as the brain and the console (STOP_WORDS).
+            if STOP_WORDS.search(request): return {'kind':'stop',**self.stop()}
             # Cheap deterministic controls/recall precede optional cloud classification.
             if RECALL.search(request):
                 return self.store.recall(request,principal=principal)
@@ -252,14 +253,8 @@ class Brain:
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
                     if supplied_digest!=actual or supplied_digest!=r['digest']: raise Conflict('approval does not match this exact plan')
                     goal=Goal.from_dict(plan['goal'])
-                    if r['derived_memory_id']:
-                        recipe=self.store.derived(r['derived_memory_id'])
-                        if recipe['status']!='VERIFIED' or recipe['payload'].get('steps')!=plan['steps'] or not self.store.refs_valid(recipe['refs']):
-                            raise Stale('execution recipe changed or lost its evidence')
-                    if r['skill_id']:
-                        skill=self.store.one('SELECT status,definition_json FROM skill_version WHERE id=?',(r['skill_id'],))
-                        if not skill or skill['status']!='APPROVED' or json.loads(skill['definition_json']).get('steps')!=plan['steps']:
-                            raise Stale('procedure was revoked or changed after proposal')
+                    changed=self._provenance_changed(r,plan)
+                    if changed: raise Stale(changed+' after proposal')
                     if plan['basis']!=self.store.basis(goal) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
                         raise Stale('rule, binding, source or policy changed after proposal')
                     if self.store.prohibitions(set(goal.targets)|{r['object'] for r in self.store.related_rules(goal)}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
@@ -272,8 +267,22 @@ class Brain:
                 return self._execute(ep,goal,plan)
         finally: self._effect_lock.release()
 
+    def _provenance_changed(self,r: dict,plan: dict) -> str | None:
+        """Why the recipe or approved skill a plan came from no longer backs it (None while it does). Checked at
+        approval and again before every dispatched step."""
+        if r['derived_memory_id']:
+            recipe=self.store.derived(r['derived_memory_id'])
+            if recipe['status']!='VERIFIED' or recipe['payload'].get('steps')!=plan['steps'] or not self.store.refs_valid(recipe['refs']):
+                return 'execution recipe changed or lost its evidence'
+        if r['skill_id']:
+            skill=self.store.one('SELECT status,definition_json FROM skill_version WHERE id=?',(r['skill_id'],))
+            if not skill or skill['status']!='APPROVED' or json.loads(skill['definition_json']).get('steps')!=plan['steps']:
+                return 'procedure was revoked or changed'
+        return None
+
     def _execute(self,ep: str,goal: Goal,plan: dict) -> dict:
         steps=[]; outcome='success'; reason=None; seen=set(); tags={o['tag']:o['id'] for o in self.store.objects()}; moved=False
+        op=self.operation(ep)
         try:
             for i,s in enumerate(plan['steps']):
                 if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
@@ -290,6 +299,9 @@ class Brain:
                             if not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
                                 raise Missing('prerequisite not currently observed at required station')
                 self.journal(ep,s['op'],s['args'],'pending',step=i)
+                # The recipe or skill behind this plan must still back it at every step: a revocation mid-run stops it.
+                changed=self._provenance_changed(op,plan)
+                if changed: raise Stale(changed+' while executing')
                 # STOP interlock: the last check sits immediately before dispatch (no validation or I/O in between),
                 # and the adapter refuses motion once stop() reached it, so a STOP in this gap cannot dispatch the step.
                 if self._stopped.is_set():

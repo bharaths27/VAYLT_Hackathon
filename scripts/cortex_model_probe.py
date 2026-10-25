@@ -32,7 +32,7 @@ def main():
             g=Goal('fetch',('sample_b',),'bench');beg=time.perf_counter()
             try:
                 r=q.complete('plan',s.bundle('Bring Sample B to bench',g),goal=g.to_dict())
-                v=verify(g,r.value['steps'],Compiler(s).fixture(),s.related_rules(g),s.policy)
+                v=verify(g,r.value['steps'],Compiler(s).fixture(symbolic=True),s.related_rules(g),s.policy)
                 out['qwen'].append({'status':'response_received','correct':v.ok,'expected_prerequisite_zone':zone,'errors':v.errors,'result':r.value,'model':r.model,
                     'model_sha256':out.get('model_file',{}).get('sha256') if out.get('model_file',{}).get('name')==r.model else None,
                     'input_tokens':r.input_tokens,'elapsed_ms':r.elapsed_ms,'contract_sha256':r.contract_hash,'prompt_sha256':r.prompt_hash,'trace':r.trace})

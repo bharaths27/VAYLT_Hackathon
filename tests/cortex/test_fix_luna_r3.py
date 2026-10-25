@@ -62,8 +62,13 @@ def test_a_structured_rule_does_not_hide_another_safety_sentence_about_the_same_
     with pytest.raises(Missing,match='structured review'): Compiler(store).compile(Goal('fetch',('sample_b',),'bench'))
 
 def test_control_the_structured_sentence_alone_is_resolved(store):
-    store.teach('SOP','Before anyone handles Sample B, the goggles have to be at the ppe station.',owner='carther',rules=[RULE])
+    store.teach('SOP','Safety goggles must be at the ppe station before handling Sample B.',owner='carther',rules=[RULE])
     assert Compiler(store).compile(Goal('fetch',('sample_b',),'bench'))['steps']
+
+def test_an_unusual_phrasing_is_not_resolved_by_entity_overlap(store):
+    # Its meaning cannot be checked against the rule: the reviewer restates it in the rule's form or it stays open.
+    store.teach('SOP','Before anyone handles Sample B, the goggles have to be at the ppe station.',owner='carther',rules=[RULE])
+    with pytest.raises(Missing,match='structured review'): Compiler(store).compile(Goal('fetch',('sample_b',),'bench'))
 
 
 # P2-4: conditionals are detected whatever `rules` says, and scoped to stations as well as objects.
@@ -107,14 +112,14 @@ def _anchored_plan(store,goal,fixture):
     return plan
 
 def test_a_goto_skill_is_tested_starting_away_from_its_destination(store):
-    f=Compiler(store).fixture(); k=Skills(store); sk=k.create(_anchored_plan(store,Goal('goto',zone='bench'),f))
+    f=Compiler(store).fixture(symbolic=True); k=Skills(store); sk=k.create(_anchored_plan(store,Goal('goto',zone='bench'),f))
     rec=k.test(sk['id'],f)
     assert rec['ok'] and any(c['start_zone'] not in (None,'bench') for c in rec['cases'])
 
 def test_a_no_op_fetch_procedure_never_becomes_a_skill(clock):
     s=Store(clock=clock);s.register_arena({'zones':['bench'],'objects':[{'id':'sample_a','name':'Sample A','tag':1}]})
     s.observe('sample_a','bench',origin='camera',mode='OPERATOR')               # one station: the goal already holds
-    g=Goal('fetch',('sample_a',),'bench'); f=Compiler(s).fixture(); plan=_anchored_plan(s,g,f)
+    g=Goal('fetch',('sample_a',),'bench'); f=Compiler(s).fixture(symbolic=True); plan=_anchored_plan(s,g,f)
     assert [x['op'] for x in plan['steps']]==['observe']
     k=Skills(s); rec=k.test(k.create(plan)['id'],f)
     assert not rec['ok'] and 'no effect step' in json.dumps(rec)

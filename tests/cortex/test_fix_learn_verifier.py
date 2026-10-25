@@ -40,12 +40,12 @@ WRONG={
 @pytest.mark.parametrize('name',sorted(WRONG))
 def test_mutation_suite_known_wrong_plans_fail_verification(store,rule,name):
     goal,steps=WRONG[name]
-    v=verify(goal,copy.deepcopy(steps),Compiler(store).fixture(),store.related_rules(goal),store.policy)
+    v=verify(goal,copy.deepcopy(steps),Compiler(store).fixture(symbolic=True),store.related_rules(goal),store.policy)   # each wrong plan fails for its own reason
     assert not v.ok, name
 
 @pytest.mark.parametrize('goal',[FETCH_B,Goal('fetch',('sample_a',),'home'),Goal('goto',zone='home'),CLAW,Goal('inspect',('goggles',))])
 def test_compiled_plans_still_verify(store,rule,goal):
-    c=Compiler(store); f={**c.fixture(),'holding':None,'holding_known':True}   # the claw is reported empty
+    c=Compiler(store); f=c.fixture(symbolic=True)   # the claw is declared empty
     p=c.compile(goal,f)
     assert verify(goal,p['steps'],f,store.related_rules(goal),store.policy).ok
 

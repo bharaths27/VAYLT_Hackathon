@@ -182,10 +182,16 @@ def _configured_brain()->Brain:
     return Brain(s,robot,qwen=qwen,intent=IntentAdvisor(enabled=policy.cloud_enabled))
 
 
+def env_token() -> str:
+    """The operator token: read from CORTEX_API_TOKEN_FILE when set (so it never sits on a command line), else from
+    CORTEX_API_TOKEN."""
+    path=os.environ.get('CORTEX_API_TOKEN_FILE')
+    return Path(path).read_text(encoding='utf-8').strip() if path else os.environ.get('CORTEX_API_TOKEN','')
+
 def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:FrameHub|None=None,
                start_idle:bool|None=None,sensor_tokens:dict[str,str]|None=None)->FastAPI:
     supplied=brain is not None
-    keys=tokens if tokens is not None else {os.environ.get('CORTEX_API_TOKEN',''):os.environ.get('CORTEX_OPERATOR','operator')}
+    keys=tokens if tokens is not None else {env_token():os.environ.get('CORTEX_OPERATOR','operator')}
     if not keys or any(len(k)<32 or not v.strip() for k,v in keys.items()):
         raise Denied('configure a random server-side CORTEX_API_TOKEN of at least 32 characters')
     skeys=sensor_tokens or ({os.environ['CORTEX_SENSOR_TOKEN']:'sensor:camera'} if os.environ.get('CORTEX_SENSOR_TOKEN') else {})

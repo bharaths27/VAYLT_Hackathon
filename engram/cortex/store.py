@@ -37,6 +37,8 @@ SAFETY_RE = re.compile(r"\b(?:must|mustn't|never|should|shouldn't|shall|needs? t
                        r"not (?:allowed|permitted)|not\s+to\s+be|(?:is|are)\s+to\s+be\s+(?:kept|left|used|moved|handled|stored)|off[- ]limits|"
                        r"out\s+of\s+(?:bounds|service|order)|(?:no\s*one|nobody)\s+(?:may|should|can|is\s+to)|"
                        r"do not|don't|cannot|can't|may not|only|always|avoid|keep|hazard\w*|danger\w*|caution|warning)\b", re.I)
+# A negated handling statement in any word order ("must never be handled", "should not be moved").
+NEG_HANDLE_RE = re.compile(r"(?:\b(?:never|not|no|cannot)\b|n't\b).*\b(?:move[ds]?|moving|touch\w*|handl\w*|pick\w*|carr\w*|lift\w*|grab\w*|transport\w*)\b", re.I)
 CONDITIONAL_RE = re.compile(r"\b(?:unless|except|exceptions?|only if|provided that)\b", re.I)
 # Motion or use wording: a conditional that names nothing registered but speaks of these is scoped to everything.
 MOTION_RE = re.compile(r"\b(?:move[ds]?|moving|bring|take|carry|put|handled?|handling|touch|pick|use[ds]?|using|go|drive|leave|enter)\b", re.I)
@@ -238,16 +240,21 @@ class Store:
                               (zone, at, oid, object_id, at))
         return oid
 
+    def _template_rule(self, m) -> tuple | None:
+        """(subject, prerequisite, station) of one prerequisite-template match, when each resolves to exactly one."""
+        pre, subject = self.resolve_objects(m['pre']), self.resolve_objects(m['subject'])
+        try:
+            zone = self.resolve_zone(m['zone'])
+        except Missing:
+            zone = None
+        return (subject[0], pre[0], zone) if len(pre) == len(subject) == 1 and zone else None
+
     def _extract(self, body: str) -> tuple[list[dict], list[str]]:
         found, unknown = [], []
         for m in RULE_RE.finditer(body):
-            pre, subject = self.resolve_objects(m['pre']), self.resolve_objects(m['subject'])
-            try:
-                zone = self.resolve_zone(m['zone'])
-            except Missing:
-                zone = None
-            if len(pre) == len(subject) == 1 and zone:
-                found.append({'subject': subject[0], 'prerequisite': pre[0], 'required_zone': zone})
+            key = self._template_rule(m)
+            if key:
+                found.append({'subject': key[0], 'prerequisite': key[1], 'required_zone': key[2]})
             else:
                 unknown.append(m.group(0))
         return found, unknown
@@ -275,23 +282,32 @@ class Store:
                 raise Conflict('self-dependent rule')
             checked.append({**r, 'rule_key': r.get('rule_key') or f"{r['subject']}::requires::{r['prerequisite']}"})
         forbidden, pending = list(prohibitions or []), []
-        # A reviewer's structured item resolves only the sentence it structures: a rule, a sentence naming exactly its
-        # subject, prerequisite and station; the prohibitions, a sentence naming nothing but prohibited objects. Every
-        # other conditional or unparsed safety sentence stays an unresolved constraint, whatever `rules` says, scoped
-        # to what the sentence names (else the source; a motion conditional naming nothing registered: everything).
-        rule_sets = {frozenset((r.get('subject'), r.get('prerequisite'), r.get('required_zone'))) for r in (rules or []) if isinstance(r, dict)}
+        # Each sentence is accounted for by its meaning, not by the entities it names. What is stored accounts for its
+        # own wording only: a prerequisite-template clause whose rule is stored as written (a reviewer's rule or an
+        # extracted one, its clause carrying nothing else), a prohibition whose objects are prohibited, or a negated
+        # handling sentence about reviewer-prohibited objects alone. A conditional is never resolved: no structured
+        # form expresses its exception. Whatever safety wording remains is an unresolved constraint, scoped to what
+        # the sentence names (else the source); a motion statement naming nothing registered is scoped to everything.
+        stored = {(r.get('subject'), r.get('prerequisite'), r.get('required_zone')) for r in extracted if isinstance(r, dict)}
         banned = set(forbidden)
-        def resolved(names): return frozenset(names) in rule_sets or bool(names) and set(names) <= banned
         for sent in sentences:
-            if PROHIBIT_RE.search(sent):
-                forbidden.extend(self.resolve_objects(sent))
             named = self.named(sent) or self.named(body)
+            residual = sent
+            for m in RULE_RE.finditer(sent):
+                if self._template_rule(m) in stored and not (SAFETY_RE.search(m['subject']) or CONDITIONAL_RE.search(m['subject'])):
+                    residual = residual.replace(m.group(0), ' ')
+            if PROHIBIT_RE.search(sent):
+                objs = self.resolve_objects(sent); forbidden.extend(objs)
+                if objs: residual = PROHIBIT_RE.sub(' ', residual)
+            elif NEG_HANDLE_RE.search(sent) and named and set(named) <= banned:
+                residual = ''
+            unscoped = ['*'] if MOTION_RE.search(sent) or SAFETY_RE.search(sent) else []
             if CONDITIONAL_RE.search(sent):
-                scope = named or (['*'] if MOTION_RE.search(sent) or SAFETY_RE.search(sent) else [])
-                if scope and not resolved(scope): pending.append(('Conditional exception; structured review required: '+sent.strip()[:300], scope))
-            elif SAFETY_RE.search(PROHIBIT_RE.sub(' ', RULE_RE.sub(' ', sent))):
-                if named and not resolved(named): pending.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], named))
-        pending += [('Unresolved rule wording: '+u[:300], self.named(u) or self.named(body)) for u in unresolved]
+                scope = named or unscoped
+                if scope: pending.append(('Conditional exception; structured review required: '+sent.strip()[:300], scope))
+            elif SAFETY_RE.search(residual) or PROHIBIT_RE.search(residual):
+                scope = named or (['*'] if MOTION_RE.search(sent) or PROHIBIT_RE.search(sent) else [])
+                if scope: pending.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], scope))
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
