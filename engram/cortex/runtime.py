@@ -258,7 +258,7 @@ class Brain:
         finally: self._effect_lock.release()
 
     def _execute(self,ep: str,goal: Goal,plan: dict) -> dict:
-        steps=[]; outcome='success'; reason=None; seen=set(); tags={o['tag']:o['id'] for o in self.store.objects()}
+        steps=[]; outcome='success'; reason=None; seen=set(); tags={o['tag']:o['id'] for o in self.store.objects()}; moved=False
         try:
             for i,s in enumerate(plan['steps']):
                 if self._stopped.is_set(): outcome='aborted'; reason='stop requested'; break
@@ -275,6 +275,7 @@ class Brain:
                             if not obj['fresh'] or obj['last_zone']!=rule['required_zone']:
                                 raise Missing('prerequisite not currently observed at required station')
                 self.journal(ep,s['op'],s['args'],'pending',step=i)
+                moved=moved or s['op'] in PHYSICAL
                 try: result=self.robot.execute(s['op'],s['args'])
                 except Exception:
                     self.journal(ep,s['op'],s['args'],'unknown','adapter exception; no automatic retry',i)
@@ -308,6 +309,9 @@ class Brain:
                     outcome='needs_verification'; reason='operator or independent sensor must attest the physical postcondition'
         except CortexError as e: outcome='aborted'; reason=str(e)
         except Exception: outcome='unknown'; reason='unexpected execution error; no retry'
+        if outcome in {'failed','aborted'} and moved and self.mode=='PHYSICAL':
+            # A dispatched motion step may have partly changed the world: unresolved until the operator attests it.
+            outcome='unknown'; reason=f'{reason}; a motion step was dispatched, physical state unverified'
         if outcome in {'unknown','aborted','failed'}:
             self._stopped.set()
             try: self.robot.stop()
@@ -334,14 +338,15 @@ class Brain:
 
     def stop(self):
         self._stopped.set(); self.activity.touch(); confirmed=False
-        try:
-            self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
-        except Exception: pass
+        # Durable first: a crash during the robot call still leaves the latch set and every pending proposal revoked.
         with self.store.tx():
             self._latch('operator stop')
             for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
                 self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
-            self.journal(None,'stop',{},'confirmed' if confirmed else 'requested')
+        try:
+            self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
+        except Exception: pass
+        self.journal(None,'stop',{},'confirmed' if confirmed else 'requested')
         return {'stop_requested':True,'stop_confirmed':confirmed,'auto_resume':False}
 
     def clear_stop(self,*,principal: str):

@@ -30,6 +30,11 @@ RULE_RE = re.compile(
     r'(?P<pre>[A-Za-z0-9 _-]+?)\s+(?:must|should|needs? to)\s+be\s+'
     r'(?:at|on|in)\s+(?:the\s+)?(?P<zone>[A-Za-z0-9 _-]+?)\s+before\s+'
     r'(?:handling|using|moving|touching)\s+(?P<subject>[A-Za-z0-9 _-]+)', re.I)
+PROHIBIT_RE = re.compile(r"\b(never|must not|do not|don't)\s+(move|touch|handle|pick|carry)\b", re.I)
+# Deontic or hazard wording. Left over after the two templates above in a sentence that names a registered
+# object or station, it is never silently accepted: it is an unresolved constraint until a person structures it.
+SAFETY_RE = re.compile(r"\b(?:must|mustn't|never|should|shouldn't|shall|needs? to|ha(?:s|ve) to|required?|requires|forbidden|prohibited|"
+                       r"not (?:allowed|permitted)|do not|don't|cannot|can't|may not|only|always|avoid|keep|hazard\w*|danger\w*|caution|warning)\b", re.I)
 
 
 class Store:
@@ -152,18 +157,21 @@ class Store:
         t = self.clock()
         for r in out:
             r['aliases'] = json.loads(r.pop('aliases_json'))
-            age = None if r['last_seen_at'] is None else max(0.0, t - r['last_seen_at'])
+            age = None if r['last_seen_at'] is None else t - r['last_seen_at']
+            # A clock now behind the capture time (rolled back) cannot date the observation: age unknown, never fresh, flagged.
+            r['clock_behind'] = age is not None and age < 0
             obs=self.one('SELECT payload FROM observation WHERE id=?',(r['last_observation_id'],)) if r['last_observation_id'] else None
             try:r['evidence_class']=json.loads(obs['payload']).get('mode','LEGACY_UNKNOWN') if obs else 'UNKNOWN'
             except (TypeError,ValueError):r['evidence_class']='UNKNOWN'
-            if getattr(self,'runtime_mode',None)=='PHYSICAL' and r['evidence_class']!='PHYSICAL': age=None
+            if r['clock_behind'] or (getattr(self,'runtime_mode',None)=='PHYSICAL' and r['evidence_class']!='PHYSICAL'): age=None
             r['age_s'] = age
             r['fresh'] = age is not None and age <= self.policy.freshness_s
             r['id'] = r['object_id']
             r['tag'] = r['tag_id']
             r['freshness'] = max(0.0, 1.0 - age/self.policy.freshness_s) if age is not None else 0.0
             r['statement'] = (f"{r['name']}: location unknown" if not r['last_zone'] else
-                              f"{r['name']} {'is' if r['fresh'] else 'was last observed'} at {r['last_zone']}")
+                              f"{r['name']} {'is' if r['fresh'] else 'was last observed'} at {r['last_zone']}"
+                              +(' (observation dated after the current clock; age unknown)' if r['clock_behind'] else ''))
         return out
 
     def resolve_objects(self, phrase: str) -> list[str]:
@@ -175,13 +183,17 @@ class Store:
                 found.append(o['id'])
         return found
 
-    def resolve_zone(self, phrase: str) -> str | None:
+    def zones_named(self, phrase: str) -> list[str]:
         p = ' ' + normalize(phrase) + ' '
-        hits = []
-        for z in self.rows('SELECT * FROM cx_station'):
-            names = [z['id'], z['name']] + json.loads(z['aliases_json'])
-            if any(' '+normalize(n)+' ' in p for n in names):
-                hits.append(z['id'])
+        return [z['id'] for z in self.rows('SELECT * FROM cx_station')
+                if any(' '+normalize(n)+' ' in p for n in [z['id'], z['name']] + json.loads(z['aliases_json']))]
+
+    def named(self, phrase: str) -> list[str]:
+        """Registered objects and stations a phrase names: the scope an unresolved statement blocks."""
+        return sorted(set(self.resolve_objects(phrase)) | set(self.zones_named(phrase)))
+
+    def resolve_zone(self, phrase: str) -> str | None:
+        hits = self.zones_named(phrase)
         if len(hits) > 1:
             raise Missing('more than one destination; name one')
         return hits[0] if hits else None
@@ -241,10 +253,15 @@ class Store:
             if r['subject'] == r['prerequisite']:
                 raise Conflict('self-dependent rule')
             checked.append({**r, 'rule_key': r.get('rule_key') or f"{r['subject']}::requires::{r['prerequisite']}"})
-        forbidden = list(prohibitions or [])
+        forbidden, safety = list(prohibitions or []), []
         for sent in re.split(r'[.\n]', body):
-            if re.search(r"\b(never|must not|do not|don't)\s+(move|touch|handle|pick|carry)\b", sent, re.I):
+            sent = sent.replace(chr(0x2019), "'")
+            if PROHIBIT_RE.search(sent):
                 forbidden.extend(self.resolve_objects(sent))
+            # Safety wording neither template captured, scoped to what the sentence (else the source) names.
+            if rules is None and SAFETY_RE.search(PROHIBIT_RE.sub(' ', RULE_RE.sub(' ', sent))):
+                named = self.named(sent) or self.named(body)
+                if named: safety.append(('Unparsed safety statement; structured review required: '+sent.strip()[:300], named))
         if len(forbidden)>32 or not set(forbidden)<=known:
             raise Missing('prohibition needs registered objects')
         facts=facts or []
@@ -275,6 +292,8 @@ class Store:
                               (sid, self.workspace, 'accepted', rev, supersedes, hashlib.sha256(body.encode()).hexdigest(), int(cloud_ok)))
             if unresolved:
                 self.conn.execute('INSERT INTO cx_unresolved VALUES(?,?,?)',(sid,canonical(self.resolve_objects(body)),'; '.join(unresolved)[:1000]))
+            for reason, named in safety:
+                self.conn.execute('INSERT INTO cx_unresolved VALUES(?,?,?)',(sid,canonical(named),reason))
             if supersedes:
                 self.conn.execute("UPDATE cx_constraint SET status='superseded' WHERE assertion_id IN (SELECT id FROM assertion WHERE source_id=?)", (supersedes,))
             for obj in sorted(set(forbidden)):
@@ -313,7 +332,7 @@ class Store:
             self._bump()
             self.invalidate()
         return {'source_id': sid, 'chunk_id': cid, 'revision': rev, 'rules': added,
-                'unresolved_rules': unresolved, 'kind': 'taught'}
+                'unresolved_rules': unresolved+[reason for reason, _ in safety], 'kind': 'taught'}
 
     def source_state(self, sid: str) -> dict:
         r = self.one('SELECT s.*,c.* FROM source s JOIN cx_source c ON c.source_id=s.id WHERE s.id=? AND c.workspace=?', (sid, self.workspace))
@@ -405,9 +424,14 @@ class Store:
                     frontier.append(r['object'])
         return relevant
 
-    def unresolved_for(self,object_ids: set[str]) -> list[dict]:
+    def unresolved_for(self,ids: set[str]) -> list[dict]:
         rows=self.rows("SELECT u.* FROM cx_unresolved u JOIN cx_source s ON s.source_id=u.source_id WHERE s.status='accepted' AND s.workspace=?",(self.workspace,))
-        return [r for r in rows if object_ids & set(json.loads(r['mentions_json']))]
+        return [r for r in rows if ids & set(json.loads(r['mentions_json']))]
+
+    @staticmethod
+    def scope(goal: Goal, rules: list[dict]) -> set[str]:
+        """Objects and stations a goal involves: what an unresolved statement naming any of them blocks."""
+        return set(goal.targets) | {r[k] for r in rules for k in ('subject','object','required_zone')} | ({goal.zone} if goal.zone else set())
 
     def generic_facts(self, query: str='') -> list[dict]:
         rows=self.rows("SELECT a.*,f.status FROM assertion a JOIN cx_fact f ON f.assertion_id=a.id JOIN cx_source s ON s.source_id=a.source_id WHERE s.workspace=? AND s.status='accepted' AND f.status IN ('active','disputed') ORDER BY a.created_at DESC",(self.workspace,))
@@ -426,7 +450,7 @@ class Store:
         zones = self.rows('SELECT id,version FROM cx_station ORDER BY id')
         payload = {'goal':goal.to_dict(), 'rules':[{k:r[k] for k in ('id','rule_key','required_zone','object','subject','status')} for r in rules],
                    'entities':entities, 'zones':zones}
-        payload['unresolved']=self.unresolved_for(ids)
+        payload['unresolved']=self.unresolved_for(self.scope(goal,rules))
         payload['prohibitions'] = self.prohibitions(ids)
         return digest(payload)
 
@@ -462,7 +486,7 @@ class Store:
         b = {'goal':request, 'task':goal.to_dict() if goal else None, 'epoch':self.epoch(),
              'basis': self.basis(goal) if goal else None, 'facts':facts, 'objects':objects, 'constraints':facts,
              'evidence':evidence, 'missing':missing, 'omitted':[], 'applicable_skills':[], 'derived':[]}
-        b['unresolved_constraints']=self.unresolved_for(ids)
+        b['unresolved_constraints']=self.unresolved_for(self.scope(goal,rules) if goal else ids|set(self.zones_named(request)))
         b['prohibitions'] = self.prohibitions(ids)
         # Optional declared facts never override sensor locations or authority.
         generic=self.generic_facts(request)[:8]
@@ -617,6 +641,17 @@ class Store:
             self.conn.execute('INSERT INTO cx_manifest VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload_json=excluded.payload_json,created_at=excluded.created_at',
                               (name,kind,canonical(payload),self.clock()))
 
+    def episodes_about(self, ids: set[str], limit: int = 8) -> list[dict]:
+        """Newest episodes naming any of these objects, searched over the whole history BEFORE limiting."""
+        names = [' '+normalize(n)+' ' for o in self.objects() if o['id'] in ids for n in [o['id'], o['name']]+o['aliases']]
+        out = []
+        with self.lock:
+            for r in self.conn.execute('SELECT e.id,e.request,e.outcome,e.failure,e.started_at,c.mode FROM episode e LEFT JOIN cx_episode c ON c.id=e.id ORDER BY e.started_at DESC'):
+                p = ' '+normalize(r['request'])+' '
+                if any(n in p for n in names): out.append(dict(r))
+                if len(out) >= limit: break
+        return out
+
     def recall(self, question: str, kinds: list[str] | None = None) -> dict:
         allowed={'semantic','episodic','procedural','external','parametric','prospective','working'}
         chosen=set(kinds or allowed)
@@ -645,8 +680,8 @@ class Store:
         low=normalize(question); ids=set(self.resolve_objects(question))
         hits=result['memories'].get('external',[])
         episodes=result['memories'].get('episodic',[])
-        if ids:
-            episodes=[e for e in episodes if ids & set(self.resolve_objects(e['request']))]
+        if ids and 'episodic' in chosen:
+            episodes=self.episodes_about(ids)
         if re.search(r'\b(what happened|what did you|last time|previous run)\b',low):
             if episodes:
                 e=episodes[0]
