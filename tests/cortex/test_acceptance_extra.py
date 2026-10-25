@@ -6,7 +6,7 @@ from engram.cortex.sensors import ingest
 from engram.cortex.types import *
 from engram.cortex.planning import Compiler,verify
 from engram.cortex.simulation import Result
-from engram.cortex.models import QwenClient
+from engram.cortex.models import QwenClient,THINK_OFF
 from engram.cortex.api import create_app
 
 TOKEN='operator-token-'+('x'*32);SENSOR='sensor-token-'+('y'*32)
@@ -75,7 +75,7 @@ def test_actual_loopback_http_qwen_contract_round_trip(store):
         def do_POST(self):
             data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             calls.append((self.path,data))
-            value={'prompt':'TEMPLATE:'+data['messages'][0]['content']} if self.path=='/apply-template' else {'tokens':[1,2,3]} if self.path=='/tokenize' else {'content':'{"steps":[{"op":"gripper_open","args":{}}]}','model':'stub-not-real-Qwen'}
+            value={'prompt':'TEMPLATE:'+data['messages'][0]['content']+THINK_OFF} if self.path=='/apply-template' else {'tokens':[1,2,3]} if self.path=='/tokenize' else {'content':'{"steps":[{"op":"gripper_open","args":{}}]}','model':'stub-not-real-Qwen'}
             body=json.dumps(value).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
     server=HTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
     try:

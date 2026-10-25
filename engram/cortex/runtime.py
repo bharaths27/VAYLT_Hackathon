@@ -139,14 +139,14 @@ class Brain:
                     plan=copy.deepcopy(skill['definition']); source='skill'
                 else:
                     plan=None
-                    if self.qwen:
+                    if self.qwen and self.qwen.planning_order=='model_first':
                         try:
                             calls+=1; out=self.qwen.complete('plan',bundle,goal=goal.to_dict())
                             v=verify(goal,out.value['steps'],fixture,self.store.related_rules(goal),self.store.policy)
                             self.store.decision('plan','llama.cpp',out.model,v.ok,'verified' if v.ok else 'goal verification rejected model plan')
                             if v.ok:
                                 base=self.compiler.compile(goal,fixture)
-                                plan={**base,'steps':out.value['steps'],'verification':v.to_dict()}; source='model'
+                                plan={**base,'steps':out.value['steps'],'refs':sorted(set(base['refs']+out.refs)),'verification':v.to_dict()}; source='model'
                                 self.store.manifest('last_qwen_request','parametric',{'contract_sha256':out.contract_hash,'prompt_sha256':out.prompt_hash,
                                     'input_tokens':out.input_tokens,'model':out.model,'elapsed_ms':out.elapsed_ms,'response_accepted':True})
                             else: note='Model plan failed independent goal verification; composed from accepted rules.'
