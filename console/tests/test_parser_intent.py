@@ -11,6 +11,7 @@ import asyncio
 import threading
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -348,6 +349,19 @@ def test_an_unconfirmed_stop_says_so_and_stays_latched(monkeypatch, failure):
     assert "could not confirm" in out["reason"] and "Cut the motor power" in out["quip"], out
     assert said == out["quip"] and out["robot"], (said, out)
     assert button.status_code == 502, button.status_code
+
+
+@pytest.mark.parametrize("status,body,confirmed", [(200, {"stopped": True, "latched": True}, True),
+                                                   (500, {"detail": "driver crashed"}, False),
+                                                   (200, {"stopped": False, "latched": False}, False)])
+def test_the_http_robot_never_passes_an_error_reply_off_as_a_stop(status, body, confirmed):
+    from server.adapters.robot import HttpRobot
+    from server.core import stop_unconfirmed
+
+    robot = HttpRobot("http://robot.test")
+    robot.fast = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status, json=body)))
+    res = asyncio.run(robot.stop())
+    assert (not stop_unconfirmed(res)) is confirmed, res
 
 
 def test_a_confirmed_stop_says_stopping():
