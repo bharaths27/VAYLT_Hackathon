@@ -65,9 +65,12 @@ def robot_frame(base: str, deadline_s: float = 5.0, max_bytes: int = MAX_FRAME_B
     def work() -> None:
         try:
             with urllib.request.urlopen(url, timeout=deadline_s) as r:
+                # read1 returns after ONE read of the socket, so an abandoned fetch sees the flag at the next bytes;
+                # read(n) would wait for all n bytes, and a server dripping a byte at a time could hold it for hours
+                read = getattr(r, "read1", r.read)
                 parts, size = [], 0
                 while not abandoned.is_set():
-                    chunk = r.read(64 << 10)
+                    chunk = read(64 << 10)
                     if not chunk:
                         result["frame"] = b"".join(parts)
                         return

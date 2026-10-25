@@ -472,6 +472,39 @@ def test_a_robot_server_that_drips_bytes_is_a_failed_frame_at_the_deadline(monke
     assert time.monotonic() - started < 2.0
 
 
+def test_an_abandoned_robot_fetch_lets_go_of_a_real_dripping_server():
+    # luna round 10: read(64 KiB) waits for 64 KiB, so after the deadline the abandoned worker kept reading a server
+    # that drips a byte at a time (in a live loop, one leaked socket per frame). The server here notices the client
+    # hanging up: a send fails once the fetch has let go.
+    import socket
+    import threading
+    import time
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    released = threading.Event()
+
+    def drip():
+        conn, _ = srv.accept()
+        with conn:
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 100000\r\n\r\n")
+            try:
+                for _ in range(400):  # 20 s at most
+                    conn.sendall(b"x")
+                    time.sleep(0.05)
+            except OSError:
+                released.set()
+
+    threading.Thread(target=drip, daemon=True).start()
+    va = _vision_ask()
+    with pytest.raises(iv.VisionError, match="deadline"):
+        va.robot_frame(f"http://127.0.0.1:{srv.getsockname()[1]}", deadline_s=0.5)
+    assert released.wait(5.0), "the abandoned fetch kept reading the dripping server"
+    srv.close()
+
+
 def test_a_robot_frame_over_the_size_cap_is_a_failed_frame(monkeypatch):
     import itertools
 
