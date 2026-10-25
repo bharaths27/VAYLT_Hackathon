@@ -39,7 +39,22 @@ test("a /tts reply that arrives after newTurn never plays", async () => {
   h.ctl.newTurn();
   h.fetch.respond(0); // the old reply lands anyway
   await tick();
+  assert.equal(h.fetch.calls[0].blobCalls, 0, "the stale body is never read");
   assert.equal(h.audios.length, 0, "no Audio element was created");
+  assert.equal(await p, "stale");
+});
+
+test("a /tts body that finishes downloading after newTurn never plays", async () => {
+  const h = makeController({ fetch: { honorAbort: false } });
+  const e1 = h.ctl.newTurn();
+  const p = h.ctl.playUrl(e1, "/tts?text=old");
+  h.fetch.respond(0, { holdBody: true });
+  await tick();
+  assert.equal(h.fetch.calls[0].blobCalls, 1, "body read started in the live turn");
+  h.ctl.newTurn();
+  h.fetch.calls[0].releaseBody(); // the body arrives anyway
+  await tick();
+  assert.equal(h.audios.length, 0);
   assert.equal(await p, "stale");
 });
 
@@ -230,4 +245,22 @@ test("track() refuses a missing or unknown turn instead of guessing the current 
   assert.throws(() => h.ctl.track(Promise.resolve()), TypeError);
   assert.throws(() => h.ctl.track(Promise.resolve(), e + 1), TypeError);
   assert.equal(h.ctl.incomingEpoch(), e);
+});
+
+test("tracked requests that settle with no speech lines do not pile up", async () => {
+  const h = makeController({ graceMs: 1000 });
+  const e = h.ctl.newTurn();
+  for (let i = 0; i < 200; i++) {
+    h.ctl.track(Promise.resolve(), e); // e.g. muted, or a command that says nothing
+    await tick();
+    h.clock.t += 1500;
+  }
+  assert.ok(h.ctl.tracked() <= 1, "only the latest settled request is kept, got " + h.ctl.tracked());
+
+  let settle;
+  h.ctl.track(new Promise((r) => { settle = r; }), e);
+  h.clock.t += 60000;
+  h.ctl.track(Promise.resolve(), e);
+  assert.equal(h.ctl.tracked(), 2, "an outstanding request is never pruned");
+  settle();
 });

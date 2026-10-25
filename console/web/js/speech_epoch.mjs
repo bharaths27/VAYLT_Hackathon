@@ -39,6 +39,14 @@ export function createSpeechController(deps = {}) {
 
   const alive = (e, g0) => e === epoch && g0 === gen;
 
+  // Forget requests that settled more than graceMs ago. Runs on every
+  // track() too, so the set stays bounded even when no line ever arrives.
+  function prune(t) {
+    for (const r of requests) {
+      if (r.settledAt !== null && t - r.settledAt > graceMs) requests.delete(r);
+    }
+  }
+
   function halt(audio) {
     try { audio.pause(); } catch (e) { /* already gone */ }
     try { audio.removeAttribute("src"); audio.load(); } catch (e) { /* already gone */ }
@@ -137,18 +145,18 @@ export function createSpeechController(deps = {}) {
       const g0 = gen;
       const f = { epoch: e, ac: new AbortController() };
       fetches.add(f);
-      let blob = null;
       try {
-        const r = await doFetch(url, { signal: f.ac.signal });
-        if (r && r.ok) blob = await r.blob();
-      } catch (err) {
-        blob = null;
+        let r = null, blob = null;
+        try { r = await doFetch(url, { signal: f.ac.signal }); } catch (err) { r = null; }
+        if (!alive(e, g0)) return "stale"; // never read a stale body
+        if (!r || !r.ok) return "failed";
+        try { blob = await r.blob(); } catch (err) { blob = null; }
+        if (!alive(e, g0)) return "stale";
+        if (!blob) return "failed";
+        return start(e, g0, blob);
       } finally {
         fetches.delete(f);
       }
-      if (!alive(e, g0)) return "stale";
-      if (!blob) return "failed";
-      return start(e, g0, blob);
     },
 
     // Piper audio already in hand.
@@ -164,6 +172,7 @@ export function createSpeechController(deps = {}) {
       if (!Number.isInteger(turn) || turn < 0 || turn > epoch) {
         throw new TypeError("track(promise, turn): turn must be a turn from current()/newTurn()");
       }
+      prune(now());
       const r = { epoch: turn, settledAt: null };
       requests.add(r);
       const settle = () => { r.settledAt = now(); };
@@ -171,18 +180,18 @@ export function createSpeechController(deps = {}) {
       return promise;
     },
 
+    // Requests still on the books (outstanding, or settled within graceMs).
+    tracked: () => requests.size,
+
     // The turn that server speech arriving now belongs to. Server speech has
     // no turn id, so while a request from an older turn is still out (or just
     // settled), credit the line to that older turn: it is stale, not ours.
     // The graceMs window exists only for these untagged lines; requests carry
     // their turn explicitly.
     incomingEpoch() {
-      const t = now();
+      prune(now());
       let owner = epoch;
-      for (const r of requests) {
-        if (r.settledAt !== null && t - r.settledAt > graceMs) requests.delete(r);
-        else if (r.epoch < owner) owner = r.epoch;
-      }
+      for (const r of requests) if (r.epoch < owner) owner = r.epoch;
       return owner;
     },
   };

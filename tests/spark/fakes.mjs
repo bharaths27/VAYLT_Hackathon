@@ -60,8 +60,16 @@ export class FakeFetch {
       });
     }
   });
-  respond(i, { ok = true, body = "wav", json = null } = {}) {
-    this.calls[i].resolve({ ok, status: ok ? 200 : 404, blob: async () => ({ fakeBlob: body }), json: async () => json });
+  // holdBody=true: blob() waits until call.releaseBody(). call.blobCalls counts reads.
+  respond(i, { ok = true, body = "wav", json = null, holdBody = false } = {}) {
+    const call = this.calls[i];
+    call.blobCalls = 0;
+    const blob = () => {
+      call.blobCalls++;
+      if (!holdBody) return Promise.resolve({ fakeBlob: body });
+      return new Promise((r) => { call.releaseBody = () => r({ fakeBlob: body }); });
+    };
+    call.resolve({ ok, status: ok ? 200 : 404, blob, json: async () => json });
   }
 }
 
