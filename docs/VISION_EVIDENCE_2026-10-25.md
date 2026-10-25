@@ -10,8 +10,9 @@ The record behind the numbers in `docs/VISION.md`. One run per photo, nothing re
   provider's latest alias for the run).
 - **Code:** this branch's `engram/vision/intent_vision.py` through `scripts/vision_ask.py` (`hand`, `scene` and
   `find` modes), default settings: each photo re-encoded as JPEG with its longest side at 768 px.
-- **Timing:** `latency_ms` is wall-clock time measured inside `VisionClient.ask`, from just before the request is
-  sent until the reply is read. It includes the upload, not the local resize.
+- **Timing:** `latency_ms` is wall-clock time measured inside the client's request call (`VisionClient._ask`, named
+  `ask` when these numbers were taken; the timing boundary is unchanged), from just before the request is sent until
+  the reply is read. It includes the upload, not the local resize.
 - **Ground truth:** a person looked at each photo and wrote down what it shows before reading the model's answer
   as right or wrong. The photo's search label was not trusted: two of them were wrong (marked below).
 - **Photos:** Wikimedia Commons, downloaded at 800 or 1024 px wide. They are listed, not included in the repo.
