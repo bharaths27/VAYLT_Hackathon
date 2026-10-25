@@ -19,12 +19,19 @@ LAZY_CLIENT=('if URL and os.environ.get("CORTEX_BRIDGE") == "1":  # lazy: only t
              '    _c = authorized_client(URL, timeout=60.0)\n'
              'else:\n'
              '    _c = httpx.AsyncClient(timeout=20.0) if URL else None\n')
+STATUS=('                 "refused": "FAILED"}.get(outcome, "NEEDS_VERIFICATION")\n')
+LABEL=('    if os.environ.get("CORTEX_BRIDGE") == "1":  # Cortex says SIMULATED or PHYSICAL; a simulated run is never VERIFIED\n'
+       '        from engram.cortex.console_adapter import console_status\n'
+       '        op.mode, op.status = res.get("mode"), console_status(res)\n')
 
 def transforms(root):
     paths={
       'console/server/brain.py':[
         ('import time\n','import os\nimport time\n'),
-        ('_c = httpx.AsyncClient(timeout=20.0) if URL else None\n',LAZY_CLIENT)],
+        ('_c = httpx.AsyncClient(timeout=20.0) if URL else None\n',LAZY_CLIENT),
+        ('        self.task = None\n','        self.task = None\n        self.mode = p.get("mode")\n'),
+        ('"bundle_id": self.bundle_id, "brain": URL}','"bundle_id": self.bundle_id, "brain": URL, "mode": self.mode}'),
+        (STATUS,STATUS+LABEL)],
       'console/server/adapters/memory.py':[
         ('def make_memory():\n', 'def make_memory():\n    import os\n    if os.environ.get("CORTEX_BRIDGE") == "1":\n        from engram.cortex.console_adapter import AsyncCortexMemory\n        return AsyncCortexMemory(config.BRAIN_URL)\n')]
     }
