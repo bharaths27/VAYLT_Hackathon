@@ -50,7 +50,11 @@ from .presets import PRESETS
 DEFAULT_TTL_S = 8.0          # a prediction older than this (from when it was asked) is not reused
 DEFAULT_FINAL_WAIT_S = 6.0   # how long on_final waits for the request already in flight
 
-STOP_WORDS = re.compile(r"\b(stop|halt|freeze|abort|emergency)\b", re.IGNORECASE)
+# Exactly the pattern of STOP_WORDS in engram/engine.py and console/server/parser.py (PR #6), so a stop said
+# in a partial stops here just as it would there. "hold on", "hold it" and "hang on" are phrases: "hold the
+# vial" and "holding" are not stops. tests/spark/test_speculation.py pins the pattern.
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b",
+                        re.IGNORECASE)
 # Words that take back or replace part of what was just said. The intent prompt names the same
 # cues; matching them here too means a confident model answer cannot talk past a correction.
 CORRECTION = re.compile(

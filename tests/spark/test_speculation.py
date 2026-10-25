@@ -1,10 +1,11 @@
 """The SpeculationGate: partials only prepare, stale answers are dropped, finals decide."""
 
+import re
 import threading
 
 import pytest
 
-from engram.spark.voice import SpeculationGate, Thresholds, future_event, is_stop
+from engram.spark.voice import STOP_WORDS, SpeculationGate, Thresholds, future_event, is_stop
 from spark_fakes import FakeIntent, clock, decision, fake, spawn  # noqa: F401  (fixtures)
 
 PARTIAL_ACTIONS = {"stop", "ignored", "dispatched", "queued", "unchanged"}
@@ -181,7 +182,7 @@ def test_negation_from_the_model_blocks_even_without_negation_words(spawn, clock
     "Close the claw instead",
     "Open the claw, or rather close it",
     "Open the claw I mean close it",
-    "Open the claw no wait close it",
+    "Open the claw, on second thought, close it",   # ("no wait" is a stop now: see the stop tests)
     "Open the claw, scratch that, close it",
 ])
 def test_correction_words_block_even_when_the_model_is_confident(spawn, clock, text):
@@ -536,6 +537,36 @@ def test_partial_of_a_new_utterance_queued_during_a_final_is_sent_afterwards():
 
 def test_stop_word_matching_uses_whole_words():
     assert not is_stop("Open the stopwatch drawer") and not is_stop("the antifreeze bottle")
+
+
+# The pattern of STOP_WORDS in engram/engine.py and console/server/parser.py (PR #6). Once that is merged, the
+# engine's own pattern is compared instead of this copy.
+PR6_STOP_PATTERN = r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b"
+
+
+def test_gate_stop_words_are_the_engines():
+    import engram.engine as engine
+
+    expected = getattr(engine, "STOP_WORDS", None)
+    assert STOP_WORDS.pattern == (expected.pattern if expected is not None else PR6_STOP_PATTERN)
+    assert STOP_WORDS.flags & re.IGNORECASE
+
+
+@pytest.mark.parametrize("text", ["Wait", "wait!", "Pause.", "PAUSE", "Hold on", "hold it!", "Hang on.", "Whoa",
+                                  "e-stop", "estop", "Open the claw, wait", "Open the claw no wait close it",
+                                  "Hold   on, open the claw"])
+def test_new_stop_words_stop_locally_on_partials_and_finals(fake, spawn, clock, text):
+    gate = make_gate(fake, spawn, clock)
+    assert gate.on_partial(1, 0, text).action == "stop"
+    assert gate.on_final(2, 0, text).action == "stop"
+    assert fake.calls == [] and spawn.jobs == []                 # the intent model is never asked
+
+
+@pytest.mark.parametrize("text", ["Hold the vial", "Open the claw while holding the beaker", "Hold the beaker steady",
+                                  "the placeholder", "awaiting results", "the timer paused", "Bring Sample A"])
+def test_holding_something_is_not_a_stop(fake, spawn, clock, text):
+    assert not is_stop(text)
+    assert make_gate(fake, spawn, clock).on_partial(1, 0, text).action != "stop"
 
 
 # ---- pieces --------------------------------------------------------------------------------------------------------

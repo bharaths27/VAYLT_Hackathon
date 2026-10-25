@@ -141,6 +141,18 @@ def test_refusal_future_ok_skips_only_the_deferral_check():
     assert "will not move" in refusal("Don't open the claw after calibration", future_ok=True)
 
 
+@pytest.mark.parametrize("text", ["Wait!", "Hold on", "pause", "Hang on.", "Whoa"])
+def test_new_stop_words_in_a_partial_stop_the_robot(voice, fake, spawn, text):
+    out = voice.on_partial(1, 0, text)
+    assert out["kind"] == "stop" and out["state"]["stopped"] is True
+    assert fake.calls == [] and spawn.jobs == [] and count(voice.engine, "episode") == 0
+
+
+def test_holding_something_in_a_partial_is_not_a_stop(voice, spawn):
+    out = voice.on_partial(1, 0, "Hold the vial")
+    assert out["kind"] == "partial" and voice.engine.robot.state()["stopped"] is False
+
+
 def test_stop_stops_at_once_without_asking_the_model(voice, fake, spawn):
     out = voice.on_partial(1, 0, "Stop")
     assert out["kind"] == "stop" and out["state"]["stopped"] is True
