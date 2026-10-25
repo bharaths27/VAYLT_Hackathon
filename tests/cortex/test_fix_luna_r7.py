@@ -42,6 +42,22 @@ def test_a_reset_the_adapter_does_not_confirm_keeps_the_latch(store,arena):
     with pytest.raises(Conflict,match='did not confirm'): b.clear_stop(principal='carther')
     assert store.one(LATCH) and b._stopped.is_set()
 
+class StopAfterCommit:
+    """The vault connection, except that a STOP lands right after the next COMMIT (the clear has committed, memory not)."""
+    def __init__(self,conn,brain): self.conn,self.brain,self.armed=conn,brain,True
+    def execute(self,sql,*args):
+        out=self.conn.execute(sql,*args)
+        if self.armed and sql=='COMMIT': self.armed=False; self.brain.stop()
+        return out
+    def __getattr__(self,name): return getattr(self.conn,name)
+
+def test_guard_a_stop_landing_right_after_the_clearing_commit_keeps_the_event_set(brain):
+    brain.stop(); w=StopAfterCommit(brain.store.conn,brain); brain.store.conn=w
+    try: brain.clear_stop(principal='carther')                                             # cleared, then stopped again
+    except Conflict: pass                                                                  # (or refused, as before)
+    brain.store.conn=w.conn
+    assert not w.armed and brain._stopped.is_set() and brain.store.one(LATCH) and brain.robot.stopped
+
 
 # P1-2: a handling limitation said without a modal or hazard word is an unresolved constraint, never accepted silently.
 LIMITS=['Sample A is too heavy to carry.','Sample A is too hot to touch.','Sample A is too big for the claw.',
@@ -111,6 +127,30 @@ def test_deleting_a_source_removes_the_text_its_plans_carried(tmp_path,arena,clo
     assert again['status']=='VERIFIED' and again['id']!=summary['id']                    # a purged memory never stands in
     b.close()
 
+def test_deleting_a_source_removes_its_text_from_episodes_that_never_got_a_plan(tmp_path,arena,clock):
+    for o in arena['objects']:
+        if o['id']=='sample_a':o['aliases']=['zqxsample']                                # a request word only an alias can carry
+    s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);b=Brain(s,FakeRobot(arena))
+    long={'recite the notice':{'kind':'primitive','primitive':'speak','args':{'text':'zqxmarker '+'x'*290}}}   # too long to speak
+    notice=s.teach('Notice','The notice is long.',owner='carther',goal_definitions=long)
+    with pytest.raises(CortexError): b.command('recite the notice',principal='carther')  # planning fails: no plan cites it
+    s.teach('Rule','Never move Sample A.',owner='carther')
+    t=b.schedule('the zqxtrigger arrives','bring zqxsample to the bench',principal='carther')
+    assert 'error' in b.trigger('the zqxtrigger arrives',event_id='ev1',principal='carther')[0]   # its proposal was refused
+    assert any('zqxmarker' in row for name,row in dump(s) if name=='episode') and any('zqxsample' in row for name,row in dump(s) if name=='episode')
+    s.revoke_source(notice['source_id'],delete=True)
+    s.revoke_source(s.one('SELECT source_id FROM prospective_task WHERE id=?',(t['task_id'],))['source_id'],delete=True)
+    for name,row in dump(s):
+        if name not in {'object_binding','cx_entity','cx_station'}: assert 'zqxmarker' not in row and 'zqxsample' not in row,(name,row)
+    b.close()
+
+def test_a_proposal_whose_plan_was_purged_can_no_longer_be_approved(brain):
+    src=brain.store.teach('Announcement','To announce the result, say the phrase.',owner='carther',goal_definitions=ANNOUNCE)
+    p=brain.propose(Goal.from_dict(ANNOUNCE['announce the result']),'Speak the phrase',principal='carther')   # no alias ref
+    brain.store.revoke_source(src['source_id'],delete=True)
+    assert brain.operation(p['operation_id'])['status']=='invalidated'
+    with pytest.raises(Conflict): approve(brain,p)
+
 
 # P2-5: the dream input is compared before the call budget; an answered or unaskable input lets the watermark advance.
 def dreaming(arena,clock,cap):
@@ -126,6 +166,8 @@ def test_an_answered_input_with_the_call_budget_spent_adds_no_run_per_tick(arena
     n=runs(b)
     for _ in range(5): b.dreamer.cycle()
     assert runs(b)==n+1 and stub.calls==1                                                  # was: one more run every tick
+    clock.advance(b.dreamer.model_window_s+1);b.dreamer.cycle()
+    assert runs(b)==n+1 and stub.calls==1                                                  # nor asked again once the budget frees
     b.close()
 
 def test_a_zero_call_cap_never_keeps_the_dreamer_running(arena,clock):
