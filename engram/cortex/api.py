@@ -427,8 +427,10 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
             try:
                 while not await req.is_disconnected():
                     f=await asyncio.to_thread(hub.latest,after=seq,wait_s=.5)
-                    if f and hub.receipt_age(f)<2:
-                        seq=f.seq
+                    if not f:continue
+                    # A stale frame is skipped but still passed: the next read waits for a newer one, never re-reads it at once.
+                    seq=f.seq
+                    if hub.receipt_age(f)<2:
                         yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
             finally:hub.unwatch()
         return StreamingResponse(frames(),media_type='multipart/x-mixed-replace; boundary=frame')

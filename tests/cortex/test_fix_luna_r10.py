@@ -134,3 +134,26 @@ def test_a_hidden_procedure_cannot_be_tested_approved_or_revoked_by_another(brai
         assert c.post(f"/skills/{skill['id']}/revoke",headers=h(TB)).status_code in (404,409)               # was: revoked
         assert brain.skills.get(skill['id'])['status']=='TESTED'
         assert c.post(f"/skills/{skill['id']}/approve",json={'digest':skill['digest']},headers=h(TA)).status_code==200   # hers
+
+
+# P2-6: a stream opened on a retained stale frame, with the camera down, waits for a newer frame instead of spinning.
+import asyncio,time
+from engram.cortex.media import FrameHub
+
+def test_a_stream_on_a_stale_frame_with_the_camera_down_does_not_spin(brain):
+    def down(): raise OSError('camera unavailable')
+    hub=FrameHub(down,fps=10);hub.publish(bytes([0xff,0xd8])+bytes(64)+bytes([0xff,0xd9]))
+    real=hub.monotonic;hub.monotonic=lambda:real()+60                                         # the retained frame is a minute old
+    reads=[];latest=hub.latest
+    hub.latest=lambda **kw:(reads.append(1),latest(**kw))[1]
+    video=next(r.endpoint for r in create_app(brain,tokens={TA:'alice'},frame_hub=hub,start_idle=False).routes if getattr(r,'path','')=='/video.mjpg')
+    class Req:
+        end=time.monotonic()+1.0
+        async def is_disconnected(self): return time.monotonic()>=self.end
+    async def watch():
+        hub.start()
+        try:
+            response=await video(req=Req(),principal='alice')
+            return [chunk async for chunk in response.body_iterator]
+        finally: hub.stop()
+    assert asyncio.run(watch())==[] and len(reads)<10,len(reads)                               # was: a read per loop, no wait
