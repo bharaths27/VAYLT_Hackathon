@@ -632,15 +632,26 @@ def reserve_stt(size: int) -> Reservation:
     return _STT.reserve(size)
 
 
-# whisper.cpp's non-speech markers: "[BLANK_AUDIO]", "(wind blowing)", "[MUSIC]".
-_MARKER = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+# whisper.cpp's non-speech markers, in one place: "[BLANK_AUDIO]", "[MUSIC]", "(music)", "[NOISE]", "(silence)",
+# "[inaudible]", "(soft music playing)", "(wind blowing)". A bracketed group is a marker only when ALL of it is one:
+# a sound from NON_SPEECH, after at most one NON_SPEECH_DESCRIBERS word, before an optional "playing" or "blowing".
+# Anything else in brackets is speech: "(don't open the claw)" is a refusal, not silence. The robot's voice console
+# (robot/engram_robot/voice/intents.py) and scripts/voice_bridge.py keep these two lists exactly as they are here
+# (tests/test_voice_bridge.py checks that they are equal).
+NON_SPEECH = ("blank_audio", "blank audio", "music", "noise", "silence", "inaudible", "applause", "laughter",
+              "laughing", "laughs", "cough", "coughing", "coughs", "sigh", "sighs", "breathing", "wind", "static",
+              "beep", "beeping", "beeps", "clicking", "typing", "footsteps", "no speech", "foreign language",
+              "speaking in foreign language", "sound", "sounds")
+NON_SPEECH_DESCRIBERS = ("soft", "upbeat", "gentle", "light", "loud", "quiet", "faint", "distant", "background")
+_SOUNDS_RX = "|".join(r"\s+".join(re.escape(part) for part in w.split()) for w in NON_SPEECH)
+_MARK_BODY = rf"\s*(?:(?:{'|'.join(NON_SPEECH_DESCRIBERS)})\s+)?(?:{_SOUNDS_RX})(?:\s+(?:playing|blowing))?\s*"
+_MARKER = re.compile(rf"\[{_MARK_BODY}\]|\({_MARK_BODY}\)", re.IGNORECASE)
 
 
 def no_speech(text: str) -> bool:
-    """A transcript with no words in it: empty, punctuation, or only whisper's bracketed markers. It tells a
-    misheard command from a real one; the transcript itself still goes to the parser unchanged. Bracketed
-    words such as "(don't)" count as no speech here as well, which errs toward asking (and toward stopping a
-    running task). A stop word is checked before this, so "[stop]" still stops."""
+    """A transcript with no words in it: empty, punctuation, or only whisper's non-speech markers (NON_SPEECH). It
+    tells a misheard command from a real one; the transcript itself still goes to the parser unchanged. Words in
+    brackets are speech, so "(don't open the claw)" stays a refusal. A stop word is checked before this."""
     return re.search(r"\w", _MARKER.sub(" ", text or "")) is None
 
 

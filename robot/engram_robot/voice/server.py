@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from robot.client import RobotClient
-from voice.intents import normalize, parse
+from voice.intents import no_speech, parse
 
 HERE = Path(__file__).resolve().parent
 NO_APPROVAL_NEEDED = {"stop", "observe", "detect_tag"}
@@ -138,7 +138,7 @@ def create_app(bot: RobotClient, transcribe, pin: str | None = None, brain: "Bra
         no words in it (the brain answers everything else, under the same rule). If the robot is busy it is
         stopped with the latching stop (a reset is needed to move again): "I stopped. <reason> Please
         clarify."; if not, nothing is stopped: "<reason> Please clarify."."""
-        if intent.get("op") is not None or (brain is not None and normalize(text)):
+        if intent.get("op") is not None or (brain is not None and not no_speech(text)):
             return intent
         stopped, lead = busy(), ""
         if stopped:

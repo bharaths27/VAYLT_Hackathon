@@ -11,6 +11,22 @@ UNITS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six":
 TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
         "ninety": 90}
 
+# whisper.cpp's non-speech markers: exactly the lists in console/server/voice.py (tests/test_voice_bridge.py checks
+# it). A bracketed group is a marker only when all of it is one; other words in brackets are speech.
+NON_SPEECH = ("blank_audio", "blank audio", "music", "noise", "silence", "inaudible", "applause", "laughter",
+              "laughing", "laughs", "cough", "coughing", "coughs", "sigh", "sighs", "breathing", "wind", "static",
+              "beep", "beeping", "beeps", "clicking", "typing", "footsteps", "no speech", "foreign language",
+              "speaking in foreign language", "sound", "sounds")
+NON_SPEECH_DESCRIBERS = ("soft", "upbeat", "gentle", "light", "loud", "quiet", "faint", "distant", "background")
+_SOUNDS_RX = "|".join(r"\s+".join(re.escape(part) for part in w.split()) for w in NON_SPEECH)
+_MARK_BODY = rf"\s*(?:(?:{'|'.join(NON_SPEECH_DESCRIBERS)})\s+)?(?:{_SOUNDS_RX})(?:\s+(?:playing|blowing))?\s*"
+_MARKER = re.compile(rf"\[{_MARK_BODY}\]|\({_MARK_BODY}\)", re.IGNORECASE)
+
+
+def no_speech(text: str) -> bool:
+    """No words in it: empty, punctuation, or only whisper's non-speech markers. "(don't open the claw)" is speech."""
+    return re.search(r"\w", _MARKER.sub(" ", text or "")) is None
+
 
 def words_to_digits(text: str) -> str:
     """'forty five' -> '45', 'one hundred eighty' -> '180', 'seven' -> '7'."""

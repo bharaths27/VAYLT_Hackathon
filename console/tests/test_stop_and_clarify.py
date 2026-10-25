@@ -280,3 +280,25 @@ def test_brain_path_misheard_voice_stops_the_brains_plan(c, on_brain):
 def test_the_spoken_reason_is_short_and_the_screen_keeps_the_whole_one(c, text, reply):
     j = c.post("/commands", json={"text": text}).json()
     assert j["kind"] == "clarify" and j["reply"] == reply and len(j["reason"]) > len(reply) - len(" Please clarify.")
+
+
+# ---- only whisper's own markers are noise: words in brackets are speech -----------------------------------
+
+
+def test_a_parenthesized_refusal_while_a_task_runs_stays_a_refusal(c, held):
+    op = start_op(c, held)
+    j = c.post("/commands", json={"text": "(don't open the claw)", "source": "voice"}).json()
+    assert j["kind"] == "abstain" and "don't" in j["reason"] and "stopped" not in j
+    assert not main.engine.stopped
+    held.finish.set()
+    assert wait(c, op["id"])["status"] != "STOPPED"
+
+
+@pytest.mark.parametrize("text,noise", [
+    ("[BLANK_AUDIO]", True), ("[MUSIC]", True), ("(music)", True), ("[NOISE]", True), ("(silence)", True),
+    ("[inaudible]", True), ("(soft music playing)", True), ("(wind blowing) [BLANK_AUDIO]", True), (" ... ", True),
+    ("(don't open the claw)", False), ("(no, I mean close it)", False), ("[open the claw]", False),
+    ("Open the claw. [MUSIC]", False), ("(music) open the claw", False),
+], ids=lambda v: str(v))
+def test_no_speech_drops_only_recognized_markers(text, noise):
+    assert main.voice.no_speech(text) is noise

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import ssl
 import sys
 import urllib.request
@@ -37,11 +38,22 @@ def transcribe(audio: Path, voice_url: str = VOICE) -> str:
         return json.loads(r.read())["text"]
 
 
-def clean(text: str) -> str:
-    """Drop whisper noise tags like [BLANK_AUDIO] and extra spaces."""
-    import re
+# whisper.cpp's non-speech markers: exactly the lists in console/server/voice.py (tests/test_voice_bridge.py checks
+# it). Only a bracketed group that is wholly one of them is dropped; other words in brackets are speech.
+NON_SPEECH = ("blank_audio", "blank audio", "music", "noise", "silence", "inaudible", "applause", "laughter",
+              "laughing", "laughs", "cough", "coughing", "coughs", "sigh", "sighs", "breathing", "wind", "static",
+              "beep", "beeping", "beeps", "clicking", "typing", "footsteps", "no speech", "foreign language",
+              "speaking in foreign language", "sound", "sounds")
+NON_SPEECH_DESCRIBERS = ("soft", "upbeat", "gentle", "light", "loud", "quiet", "faint", "distant", "background")
+_SOUNDS_RX = "|".join(r"\s+".join(re.escape(part) for part in w.split()) for w in NON_SPEECH)
+_MARK_BODY = rf"\s*(?:(?:{'|'.join(NON_SPEECH_DESCRIBERS)})\s+)?(?:{_SOUNDS_RX})(?:\s+(?:playing|blowing))?\s*"
+_MARKER = re.compile(rf"\[{_MARK_BODY}\]|\({_MARK_BODY}\)", re.IGNORECASE)
 
-    return re.sub(r"\s+", " ", re.sub(r"\[.*?\]|\(.*?\)", " ", text)).strip()
+
+def clean(text: str) -> str:
+    """Drop whisper's non-speech markers like [BLANK_AUDIO] and extra spaces. "(don't open the claw)" is kept:
+    dropping it would send nothing, a misheard command, instead of the refusal that was said."""
+    return re.sub(r"\s+", " ", _MARKER.sub(" ", text)).strip()
 
 
 def send(text: str, brain_url: str = BRAIN, dry: bool = False) -> dict:

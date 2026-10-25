@@ -236,3 +236,13 @@ def test_a_robot_that_cannot_say_whether_it_is_busy_is_stopped(stack, monkeypatc
     r = transcribe(c)
     assert r["stopped"] is True and svc.safety.estop_latched    # a needless stop costs one reset
     svc.reset("test")
+
+
+def test_brain_mode_a_parenthesized_request_is_speech_not_noise(stack, monkeypatch):
+    _, d, whisper, svc = stack
+    brain = FakeBrain()
+    c = TestClient(voice_app(TestClient.bot, whisper, pin="1234", brain=brain))
+    robot_busy(monkeypatch)
+    whisper.text = "(don't open the claw)"               # words in brackets: for the brain, which refuses "don't"
+    r = transcribe(c)
+    assert "stopped" not in r and not svc.safety.estop_latched and ("stop",) not in brain.calls
