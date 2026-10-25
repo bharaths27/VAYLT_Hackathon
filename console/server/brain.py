@@ -207,8 +207,11 @@ async def run(engine, op: RemoteOperation) -> None:
         else:
             s["status"] = "skipped"
     outcome = str(res.get("outcome", "unknown")).lower()
-    op.status = {"success": "VERIFIED", "failed": "FAILED", "failure": "FAILED", "stopped": "STOPPED",
-                 "refused": "FAILED"}.get(outcome, "NEEDS_VERIFICATION")
+    if outcome == "aborted" and res.get("stopped") is True:  # stopped (a stop, or Carter's rule): it did not finish
+        op.status = "STOPPED"
+    else:
+        op.status = {"success": "VERIFIED", "failed": "FAILED", "failure": "FAILED", "stopped": "STOPPED",
+                     "refused": "FAILED"}.get(outcome, "NEEDS_VERIFICATION")
     if res.get("failure"):
         op.trace.append(f"brain failure: {res.get('failure')}")
     op.metrics["exec_ms"] = int((time.time() - t0) * 1000)

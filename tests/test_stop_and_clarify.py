@@ -155,3 +155,25 @@ def test_a_rule_that_cannot_wait_for_an_event_while_a_plan_runs_is_refused_and_s
     assert r["status"] == "refused" and r["needs_clarification"] is False and "stopped" not in r
     assert r["reason"].startswith("I can only schedule a robot action")
     assert out["run"]["outcome"] == "success" and lab.robot.state()["stopped"] is False
+
+
+# ---- a run the brain stopped says so, so the console shows STOPPED, not "needs verification" ---------------
+
+
+def test_a_run_stopped_by_a_stop_says_stopped(lab):
+    oid, t, out = start_plan(lab)
+    lab.command(UNCLEAR, "test")                                # Carter's rule stops it
+    lab.robot.release.set()
+    t.join(10)
+    assert (out["run"]["outcome"], out["run"]["stopped"]) == ("aborted", True)
+
+
+def test_a_run_that_finished_or_needs_a_person_is_not_stopped(engine):
+    p = engine.command(REQUEST, "test")
+    done = engine.approve_and_run(p["operation_id"], p["digest"], "tester")
+    assert (done["outcome"], done["stopped"]) == ("success", False)
+    engine.robot.reset()
+    engine.robot.inject_fault("locate_tag", "unknown", "camera lost the tag")
+    p = engine.command(REQUEST, "test")
+    unknown = engine.approve_and_run(p["operation_id"], p["digest"], "tester")
+    assert (unknown["outcome"], unknown["stopped"]) == ("aborted", False)   # a person must check: not a stop

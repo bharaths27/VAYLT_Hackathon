@@ -286,7 +286,7 @@ class Engine:
         result = self.executor.run(operation_id, plan)
         self._finish(operation_id, result.outcome, result.failure)
         return {"operation_id": operation_id, "outcome": result.outcome, "failure": result.failure,
-                "steps": result.steps}
+                "steps": result.steps, "stopped": result.stopped}
 
     def _finish(self, episode_id: str, outcome: str, failure: str | None) -> None:
         self.conn.execute("UPDATE episode SET outcome = ?, failure = ?, finished_at = ? WHERE id = ?",

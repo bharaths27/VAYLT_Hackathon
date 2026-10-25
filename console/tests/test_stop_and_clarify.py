@@ -346,3 +346,39 @@ def test_the_parser_marks_what_it_understood():
     assert parse("In 5 minutes, look around.", {}).understood is True
     assert parse("In 5 seconds, juggle.", {}).understood is False
     assert parse("bring it here", {}).understood is False
+
+
+class RunningBrain(FakeBrain):
+    """A brain whose plan runs until it is stopped; then it reports the run aborted by the stop."""
+
+    PLAN = {"kind": "proposal", "status": "proposed", "operation_id": "ep_run", "digest": "d" * 64, "source": "rules",
+            "plan": {"goal": "Bring Sample B to the bench", "steps": [{"op": "locate_tag", "args": {}},
+                                                                      {"op": "pick_tagged_object", "args": {}}]},
+            "check": {"ok": True, "physical": True}, "needs_clarification": False}
+
+    def __init__(self):
+        super().__init__(self.PLAN)
+        self.stop_seen, self.approved = threading.Event(), threading.Event()
+
+    async def __call__(self, request):
+        if request.url.path == "/stop":
+            self.stop_seen.set()
+        if request.url.path.endswith("/approve"):
+            self.approved.set()
+            while not self.stop_seen.is_set():
+                await asyncio.sleep(0.01)
+            return httpx.Response(200, json={"operation_id": "ep_run", "outcome": "aborted", "stopped": True,
+                                             "failure": "stop was pressed", "steps": [{"op": "locate_tag", "status": "done"}]})
+        return super().__call__(request)
+
+
+def test_a_brain_plan_stopped_by_the_rule_shows_stopped(c, on_brain):
+    fake = on_brain(RunningBrain())
+    op = c.post("/commands", json={"text": "bring sample b to the bench"}).json()["operation"]
+    assert c.post(f"/operations/{op['id']}/approve", json={"digest": op["digest"]}).status_code == 200
+    assert fake.approved.wait(5)                                # the brain is running the plan
+    fake.reply = {**UNKNOWN, "stopped": True}                   # an unclear command: the brain stops its own plan
+    j = c.post("/commands", json={"text": "bring the thing"}).json()
+    assert j["kind"] == "clarify" and j["stopped"] is True
+    done = wait(c, op["id"])
+    assert done["status"] == "STOPPED" and [s["status"] for s in done["steps"]] == ["succeeded", "skipped"]

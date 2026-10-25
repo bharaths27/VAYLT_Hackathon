@@ -23,6 +23,8 @@ class ExecResult:
     outcome: str                    # success | failed | aborted
     failure: str | None = None
     steps: list[dict[str, Any]] = field(default_factory=list)
+    stopped: bool = False           # aborted because the robot was stopped (a stop, or a command that needed
+                                    # clarifying): not an unknown outcome a person must check
 
 
 class Executor:
@@ -46,7 +48,7 @@ class Executor:
             op_id = new_id("op")
             if self.robot.state().get("stopped") and op != "stop":
                 self.journal(op_id, episode_id, op, args, "rejected", "robot is stopped")
-                result.outcome, result.failure = "aborted", "stop was pressed"
+                result.outcome, result.failure, result.stopped = "aborted", "stop was pressed", True
                 break
             self.journal(op_id, episode_id, op, args, "pending")
             out = self.robot.execute(op, args)
