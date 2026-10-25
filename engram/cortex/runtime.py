@@ -16,6 +16,7 @@ from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
 from .planning import CAPS,PHYSICAL,RECALL,Compiler,parse_goal,safety_reason,validate_step,verify
 from .store import Store
+from .seeding import synthetic_seed_present
 from . import vault_lock
 from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,digest,normalize,text,uid
 
@@ -37,6 +38,8 @@ class Brain:
         store.runtime_mode=self.mode
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
+        if self.mode=='PHYSICAL' and synthetic_seed_present(store):
+            raise Denied('this vault contains synthetic seed data (scripts/cortex_seed.py); a physical runtime must start on a separate, unseeded vault (set CORTEX_DB to a new file)')
         if acquire_lock and store.path!=':memory:' and store.file_lock is None:
             self._file_lock=vault_lock.acquire(store.path)
         self.recover()
@@ -125,8 +128,8 @@ class Brain:
                     (basis,canonical(self.compiler.fixture()),t+self.store.policy.approval_ttl_s,ep))
         with self.activity.foreground():
             try:
-                instruction=self.store.teach('Task instruction',request,owner=principal,kind='request',rules=[],cloud_ok=cloud_allowed)
-                refs=['source:'+instruction['source_id']]+(extra_refs or [])
+                # A command is an episode, not a source: it is never recalled as knowledge.
+                refs=self.skills.provenance(goal,ep,extra_refs)
                 bundle=self.store.bundle(request,goal)
                 fixture=self.compiler.fixture()
                 # Optional relevance advice ranks only explicitly cloud-permitted evidence.
@@ -144,14 +147,14 @@ class Brain:
                     plan=copy.deepcopy(skill['definition']); source='skill'
                 else:
                     plan=None
-                    if self.qwen:
+                    if self.qwen and self.qwen.planning_order=='model_first':
                         try:
                             calls+=1; out=self.qwen.complete('plan',bundle,goal=goal.to_dict())
                             v=verify(goal,out.value['steps'],fixture,self.store.related_rules(goal),self.store.policy)
                             self.store.decision('plan','llama.cpp',out.model,v.ok,'verified' if v.ok else 'goal verification rejected model plan')
                             if v.ok:
                                 base=self.compiler.compile(goal,fixture)
-                                plan={**base,'steps':out.value['steps'],'verification':v.to_dict()}; source='model'
+                                plan={**base,'steps':out.value['steps'],'refs':sorted(set(base['refs']+out.refs)),'verification':v.to_dict()}; source='model'
                                 self.store.manifest('last_qwen_request','parametric',{'contract_sha256':out.contract_hash,'prompt_sha256':out.prompt_hash,
                                     'input_tokens':out.input_tokens,'model':out.model,'elapsed_ms':out.elapsed_ms,'response_accepted':True})
                             else: note='Model plan failed independent goal verification; composed from accepted rules.'

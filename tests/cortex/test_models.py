@@ -10,7 +10,7 @@ class LocalModelTransport:
     def __init__(self,steps=None,tokens=100):self.calls=[];self.tokens=tokens;self.steps=steps or [{'op':'observe','args':{}}]
     def __call__(self,url,body,headers,timeout):
         self.calls.append((url,body,dict(headers)))
-        if url.endswith('/apply-template'):return {'prompt':'<system>'+body['messages'][0]['content']+'<user>'+body['messages'][1]['content']}
+        if url.endswith('/apply-template'):return {'prompt':'<system>'+body['messages'][0]['content']+'<user>'+body['messages'][1]['content']+THINK_OFF}
         if url.endswith('/tokenize'):return {'tokens':list(range(self.tokens))}
         return {'model':'test-Qwen-compatible-stub','content':json.dumps({'steps':self.steps})}
 
@@ -44,7 +44,7 @@ def test_qwen_malformed_output_rejected(bad):
 
 def test_model_goal_error_falls_back_to_verified_composer(arena,clock):
     transport=LocalModelTransport([{'op':'drive_bounded','args':{'distance_m':.5}}])
-    s=Store(clock=clock);s.register_arena(arena);b=Brain(s,FakeRobot(arena),qwen=QwenClient(transport=transport))
+    s=Store(clock=clock);s.register_arena(arena);b=Brain(s,FakeRobot(arena),qwen=QwenClient(transport=transport,planning_order='model_first'))
     p=b.command('Bring Sample A to bench',principal='carther')
     assert p['source']=='fallback' and p['status']=='proposed'
     assert p['plan']['steps'][0]['op']=='locate_tag'
@@ -52,7 +52,7 @@ def test_model_goal_error_falls_back_to_verified_composer(arena,clock):
 
 def test_model_validated_plan_used_and_manifest_recorded(arena,clock):
     steps=[{'op':'locate_tag','args':{'object_id':'sample_a'}},{'op':'pick_tagged_object','args':{'object_id':'sample_a'}},{'op':'place_at_zone','args':{'zone':'bench'}}]
-    s=Store(clock=clock);s.register_arena(arena);b=Brain(s,FakeRobot(arena),qwen=QwenClient(transport=LocalModelTransport(steps)))
+    s=Store(clock=clock);s.register_arena(arena);b=Brain(s,FakeRobot(arena),qwen=QwenClient(transport=LocalModelTransport(steps),planning_order='model_first'))
     p=b.command('Bring Sample A to bench',principal='carther')
     assert p['source']=='model' and p['plan']['steps']==steps
     assert s.one("SELECT * FROM cx_manifest WHERE id='last_qwen_request'")
