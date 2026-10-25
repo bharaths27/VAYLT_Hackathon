@@ -252,3 +252,28 @@ def test_guard_valid_windows_and_caps_are_kept(store):
     d=Dreamer(store,Skills(store),Activity(),model_window_s=0.5,model_calls_per_window=0)
     assert (d.model_window_s,d.model_calls_per_window,d._model_cap())==(0.5,0,0)
     d.model_calls_per_window=None;assert d._model_cap()==store.policy.max_model_calls_per_dream
+
+
+# Class-A sweep: a skill test records its result only on the procedure it validated, never reviving one revoked
+# meanwhile; and revoking a procedure withdraws the proposals built on it at once, as revoking a source does.
+from engram.cortex.planning import Compiler
+
+def test_a_skill_test_never_revives_a_procedure_revoked_while_it_was_validated(store,rule,monkeypatch):
+    skills=Skills(store);s=skills.create(Compiler(store).compile(Goal('fetch',('sample_b',),'bench')))
+    import engram.cortex.learning as learning
+    real=learning.verify;calls=[]
+    def revoking(*a,**k):
+        calls.append(1)
+        if len(calls)==1: skills.revoke(s['id'])                                              # lands mid-validation
+        return real(*a,**k)
+    monkeypatch.setattr(learning,'verify',revoking)
+    with pytest.raises(Conflict,match='changed while it was validated'): skills.test(s['id'])   # was: TESTED again
+    assert skills.get(s['id'])['status']=='REVOKED'
+    with pytest.raises(Denied): skills.approve(s['id'],s['digest'],principal='carther')
+
+def test_revoking_a_procedure_withdraws_the_proposals_built_on_it_at_once(published):
+    first=published.command('Go to the shelf b',principal='carther');published.reject(first['operation_id'],principal='carther')
+    p=published.command('Go to the shelf b',principal='carther');assert p['source']=='skill'
+    published.skills.revoke(p['skill_id'])
+    assert published.operation(p['operation_id'])['status']=='invalidated'                   # was: still proposed
+    with pytest.raises(Conflict): approve(published,p)

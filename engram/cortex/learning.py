@@ -90,8 +90,12 @@ class Skills:
                 'assumptions':'Registered primitives succeed in the symbolic environment; this is not physical competence evidence.',
                 'definition_digest':s['digest'],'basis':self.store.basis(g)}
         with self.store.tx():
+            # Recorded only on the procedure as it was validated: a revocation (or publication) meanwhile wins and is never
+            # undone here, so a revoked procedure cannot come back as TESTED and be approved.
+            if not self.store.conn.execute("UPDATE skill_version SET status=? WHERE id=? AND digest=? AND status IN ('CANDIDATE','TESTED')",
+                                           ('TESTED' if passed else 'CANDIDATE',sid,s['digest'])).rowcount:
+                raise Conflict('the skill changed while it was validated (revoked or published meanwhile)')
             self.store.conn.execute('UPDATE cx_skill SET validation_json=? WHERE id=?',(canonical(record),sid))
-            self.store.conn.execute('UPDATE skill_version SET status=? WHERE id=?',('TESTED' if passed else 'CANDIDATE',sid))
         return record
 
     def approve(self,sid: str, supplied_digest: str, *, principal: str, automatic: bool=False) -> dict:
@@ -110,8 +114,11 @@ class Skills:
 
     def revoke(self,sid: str):
         self.get(sid)
-        # Never between a running step's final check and its dispatch (Store.authority_tx).
-        with self.store.authority_tx(): self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
+        # Never between a running step's final check and its dispatch (Store.authority_tx); the proposals built on it are
+        # withdrawn in the same transaction (Store.invalidate), as a revoked source's are.
+        with self.store.authority_tx():
+            self.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?",(sid,))
+            self.store.invalidate()
 
     def identity_refs(self, goal: Goal, refs: list[str]) -> list[str]:
         """The refs that identify a procedure: the sources and rules it rests on, which revocation follows. What only

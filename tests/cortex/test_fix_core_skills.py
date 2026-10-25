@@ -18,7 +18,8 @@ def skill_brain(arena, clock):
 
 def test_fix_core_approval_refused_after_skill_revoked(skill_brain):
     b, p = skill_brain
-    b.skills.revoke(p['skill_id'])                                    # as POST /skills/{id}/revoke does
+    # Revoked by a write that does not withdraw its proposals (Skills.revoke does since round 11): approval still checks.
+    with b.store.tx(): b.store.conn.execute("UPDATE skill_version SET status='REVOKED' WHERE id=?", (p['skill_id'],))
     with pytest.raises(Stale, match='revoked'):
         b.approve(p['operation_id'], p['digest'], principal='carther')
     assert not b.robot.calls and b.operation(p['operation_id'])['status'] == 'proposed'
