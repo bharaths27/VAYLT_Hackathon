@@ -13,6 +13,12 @@
 - A deferred preset ("open the claw after calibration finishes") becomes a "When <event>,
   <task>" commitment through Engine.command, the existing prospective path. When the trigger
   fires, the engine proposes it and a person still approves it.
+- A final the gate could not act on because it was ambiguous or misheard (a "clarify" result:
+  nothing caught, a correction, audio that overflowed, no answer from the intent model) follows
+  Carter's rule: if a plan is running (an episode whose outcome is 'running'), Engine.stop()
+  stops it with the latching stop a stop word uses, and the reply is "I stopped. <reason> Please
+  clarify."; with nothing running nothing is stopped and the reply is "<reason> Please
+  clarify.". "You said not to" and "not one of the voice presets" are understood: unchanged.
 
 Call on_partial and on_final from the thread that owns the engine's database connection. The
 gate's worker thread only talks to the intent model; every database read (the memory-context
@@ -23,7 +29,7 @@ from __future__ import annotations
 
 from typing import Any, Hashable
 
-from ..engine import Engine
+from ..engine import Engine, clarify_reply
 from ..memory import MemoryBundle
 from ..planner import refusal
 from ..skills import APPROVED
@@ -128,7 +134,17 @@ class VoiceIntegration:
             if out.get("kind") != "scheduled":
                 return {"kind": "none", **base, "reason": "That could not be saved as a future task."}
             return {**out, **base, "preset": r.preset}
+        if r.action == "clarify":
+            return self._clarify(base, r.reason)
         return {"kind": r.action, **base, "reason": r.reason}
+
+    def _clarify(self, base: dict[str, Any], reason: str) -> dict[str, Any]:
+        """Carter's rule: stop the plan that is running, if one is, then ask the person to clarify."""
+        stopped = bool(self.engine.running())
+        out = {"kind": "clarify", **base, "reason": reason, "reply": clarify_reply(reason, stopped), "stopped": stopped}
+        if stopped:
+            out["state"] = self.engine.stop()
+        return out
 
     def finish_live(self, utterance: int, revision: int, transcriber: LiveTranscriber) -> dict[str, Any]:
         """End of speech for audio fed through a LiveTranscriber: transcribe, then on_final.
@@ -138,6 +154,6 @@ class VoiceIntegration:
         try:
             text = transcriber.finish()
         except AudioOverflow:
-            r = self.gate.reject(utterance, "That was too long for me to take in at once. Please say it again.")
-            return {"kind": "clarify", "heard": "", "utterance": utterance, "revision": revision, "reason": r.reason}
+            r = self.gate.reject(utterance, "That was too long for me to take in at once.")
+            return self._clarify({"heard": "", "utterance": utterance, "revision": revision}, r.reason)
         return self.on_final(utterance, revision, text)

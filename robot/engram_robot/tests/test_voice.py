@@ -162,3 +162,77 @@ def test_brain_mode_routes_motion_through_the_brain(stack):
     c.post("/api/stop")
     assert svc.safety.estop_latched and brain.calls[-1] == ("stop",)
     svc.reset("test")
+
+
+# ---- Carter's rule: "ambiguous or misheard command: we stop the task and ask user to please clarify." ----
+
+def robot_busy(monkeypatch, busy=True):
+    """The robot server reports an operation in progress (or none)."""
+    real = TestClient.bot.state
+    monkeypatch.setattr(TestClient.bot, "state",
+                        lambda: {**real(), "busy": {"operation_id": "op_1", "op": "drive_bounded"} if busy else None})
+
+
+def transcribe(c):
+    return c.post("/api/transcribe", files={"audio": ("speech.m4a", b"fake-audio", "audio/mp4")}).json()["intent"]
+
+
+@pytest.mark.parametrize("heard, reason", [
+    ("make me a sandwich", 'Sorry, I don\'t know how to do: "make me a sandwich".'),
+    ("[BLANK_AUDIO]", "I didn't catch anything."),
+], ids=["unclear", "misheard"])
+def test_an_unclear_or_misheard_request_while_the_robot_is_busy_stops_it_and_asks(stack, monkeypatch, heard, reason):
+    c, d, whisper, svc = stack
+    whisper.text = heard
+    robot_busy(monkeypatch)
+    r = transcribe(c)
+    assert r["op"] is None and r["stopped"] is True and r["say"] == f"I stopped. {reason} Please clarify."
+    assert svc.safety.estop_latched                     # latched: a reset is needed to move again
+    svc.reset("test")
+
+
+def test_an_unclear_request_while_idle_asks_without_stopping(stack, monkeypatch):
+    c, d, whisper, svc = stack
+    whisper.text = "make me a sandwich"
+    robot_busy(monkeypatch, busy=False)
+    r = transcribe(c)
+    assert r["stopped"] is False and r["say"] == 'Sorry, I don\'t know how to do: "make me a sandwich". Please clarify.'
+    assert not svc.safety.estop_latched                 # no latch for a cough
+
+
+@pytest.mark.parametrize("heard", ["pick up object seven", "Stop!"])
+def test_a_clear_request_or_a_stop_while_busy_is_unchanged(stack, monkeypatch, heard):
+    c, d, whisper, svc = stack
+    whisper.text = heard
+    robot_busy(monkeypatch)
+    r = transcribe(c)
+    assert r["op"] in ("pick_tagged", "stop") and "stopped" not in r and "clarify" not in r
+    assert not svc.safety.estop_latched                 # (the iPad sends the stop itself, straight away)
+
+
+def test_brain_mode_answers_only_a_misheard_request_here(stack, monkeypatch):
+    _, d, whisper, svc = stack
+    brain = FakeBrain()
+    c = TestClient(voice_app(TestClient.bot, whisper, pin="1234", brain=brain))
+    robot_busy(monkeypatch)
+    whisper.text = "bring sample b to the bench"         # not parsed here, but the brain may understand it
+    r = transcribe(c)
+    assert r["op"] is None and "stopped" not in r and not svc.safety.estop_latched
+    whisper.text = "[BLANK_AUDIO]"                       # nothing to send to the brain: misheard, answered here
+    r = transcribe(c)
+    assert r["stopped"] is True and r["say"] == "I stopped. I didn't catch anything. Please clarify."
+    assert svc.safety.estop_latched and brain.calls[-1] == ("stop",)
+    svc.reset("test")
+
+
+def test_a_robot_that_cannot_say_whether_it_is_busy_is_stopped(stack, monkeypatch):
+    c, d, whisper, svc = stack
+    whisper.text = "make me a sandwich"
+
+    def no_state():
+        raise OSError("robot server not answering")
+
+    monkeypatch.setattr(TestClient.bot, "state", no_state)
+    r = transcribe(c)
+    assert r["stopped"] is True and svc.safety.estop_latched    # a needless stop costs one reset
+    svc.reset("test")

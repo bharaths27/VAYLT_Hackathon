@@ -24,7 +24,7 @@ from .hashes import hash_models
 from .heard import record_heard
 from .ids import digest, new_id
 from .memory import Memory, MemoryBundle
-from .planner import PlanResult, RulePlanner, find_zone, refusal, targets_in
+from .planner import PlanResult, RulePlanner, classify_refusal, find_zone, targets_in
 from .prospective import Prospective, normalize, parse_when
 from .recall import Recall, asks_question, is_memory_question
 from .robot.base import RobotAdapter
@@ -42,6 +42,16 @@ APPROVAL_TTL_S = 120.0
 # stop. The same pattern as STOP_WORDS in console/server/parser.py (tests/test_spoken_stop.py checks it).
 STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b",
                         re.IGNORECASE)
+
+
+def clarify_reply(reason: str, stopped: bool) -> str:
+    """Carter's rule, in words: "I stopped. <reason> Please clarify." when a running task was stopped,
+    "<reason> Please clarify." when nothing was running. The console and the robot's voice console say
+    it the same way."""
+    reason = reason.strip()
+    if reason and reason[-1] not in ".?!":
+        reason += "."
+    return ("I stopped. " if stopped else "") + (reason + " " if reason else "") + "Please clarify."
 
 
 class EngineError(Exception):
@@ -103,16 +113,43 @@ class Engine:
 
     def command(self, text: str, who: str = "user", bundle: MemoryBundle | None = None) -> dict[str, Any]:
         """One entry point for typed or spoken commands. What was said is kept as heard memory.
+
+        Carter's rule: "ambiguous or misheard command: we stop the task and ask user to please clarify."
+        A command that needs clarifying (needs_clarification) stops a plan that is running, with the
+        same latching stop as a stop word (clear_stop is needed to move again), and the reply says so:
+        "I stopped. <reason> Please clarify." With nothing running nothing is stopped, and the reply is
+        "<reason> Please clarify.". A stopped plan is never resumed on its own. Understood refusals (an
+        action the robot may not do, "don't") and stop words are unchanged.
         bundle: as for propose(), if the command proposes."""
         result = self._command(text, who, bundle)
+        if result.get("needs_clarification"):
+            result.update(self._clarify(result["reason"]))
         result["heard_id"] = record_heard(self.conn, text.strip(), who, result)
         return result
+
+    def _clarify(self, reason: str) -> dict[str, Any]:
+        """Stop the plan that is running, if there is one, and say why and that the person should clarify."""
+        stopped = bool(self.running())
+        out: dict[str, Any] = {"stopped": stopped, "reply": clarify_reply(reason, stopped)}
+        if stopped:
+            out["robot"] = self.stop()
+        return out
+
+    def _refuse(self, request: str, reason: str, unclear: bool) -> dict[str, Any]:
+        """A command refused before planning, recorded as a refused episode like propose()'s refusals."""
+        episode_id = new_id("ep")
+        self._episode(episode_id, request, None, {}, "refused", reason, PlanResult(None))
+        self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", reason)
+        return {"kind": "proposal", "operation_id": episode_id, "status": "refused", "reason": reason,
+                "needs_clarification": unclear}
 
     def _command(self, text: str, who: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
         # A stop wins before anything else (it is still recorded as heard by command()).
         if STOP_WORDS.search(text):
             return {"kind": "stopped", **self.stop()}
         stripped = text.strip()
+        if not stripped:  # nothing was heard: a misheard command, never a plan
+            return self._refuse(stripped, "I didn't catch anything.", unclear=True)
         body = rule_body(stripped)  # "Remember that ...", "Note that ...", "From now on, ..."
         if body is not None:
             return {"kind": "taught", **self.teach(f"Spoken note from {who}", body, kind="spoken", origin=who)}
@@ -121,13 +158,10 @@ class Engine:
             # Any question counts, not only memory-shaped ones: a question is never a request to move.
             return {"kind": "answer", **Recall(self.memory).recall(stripped)}
         rule = deferred_rule(stripped)  # "When X, remember that ...": a rule cannot wait for an event
-        if rule is not None:
+        if rule is not None:  # it must be said another way: as a rule now, or as a robot action to schedule
             reason = (f"I can only schedule a robot action, and not '{rule}': it is a rule. Say the rule now, or "
                       "schedule a robot action, like 'When calibration ends, bring Sample B to the bench'.")
-            episode_id = new_id("ep")
-            self._episode(episode_id, stripped, None, {}, "refused", reason, PlanResult(None))
-            self.executor.journal(new_id("op"), episode_id, "propose", {"request": stripped}, "rejected", reason)
-            return {"kind": "proposal", "operation_id": episode_id, "status": "refused", "reason": reason}
+            return self._refuse(stripped, reason, unclear=True)
         when = parse_when(stripped)
         if when:
             trigger, request = when
@@ -139,13 +173,18 @@ class Engine:
     def propose(self, request: str, bundle: MemoryBundle | None = None) -> dict[str, Any]:
         """bundle: the memory bundle for this request, if the caller has already retrieved it and memory has not
         changed since (voice presets prefetch it while the user is still speaking). Without one, or with one
-        retrieved for another request, it is retrieved here."""
+        retrieved for another request, it is retrieved here.
+
+        needs_clarification, on every result: True when the request was refused because what was meant is
+        not clear (an unknown object, a time that did not parse), so the person must say it another way;
+        False when it was understood (planned, or refused as something the robot may not do)."""
         episode_id = new_id("ep")
-        why = refusal(request)
-        if why:
+        cls = classify_refusal(request)
+        if cls:
+            why, unclear = cls
             self._episode(episode_id, request, None, {}, "refused", why, PlanResult(None))
             self.executor.journal(new_id("op"), episode_id, "propose", {"request": request}, "rejected", why)
-            return {"operation_id": episode_id, "status": "refused", "reason": why}
+            return {"operation_id": episode_id, "status": "refused", "reason": why, "needs_clarification": unclear}
 
         if bundle is None or bundle.goal != request:
             bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
@@ -169,7 +208,7 @@ class Engine:
         if res.plan is None:
             self._episode(episode_id, request, None, {"bundle": bundle.to_dict()}, "refused", res.refused, res)
             return {"operation_id": episode_id, "status": "refused", "reason": res.refused,
-                    "memory": bundle.to_dict(), "planner_calls": res.planner_calls}
+                    "needs_clarification": res.unclear, "memory": bundle.to_dict(), "planner_calls": res.planner_calls}
 
         check = check_plan(res.plan, self.memory, self.zones)
         plan_digest = digest(res.plan)
@@ -182,6 +221,7 @@ class Engine:
             "operation_id": episode_id, "status": status, "plan": res.plan, "digest": plan_digest,
             "check": check.to_dict(), "memory": bundle.to_dict(), "source": res.source,
             "planner_note": res.note, "planner_calls": res.planner_calls, "planning_ms": round(res.planning_ms, 3),
+            "needs_clarification": False,   # planned, or rejected by the checker: understood either way
         }
 
     def propose_fixed(self, goal: str, steps: list[dict[str, Any]], source: str) -> dict[str, Any]:
@@ -273,6 +313,12 @@ class Engine:
 
     def test_skill(self, skill_id: str) -> dict[str, Any]:
         return self.skills.test(skill_id, lambda p: check_plan(p, self.memory, self.zones)).to_dict()
+
+    def running(self) -> list[dict[str, Any]]:
+        """Approved plans executing now (episode outcome 'running'), oldest first."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT id AS operation_id, request, started_at FROM episode WHERE outcome = 'running' "
+            "ORDER BY started_at")]
 
     def pending(self, max_age_s: float = 300.0) -> list[dict[str, Any]]:
         """Plans waiting for a person's approval, newest first.

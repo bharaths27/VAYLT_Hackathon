@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -629,6 +630,18 @@ def reserve_stt(size: int) -> Reservation:
     """Room in the STT queue for a clip of up to `size` bytes, taken before it is read (so a
     full queue answers busy without the upload ever being held in memory). VoiceBusy if full."""
     return _STT.reserve(size)
+
+
+# whisper.cpp's non-speech markers: "[BLANK_AUDIO]", "(wind blowing)", "[MUSIC]".
+_MARKER = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+
+
+def no_speech(text: str) -> bool:
+    """A transcript with no words in it: empty, punctuation, or only whisper's bracketed markers. It tells a
+    misheard command from a real one; the transcript itself still goes to the parser unchanged. Bracketed
+    words such as "(don't)" count as no speech here as well, which errs toward asking (and toward stopping a
+    running task). A stop word is checked before this, so "[stop]" still stops."""
+    return re.search(r"\w", _MARKER.sub(" ", text or "")) is None
 
 
 async def transcribe(audio: bytes, suffix: str, details: dict | None = None,

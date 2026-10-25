@@ -205,13 +205,14 @@ def test_negation_from_the_model_blocks_even_without_negation_words(spawn, clock
 def test_correction_words_block_even_when_the_model_is_confident(spawn, clock, text):
     fake = FakeIntent({text: decision("close_gripper", confidence=0.97, ready=0.95, correction=0.05)})
     r = make_gate(fake, spawn, clock).on_final(1, 0, text)
-    assert r.action == "none" and r.preset is None
+    assert r.action == "clarify" and r.preset is None
 
 
-def test_correction_means_no_action(spawn, clock):
+def test_a_correction_asks_to_clarify_and_never_acts(spawn, clock):
     text = "Open the claw, I mean close it"
     fake = FakeIntent({text: decision("close_gripper")})
-    assert make_gate(fake, spawn, clock).on_final(1, 0, text).action == "none"
+    r = make_gate(fake, spawn, clock).on_final(1, 0, text)
+    assert (r.action, r.preset, r.reason) == ("clarify", None, "You corrected yourself, so nothing will move.")
 
 
 @pytest.mark.parametrize("text", ["Where are the goggles?", "Open the"])

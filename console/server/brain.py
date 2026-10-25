@@ -49,8 +49,8 @@ async def _post(path: str, body: dict | None = None, timeout: float | None = Non
     return r.json()
 
 
-async def _get(path: str) -> Any:
-    r = await _c.get(URL + path)
+async def _get(path: str, timeout: float | None = None) -> Any:
+    r = await _c.get(URL + path, **({"timeout": timeout} if timeout else {}))
     r.raise_for_status()
     return r.json()
 
@@ -71,6 +71,12 @@ async def pending() -> list[dict]:
         return await _get("/operations/pending")
     except Exception:  # noqa: BLE001
         return []
+
+
+async def running() -> list[dict]:
+    """The plans the brain is executing now, whoever started them. Raises if the brain cannot say within a few
+    seconds (a stop may be waiting on the answer): the caller then assumes one is running."""
+    return await _get("/operations/running", timeout=config.BRAIN_QUICK_TIMEOUT_S)
 
 
 async def approve(oid: str, digest: str) -> dict:

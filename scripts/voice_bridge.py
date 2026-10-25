@@ -67,11 +67,13 @@ def summary(out: dict) -> str:
     return json.dumps(out)[:300]
 
 
-def handle(text: str, brain_url: str, dry: bool) -> str:
+def handle(text: str, brain_url: str, dry: bool, spoken: bool = False) -> str:
+    """A spoken clip with nothing in it is sent all the same: the brain answers a misheard command, and stops a
+    plan that is running ("I stopped. ... Please clarify."). Only an empty typed line is skipped."""
     text = clean(text)
-    if not text:
+    if not text and not spoken:
         return "heard nothing"
-    return f"heard: {text}\n{summary(send(text, brain_url, dry))}"
+    return f"heard: {text or '(nothing)'}\n{summary(send(text, brain_url, dry))}"
 
 
 def main() -> int:
@@ -83,7 +85,7 @@ def main() -> int:
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
     if a.audio:
-        print(handle(transcribe(a.audio, a.voice), a.brain, a.dry))
+        print(handle(transcribe(a.audio, a.voice), a.brain, a.dry, spoken=True))
     elif a.text:
         print(handle(a.text, a.brain, a.dry))
     else:

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from robot.client import RobotClient
-from voice.intents import parse
+from voice.intents import normalize, parse
 
 HERE = Path(__file__).resolve().parent
 NO_APPROVAL_NEEDED = {"stop", "observe", "detect_tag"}
@@ -125,6 +125,35 @@ def create_app(bot: RobotClient, transcribe, pin: str | None = None, brain: "Bra
         if pin and given != pin:
             raise HTTPException(403, "wrong PIN")
 
+    def busy() -> bool:
+        """Is the robot executing something now (its server's "busy")? If it cannot say, assume it is."""
+        try:
+            return bool(bot.state().get("busy"))
+        except Exception:
+            return True
+
+    def clarify(text: str, intent: dict) -> dict:
+        """Carter's rule: "ambiguous or misheard command: we stop the task and ask user to please clarify."
+        For what this console answers itself: in direct mode a request it cannot parse, in brain mode one with
+        no words in it (the brain answers everything else, under the same rule). If the robot is busy it is
+        stopped with the latching stop (a reset is needed to move again): "I stopped. <reason> Please
+        clarify."; if not, nothing is stopped: "<reason> Please clarify."."""
+        if intent.get("op") is not None or (brain is not None and normalize(text)):
+            return intent
+        stopped, lead = busy(), ""
+        if stopped:
+            lead = "I stopped. "
+            try:
+                bot.stop(latch=True, reason="unclear voice command")
+            except Exception:
+                lead = "I could not stop the robot: use its STOP button. "
+            if brain:
+                try:
+                    brain.stop()
+                except Exception:
+                    pass
+        return {**intent, "say": f"{lead}{intent['say']} Please clarify.", "clarify": True, "stopped": stopped}
+
     @app.get("/")
     def index():
         return FileResponse(HERE / "static" / "index.html", headers={"Cache-Control": "no-store"})
@@ -144,11 +173,11 @@ def create_app(bot: RobotClient, transcribe, pin: str | None = None, brain: "Bra
             text = transcribe(data, audio.filename or "audio.m4a")
         except Exception as e:
             return JSONResponse({"error": f"transcription failed: {e}"}, status_code=500)
-        return {"text": text, "intent": parse(text, poses())}
+        return {"text": text, "intent": clarify(text, parse(text, poses()))}
 
     @app.post("/api/parse")
     def do_parse(req: TextReq):
-        return {"text": req.text, "intent": parse(req.text, poses())}
+        return {"text": req.text, "intent": clarify(req.text, parse(req.text, poses()))}
 
     @app.post("/api/brain/command")
     def brain_command(req: TextReq):

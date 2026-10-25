@@ -48,10 +48,15 @@ class PlanResult:
     note: str = ""                 # why the model was not used, or the start of its raw reply
     targets: list[str] = field(default_factory=list)
     zone: str | None = None
+    unclear: bool = False          # a refusal that asks the person to clarify (see classify_refusal)
 
 
-def refusal(request: str, future_ok: bool = False) -> str | None:
-    """Why this request must not be planned, or None.
+def classify_refusal(request: str, future_ok: bool = False) -> tuple[str, bool] | None:
+    """(why this request must not be planned, whether it needs clarifying), or None.
+
+    Needs clarifying (True): what was meant is not clear, so the person is asked to say it another
+    way. Understood (False): it was understood and is refused, and saying it again would not help:
+    an action the robot is not allowed to do, or "don't".
 
     future_ok=True is for a request that is being saved as a future task ("... after
     calibration finishes"): its deferral wording is expected, so only that check is skipped.
@@ -60,16 +65,22 @@ def refusal(request: str, future_ok: bool = False) -> str | None:
     low = request.lower()
     for w in REFUSE_WORDS:
         if re.search(rf"\b{re.escape(w)}\b", low):
-            return f"I will not do that: '{w}' is not something this robot is allowed to do."
+            return f"I will not do that: '{w}' is not something this robot is allowed to do.", False
     neg = NEGATION.search(low.replace("\u2019", "'"))
     if neg:
         return (f"You said '{neg.group(1)}', so I will not move anything. "
-                "To make it a rule, say 'Remember that ...'.")
+                "To make it a rule, say 'Remember that ...'."), False
     hint = None if future_ok else FUTURE_HINTS.search(low)
     if hint:
         return (f"That sounds like something to do later ('{hint.group(1)}'), so I will not move now. "
-                "Say it as 'When <event>, <task>' and I will schedule it.")
+                "Say it as 'When <event>, <task>' and I will schedule it."), True
     return None
+
+
+def refusal(request: str, future_ok: bool = False) -> str | None:
+    """Why this request must not be planned, or None (see classify_refusal)."""
+    r = classify_refusal(request, future_ok)
+    return r[0] if r else None
 
 
 def find_zone(request: str, zones: set[str]) -> str:
@@ -92,12 +103,12 @@ class RulePlanner:
 
     def plan(self, request: str, bundle: MemoryBundle, memory: Memory) -> PlanResult:
         t0 = time.perf_counter()
-        why = refusal(request)
-        if why:
-            return PlanResult(None, refused=why)
+        cls = classify_refusal(request)
+        if cls:
+            return PlanResult(None, refused=cls[0], unclear=cls[1])
         targets = targets_in(request, memory)
         if not targets:
-            return PlanResult(None, refused="I don't know which object you mean. Can you name it?",
+            return PlanResult(None, refused="I don't know which object you mean.", unclear=True,
                               planner_calls=1, planning_ms=(time.perf_counter() - t0) * 1000)
         zone = find_zone(request, self.zones)
         rules = [f for f in memory.current_facts() if f["predicate"] == "requires_before"]
@@ -175,9 +186,9 @@ class LlamaCppPlanner:
         )
 
     def plan(self, request: str, bundle: MemoryBundle, memory: Memory) -> PlanResult:
-        why = refusal(request)
-        if why:
-            return PlanResult(None, refused=why)
+        cls = classify_refusal(request)
+        if cls:
+            return PlanResult(None, refused=cls[0], unclear=cls[1])
         t0 = time.perf_counter()
         # json_schema makes llama.cpp stop as soon as the plan object closes; without it the model
         # kept writing prose until n_predict (measured on the Pi 5: 512 tokens, 100 s wasted).

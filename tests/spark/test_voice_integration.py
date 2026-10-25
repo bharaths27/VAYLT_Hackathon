@@ -10,7 +10,7 @@ import pytest
 
 from engram.checker import check_plan
 from engram.capabilities import CAPABILITIES
-from engram.db import SCHEMA
+from engram.db import SCHEMA, connect
 from engram.engine import Engine, EngineError
 from engram.planner import refusal
 from engram.robot.mock import MockRobot
@@ -215,7 +215,7 @@ def test_an_overlong_transcript_is_never_classified_or_acted_on(taught, spawn, c
     spawn.run_all()
     assert voice.gate.prepared() is None and voice.gate.stats.errors == 1
     out = voice.on_final(1, 1, long_text)
-    assert out["kind"] == "clarify" and "say it again" in out["reason"] and net.sent == []
+    assert out["kind"] == "clarify" and out["reply"].endswith("Please clarify.") and net.sent == []
     assert nothing_happened(taught)
     assert voice.on_final(2, 0, "Open the claw")["status"] == "proposed" and len(net.sent) == 1   # control
 
@@ -300,7 +300,7 @@ def test_an_overflowed_utterance_can_never_reach_a_proposal(taught, spawn, clock
     with pytest.raises(AudioOverflow):
         window.append(b"\x01\x00" * int(0.6 * SAMPLE_RATE))           # "...no, don't" never fits
     out = voice.finish_live(1, 99, tr)
-    assert out["kind"] == "clarify" and "say it again" in out["reason"]
+    assert out["kind"] == "clarify" and out["reply"] == "That was too long for me to take in at once. Please clarify."
     assert stt.calls.count("final") == 0                              # no final transcript at all
     assert voice.gate.prepared() is None                              # what the partials prepared is void
     assert voice.on_final(1, 100, "Open the claw")["kind"] == "ignored"   # and can never be reused
@@ -505,3 +505,109 @@ def test_a_voice_final_is_a_spoken_command_and_carries_the_prefetched_bundle(voi
     assert out["kind"] == "proposal" and out["status"] == "proposed"
     assert [(text, kw["who"]) for text, kw in calls] == [("Open the gripper", "voice")]   # the one entry point
     assert calls[0][1]["bundle"] is prepared.bundle             # with the bundle prepared while speaking
+
+
+# ---- Carter's rule: an ambiguous or misheard final stops a running plan and asks --------------------------
+
+RUN_REQUEST = "Bring Sample B to the bench for the acid rinse"
+
+
+class HeldRobot(MockRobot):
+    """The plan's first motion step does its work, then waits until the test lets it finish."""
+
+    def __init__(self, arena):
+        super().__init__(arena)
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def execute(self, op, args):
+        res = super().execute(op, args)
+        if op != "observe" and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(10), "the test never let the step finish"
+        return res
+
+
+@pytest.fixture
+def held(arena):
+    eng = Engine(connect(":memory:"), HeldRobot(arena), set(arena["zones"]))  # usable from the plan's thread too
+    eng.load_arena(arena)
+    eng.overhead_scan()
+    eng.teach("SOP 004", (ROOT / "fixtures/lab/SOP_004.md").read_text())
+    return eng
+
+
+def run_a_plan(engine):
+    """Approve RUN_REQUEST on another thread; return once its first step is under way (a plan is running)."""
+    p = engine.command(RUN_REQUEST, "test")
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("run", engine.approve_and_run(
+        p["operation_id"], p["digest"], "tester")))
+    t.start()
+    assert engine.robot.entered.wait(5) and engine.running()
+    return t, out
+
+
+def finish(engine, t, out):
+    engine.robot.release.set()
+    t.join(10)
+    return out["run"]
+
+
+@pytest.mark.parametrize("say,intent,reason", [
+    ("Open the claw", FakeIntent(fail=True), "I could not work out what you meant."),     # no answer
+    ("", FakeIntent(), "I didn't catch anything."),                                         # nothing caught
+    ("Open the claw, I mean close it", FakeIntent(), "You corrected yourself, so nothing will move."),
+], ids=["no answer", "nothing caught", "a correction"])
+def test_an_ambiguous_or_misheard_final_stops_the_running_plan_and_asks(held, spawn, clock, say, intent, reason):
+    voice = VoiceIntegration(held, intent, spawn=spawn, clock=clock)
+    t, out = run_a_plan(held)
+    r = voice.on_final(1, 0, say)
+    run = finish(held, t, out)
+    assert r["kind"] == "clarify" and r["stopped"] is True and r["state"]["stopped"] is True
+    assert r["reply"] == f"I stopped. {reason} Please clarify."
+    assert held.robot.state()["stopped"] is True                    # latched: clear_stop is needed to move again
+    assert (run["outcome"], run["failure"]) == ("aborted", "stop was pressed")
+
+
+def test_an_ambiguous_final_with_nothing_running_asks_without_stopping(held, spawn, clock):
+    voice = VoiceIntegration(held, FakeIntent(fail=True), spawn=spawn, clock=clock)
+    r = voice.on_final(1, 0, "Open the claw")
+    assert r["kind"] == "clarify" and r["stopped"] is False and "state" not in r
+    assert r["reply"] == "I could not work out what you meant. Please clarify."
+    assert held.robot.state()["stopped"] is False                   # no latch for a cough
+
+
+def test_an_overflowed_utterance_while_a_plan_runs_stops_it_and_asks(held, spawn, clock):
+    voice = VoiceIntegration(held, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=1.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)
+    with pytest.raises(AudioOverflow):
+        window.append(b"\x01\x00" * int(0.6 * SAMPLE_RATE))
+    t, out = run_a_plan(held)
+    r = voice.finish_live(1, 99, tr)
+    run = finish(held, t, out)
+    assert r["kind"] == "clarify" and r["stopped"] is True
+    assert r["reply"] == "I stopped. That was too long for me to take in at once. Please clarify."
+    assert run["outcome"] == "aborted"
+
+
+@pytest.mark.parametrize("say,kind,reason", [
+    ("Open the claw, no, don't", "none", "You said not to, so nothing will move."),
+    ("Where are the goggles?", "none", "That is not one of the voice presets."),
+], ids=["said not to", "not a preset"])
+def test_an_understood_final_while_a_plan_runs_is_unchanged(held, spawn, clock, say, kind, reason):
+    voice = VoiceIntegration(held, FakeIntent(), spawn=spawn, clock=clock)
+    t, out = run_a_plan(held)
+    r = voice.on_final(1, 0, say)
+    run = finish(held, t, out)
+    assert (r["kind"], r["reason"]) == (kind, reason) and "stopped" not in r and "reply" not in r
+    assert run["outcome"] == "success" and held.robot.state()["stopped"] is False
+
+
+def test_a_spoken_stop_while_a_plan_runs_is_unchanged(held, spawn, clock):
+    voice = VoiceIntegration(held, FakeIntent(), spawn=spawn, clock=clock)
+    t, out = run_a_plan(held)
+    r = voice.on_final(1, 0, "Stop!")
+    run = finish(held, t, out)
+    assert r["kind"] == "stop" and r["state"]["stopped"] is True and "reply" not in r
+    assert run["outcome"] == "aborted"

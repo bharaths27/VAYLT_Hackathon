@@ -9,3 +9,6 @@
 7. The Dreamer (skills.compile_all) only makes CANDIDATE skills. Only a person can approve.
 8. Stale object locations are said as "last seen at", never as fact.
 9. Stop must always work, including when the network is down.
+10. An ambiguous or misheard command stops a running task with the latching stop a stop word uses, and asks:
+    "I stopped. <reason> Please clarify." A stopped task never resumes on its own. With nothing running,
+    nothing is stopped ("<reason> Please clarify."). Understood refusals (unsafe, a limit, "don't") do not stop.
