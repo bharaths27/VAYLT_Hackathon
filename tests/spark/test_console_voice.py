@@ -344,7 +344,7 @@ def test_closing_the_pool_stops_its_thread_and_a_later_clip_starts_afresh(stt, w
 def test_whisper_cli_gets_the_audio_context_and_the_vocabulary_prompt(stt, monkeypatch):
     assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "pick up the beaker"
     ((_, cmd),) = stt.calls
-    assert cmd[cmd.index("-ac") + 1] == "512"
+    assert cmd[cmd.index("-ac") + 1] == "768"
     assert cmd[cmd.index("--prompt") + 1] == config.WHISPER_PROMPT and "claw" in config.WHISPER_PROMPT
     stt.calls.clear()
     monkeypatch.setattr(config, "WHISPER_AUDIO_CTX", 0)  # whisper's own defaults
@@ -362,7 +362,7 @@ def test_the_whisper_server_gets_them_with_every_request(stt, whisper_server, mo
     monkeypatch.setattr(config, "WHISPER_PROMPT", "")
     assert run(voice.transcribe(wav_bytes(), ".wav"))[0] == "hello from the server"
     (_, _, first), (_, _, second) = whisper_server["requests"]
-    assert b'name="audio_ctx"\r\n\r\n512\r\n' in first
+    assert b'name="audio_ctx"\r\n\r\n768\r\n' in first
     assert b'name="prompt"\r\n\r\n' + prompt.encode() + b"\r\n" in first
     assert b'name="audio_ctx"' not in second and b'name="prompt"' not in second  # the server's own defaults
 
@@ -559,6 +559,62 @@ def test_resident_piper_voice_is_reused_until_the_voice_changes(piper, monkeypat
     os.utime(piper.model, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
     assert run(voice.synthesize("one"))
     assert len(loads) == 2  # new voice on disk -> reloaded
+
+
+def _fake_piper(monkeypatch, loads, spoken, fail_load=False, load_seconds=0.0):
+    class FakePiperVoice:
+        @classmethod
+        def load(cls, path):
+            loads.append(path)
+            time.sleep(load_seconds)
+            if fail_load:
+                raise RuntimeError("not an onnx model")
+            return cls()
+
+        def synthesize_wav(self, text, wf):
+            spoken.append(text)
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(22050)
+            wf.writeframes(b"\x00\x01" * 2000)
+
+    fake = types.ModuleType("piper")
+    fake.PiperVoice = FakePiperVoice
+    monkeypatch.setitem(sys.modules, "piper", fake)
+    monkeypatch.setattr(voice, "_synth_py", _real_synth_py)
+
+
+def test_warming_up_loads_the_voice_and_speaks_once_so_the_first_reply_is_fast(piper, monkeypatch):
+    loads, spoken = [], []
+    _fake_piper(monkeypatch, loads, spoken)
+    assert run(voice.warm_tts()) is True
+    assert len(loads) == 1 and spoken == ["Ready."]  # loaded, and its first (slow) synthesis done
+    assert not piper.cache.exists() or list(piper.cache.iterdir()) == []  # the throwaway is not cached
+    assert run(voice.synthesize("Opening the claw."))
+    assert len(loads) == 1 and spoken == ["Ready.", "Opening the claw."]  # the reply reused it
+
+
+def test_a_reply_asked_for_during_the_warm_up_waits_for_it_instead_of_loading_again(piper, monkeypatch):
+    loads, spoken = [], []
+    _fake_piper(monkeypatch, loads, spoken, load_seconds=0.2)  # a load slow enough to overlap
+
+    async def both():
+        return await asyncio.gather(voice.warm_tts(), voice.synthesize("Stopped."))
+
+    warmed, reply = run(both())
+    assert warmed is True and reply.exists() and len(loads) == 1
+
+
+@pytest.mark.parametrize("missing", ["piper-package", "model", "broken-model"])
+def test_warming_up_without_a_usable_voice_is_harmless(piper, monkeypatch, missing):
+    loads, spoken = [], []
+    _fake_piper(monkeypatch, loads, spoken, fail_load=missing == "broken-model")
+    if missing == "piper-package":
+        monkeypatch.setitem(sys.modules, "piper", None)  # import piper -> ImportError
+    if missing == "model":
+        piper.model.unlink()
+    assert run(voice.warm_tts()) is False and spoken == []
+    assert (voice._TTS.jobs, voice._TTS.bytes) == (0, 0)
 
 
 
@@ -961,6 +1017,28 @@ def test_the_console_closes_the_whisper_pool_on_shutdown(monkeypatch):
     assert closed == [1]
 
 
+@needs_web
+def test_the_console_warms_the_voice_at_startup_without_waiting_for_it(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from console.server import main
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    async def slow_warm_up():  # a first load that takes a while
+        started.set()
+        await asyncio.to_thread(release.wait, 5)
+        finished.set()
+        return True
+
+    monkeypatch.setattr(main.voice, "warm_tts", slow_warm_up)
+    with TestClient(main.app) as client:
+        assert started.wait(5)  # began at startup...
+        assert client.get("/health").status_code == 200  # ...and the console serves meanwhile,
+        assert not finished.is_set()  # before the warm-up is done
+        release.set()
+
+
 def multipart(audio: bytes, auto: str = "0") -> bytes:
     return (f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="auto"\r\n\r\n{auto}\r\n'
             f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="audio"; filename="a.wav"\r\n'
@@ -1287,10 +1365,20 @@ def test_queue_limits_are_validated(monkeypatch, raw, expected):
 
 
 @pytest.mark.parametrize("raw,expected", [("0", 0), ("384", 384), ("512", 512), ("768", 768), ("1500", 1500),
-                                          ("256", 512), ("383", 512), ("1501", 512), ("-1", 512), ("lots", 512)])
+                                          ("256", 768), ("383", 768), ("1501", 768), ("-1", 768), ("lots", 768)])
 def test_the_audio_context_is_validated(monkeypatch, raw, expected):
     monkeypatch.setenv("ENGRAM_WHISPER_AUDIO_CTX", raw)
-    assert config._audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 512) == expected
+    assert config._audio_ctx("ENGRAM_WHISPER_AUDIO_CTX", 768) == expected
+
+
+def test_the_shipped_whisper_defaults():
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ENGRAM_")}
+    code = "from console.server import config as c; print(c.WHISPER_AUDIO_CTX); print(c.WHISPER_PROMPT)"
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    ctx, prompt = out.stdout.splitlines()
+    assert ctx == "768"  # not 512: at 512 whisper-cli repeated whole commands on 3 of 32 clips
+    assert "claw" in prompt and "gripper" in prompt
 
 
 @pytest.mark.parametrize("raw,expected", [("x" * 900, "x" * 500), ("  ", ""), ("Open the claw.", "Open the claw.")],
@@ -1315,7 +1403,7 @@ def test_bad_settings_fall_back_to_defaults_at_startup(bad):
             "c.STT_MAX_SECONDS, c.STT_UPLOAD_TIMEOUT_S, c.WHISPER_AUDIO_CTX)")
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0", "20.0", "512"]
+    assert out.stdout.split() == ["30.0", "4", str(32 * 1024 * 1024), "8", "30.0", "20.0", "768"]
 
 
 def test_a_server_that_never_finishes_answering_hits_the_overall_deadline(stt, whisper_server, monkeypatch):

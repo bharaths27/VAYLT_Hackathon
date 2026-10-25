@@ -14,6 +14,7 @@ import asyncio
 import collections
 import concurrent.futures
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -256,18 +257,49 @@ def _tts_cache_path(text: str, version: tuple) -> Path:
     return config.TTS_CACHE / (hashlib.sha256(repr((version, text)).encode()).hexdigest()[:32] + ".wav")
 
 
-def _synth_py(text: str, out: Path, version: tuple) -> bool:
+def _resident_voice(version: tuple):
+    """The resident PiperVoice for this voice version: loaded once (again only when the voice on
+    disk changes), or None without the piper package. Only the TTS worker calls this."""
     global _piper_voice, _piper_voice_version
     try:
         from piper import PiperVoice
     except Exception:  # noqa: BLE001
-        return False
+        return None
     if _piper_voice is None or _piper_voice_version != version:  # first use, or the voice changed
         _piper_voice = PiperVoice.load(config.PIPER_MODEL)
         _piper_voice_version = version
+    return _piper_voice
+
+
+def _synth_py(text: str, out: Path, version: tuple) -> bool:
+    piper_voice = _resident_voice(version)
+    if piper_voice is None:
+        return False
     with wave.open(str(out), "wb") as wf:
-        _piper_voice.synthesize_wav(text, wf)
+        piper_voice.synthesize_wav(text, wf)
     return out.exists() and out.stat().st_size > 100
+
+
+def _warm_job() -> bool:
+    version = voice_version()
+    piper_voice = None if version is None else _resident_voice(version)
+    if piper_voice is None:
+        return False
+    with wave.open(io.BytesIO(), "wb") as wf:  # one throwaway reply: the first synthesis is slow too
+        piper_voice.synthesize_wav("Ready.", wf)
+    return True
+
+
+async def warm_tts() -> bool:
+    """Load the resident Piper voice now, as a job on the TTS queue (so it cannot race a reply),
+    rather than on the first reply. Measured on this box with the lessac-medium voice: loading
+    takes ~7.7 s and the first synthesis after it ~2.5 s more; later replies take 44-92 ms (the
+    piper CLI, which loads the voice per reply, ~740 ms). False when there is nothing to warm
+    (no piper package, no model) or loading failed; replies then use the CLI as before."""
+    try:
+        return await _TTS.run(_warm_job)
+    except Exception:  # noqa: BLE001 - a voice that will not load is the first reply's problem, as before
+        return False
 
 
 def _synth_cli(text: str, out: Path) -> bool:
