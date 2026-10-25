@@ -17,6 +17,7 @@ from engram.robot.mock import MockRobot
 from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscriber, OutOfOrder, PcmWindow
 from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
+from engram.spark.voice import GateResult
 from engram.spark.voice_integration import VoiceIntegration, memory_version
 from spark_fakes import (  # noqa: F401  (fixtures)
     REJECTIONS, SAMPLES, FakeIntent, RecordingTransport, clock, decision, fake, spawn,
@@ -611,3 +612,45 @@ def test_a_spoken_stop_while_a_plan_runs_is_unchanged(held, spawn, clock):
     run = finish(held, t, out)
     assert r["kind"] == "stop" and r["state"]["stopped"] is True and "reply" not in r
     assert run["outcome"] == "aborted"
+
+
+def test_memory_that_changes_during_the_final_while_a_plan_runs_is_retried_not_stopped(held, spawn, clock):
+    fake = FakeIntent()
+
+    def classifier(text, partial):
+        held.teach("Note", "The bench is wet.")           # memory moves on while the model answers
+        return fake(text, partial)
+
+    voice = VoiceIntegration(held, classifier, spawn=spawn, clock=clock)
+    t, out = run_a_plan(held)
+    r = voice.on_final(1, 0, "Open the claw")
+    run = finish(held, t, out)
+    assert (r["kind"], r["cause"]) == ("none", "memory_changed") and "stopped" not in r
+    assert r["reason"] == "Things changed while I was listening. Please say it again."
+    assert run["outcome"] == "success" and held.robot.state()["stopped"] is False
+
+
+def test_a_final_that_took_too_long_while_a_plan_runs_is_retried_not_stopped(held, spawn, clock):
+    fake = FakeIntent()
+
+    def classifier(text, partial):
+        clock.advance(30.0)                               # understood, but too late to act on
+        return fake(text, partial)
+
+    voice = VoiceIntegration(held, classifier, spawn=spawn, clock=clock)
+    t, out = run_a_plan(held)
+    r = voice.on_final(1, 0, "Open the claw")
+    run = finish(held, t, out)
+    assert (r["kind"], r["cause"]) == ("clarify", "expired") and "stopped" not in r
+    assert r["reason"] == "That took too long to work out. Please say it again."
+    assert run["outcome"] == "success"
+
+
+def test_the_rule_follows_the_gates_cause_not_its_action(held, spawn, clock, monkeypatch):
+    voice = VoiceIntegration(held, FakeIntent(), spawn=spawn, clock=clock)
+    asked = GateResult("clarify", 1, 0, "Open the claw", reason="Say it again, please.", cause="memory_changed")
+    monkeypatch.setattr(voice.gate, "on_final", lambda *a: asked)
+    t, out = run_a_plan(held)
+    r = voice.on_final(1, 0, "Open the claw")
+    run = finish(held, t, out)
+    assert r["kind"] == "clarify" and "stopped" not in r and run["outcome"] == "success"

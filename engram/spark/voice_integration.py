@@ -13,12 +13,14 @@
 - A deferred preset ("open the claw after calibration finishes") becomes a "When <event>,
   <task>" commitment through Engine.command, the existing prospective path. When the trigger
   fires, the engine proposes it and a person still approves it.
-- A final the gate could not act on because it was ambiguous or misheard (a "clarify" result:
-  nothing caught, a correction, audio that overflowed, no answer from the intent model) follows
-  Carter's rule: if a plan is running (an episode whose outcome is 'running'), Engine.stop()
+- A final the gate could not act on because it was ambiguous or misheard (its cause, one of
+  voice.RULE_CAUSES: nothing caught, a correction, audio that overflowed, no answer from the
+  intent model) follows Carter's rule: if a plan is running (an episode whose outcome is 'running'), Engine.stop()
   stops it with the latching stop a stop word uses, and the reply is "I stopped. <reason> Please
   clarify."; with nothing running nothing is stopped and the reply is "<reason> Please
-  clarify.". "You said not to" and "not one of the voice presets" are understood: unchanged.
+  clarify.". "You said not to" and "not one of the voice presets" are understood, and a final
+  that memory moved past, or that took too long, is asked again ("Please say it again."): all
+  unchanged, and nothing is stopped for them.
 
 Call on_partial and on_final from the thread that owns the engine's database connection. The
 gate's worker thread only talks to the intent model; every database read (the memory-context
@@ -36,7 +38,7 @@ from ..skills import APPROVED
 from .audio_windows import AudioOverflow, LiveTranscriber
 from .intent_client import IntentDecision
 from .presets import PRESETS, register_presets, voice_presets_enabled
-from .voice import Classifier, GateResult, Prediction, SpeculationGate
+from .voice import RULE_CAUSES, Classifier, GateResult, Prediction, SpeculationGate
 
 ACTING = ("propose", "schedule")   # gate actions that lead to an engine proposal, now or when a trigger fires
 
@@ -134,9 +136,9 @@ class VoiceIntegration:
             if out.get("kind") != "scheduled":
                 return {"kind": "none", **base, "reason": "That could not be saved as a future task."}
             return {**out, **base, "preset": r.preset}
-        if r.action == "clarify":
+        if r.cause in RULE_CAUSES:  # ambiguous or misheard: never by the words, never by the action alone
             return self._clarify(base, r.reason)
-        return {"kind": r.action, **base, "reason": r.reason}
+        return {"kind": r.action, **base, "reason": r.reason, "cause": r.cause}
 
     def _clarify(self, base: dict[str, Any], reason: str) -> dict[str, Any]:
         """Carter's rule: stop the plan that is running, if one is, then ask the person to clarify."""
