@@ -252,9 +252,11 @@ def test_cancel_closes_the_connection_and_returns_at_once():
 
 
 class _SlowConnect(socket.socket):
-    def connect(self, address):
+    """A TCP connect that completes only after 1 s (after the test's cancel)."""
+
+    def connect_ex(self, address):
         time.sleep(1.0)
-        super().connect(address)
+        return super().connect_ex(address)
 
 
 def test_a_request_cancelled_while_connecting_is_never_sent(monkeypatch):

@@ -157,9 +157,9 @@ class _SlowConnect(socket.socket):
 
     DELAY = 0.0
 
-    def connect(self, address):
+    def connect_ex(self, address):
         time.sleep(self.DELAY)
-        super().connect(address)
+        return super().connect_ex(address)
 
 
 @pytest.mark.parametrize("connect_delay", [0.0, 0.4], ids=["fast connect", "connect uses most of the budget"])
