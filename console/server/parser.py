@@ -32,6 +32,23 @@ UNSAFE = [
 
 PRONOUNS = r"\b(it|that|this|them|those|the thing|the stuff|something)\b"
 
+# STOP always wins: a stop word ANYWHERE in the utterance stops the robot, whatever the case, punctuation or
+# company ("Stop.", "STOP!", "stop, stop", "Please stop.", "Stop. Open the claw."). whisper.cpp writes
+# "Stop." and the old exact match missed it. This deliberately also stops on "don't stop the timer",
+# "stop sign" or "remember to stop at zone A": on a robot a needless stop costs one Clear Stop, a missed
+# stop can hurt someone, so we err toward stopping. ("e-stop" is covered by "stop". Keep in step with
+# STOP_WORDS in engram/engine.py.)
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa)\b")
+# Negated or called-off commands ("don't open the claw", "no, ...", "cancel", "wait, don't"). Planning the
+# rest of the sentence would do the opposite of what was said, so these refuse. Checked after the rule
+# prefix, so "remember that the vial must never ..." is still taught as a rule (rules never move anything).
+NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never ?mind|wait|hold on)\b")
+# A future condition ("after calibration finishes", "when the vial arrives") or a trailing delay ("open the
+# claw in 5 seconds"). Only a leading timer ("In 5 seconds, ...") can be scheduled here; anything else
+# would run NOW, so it asks instead.
+FUTURE = re.compile(r"\b(after|when|whenever|once(?=\s+\w)|as soon as|until|till|later|soon|tomorrow|tonight"
+                    r"|in a (?:bit|moment|while)|in \S+ (?:seconds?|secs?|minutes?|mins?|hours?))\b")
+
 QUIPS = {
     "plan": ["Plan staged. Your signature, please.", "Drafted. Nothing moves until you say so.",
              "Ready when you are. I've shown my work.", "Plan's on the board. I await your blessing."],
@@ -73,7 +90,7 @@ def _num(s: str) -> float | None:
 
 
 def _norm(text: str) -> str:
-    t = text.lower().strip()
+    t = text.lower().replace(chr(0x2019), "'").strip()  # a curly apostrophe (U+2019) still reads as one
     t = re.sub(r"[^\w\s:.'-]", " ", t)
     return re.sub(r"\s+", " ", t)
 
@@ -158,6 +175,10 @@ FETCH_VERB = r"\b(bring|fetch|get|grab|move|put|take|deliver|carry|place|set)\b"
 PROSPECTIVE = re.compile(r"^(?:in|after)\s+(\d+|\w+)\s*(seconds?|secs?|minutes?|mins?)\s*,?\s*(.+)$")
 
 
+def is_stop(text: str) -> bool:
+    return STOP_WORDS.search(_norm(text)) is not None
+
+
 def parse(text: str, bundle: dict) -> ParseResult:
     """Never raises for a request the primitives cannot express: a plan that fails validation
     (for example a tag id outside the allowed range) comes back as a clarification."""
@@ -174,9 +195,10 @@ def _parse(text: str, bundle: dict) -> ParseResult:
     if not t:
         return ParseResult("clarify", text, reason="empty command", quip=quip("clarify"), trace=trace)
 
-    # 0. STOP always wins, no approval needed
-    if re.fullmatch(r"(please )?(stop|halt|freeze|abort|e-?stop|emergency stop|stop stop|whoa)( now| please| it)?", t):
-        return ParseResult("stop", text, quip=quip("stop"), trace=trace + ["stop keyword"])
+    # 0. STOP always wins, no approval needed (see STOP_WORDS)
+    m = STOP_WORDS.search(t)
+    if m:
+        return ParseResult("stop", text, quip=quip("stop"), trace=trace + [f"stop word '{m.group(1)}'"])
 
     # 1. safety screen
     for pat, why in UNSAFE:
@@ -189,6 +211,13 @@ def _parse(text: str, bundle: dict) -> ParseResult:
     if m:
         body = text.split(":", 1)[1].strip() if ":" in text else m.group(m.lastindex)
         return ParseResult("rule", text, data={"rule_text": body}, quip=quip("rule"), trace=trace + ["rule prefix"])
+
+    # 2b. a negated command is never planned, and never handed to the LLM fallback (see NEGATION)
+    m = NEGATION.search(t)
+    if m:
+        return ParseResult("abstain", text, reason=f"You said '{m.group(1)}', so nothing will move. "
+                           "To make it a rule, say 'Remember that ...'", quip=quip("abstain"),
+                           trace=trace + [f"negation '{m.group(1)}'"])
 
     # 3. prospective ("in 2 minutes, bring the vial to zone B")
     m = PROSPECTIVE.match(t)
@@ -204,6 +233,13 @@ def _parse(text: str, bundle: dict) -> ParseResult:
             return sub
         return ParseResult("prospective", text, plan=sub.plan, quip=quip("prospective"),
                            data={"delay_s": secs, "inner": inner}, trace=trace + [f"prospective in {secs:.0f}s"] + sub.trace)
+
+    # 3b. any other future condition must not run now (see FUTURE)
+    m = FUTURE.search(t)
+    if m:
+        return ParseResult("clarify", text, reason=f"That sounds like later ('{m.group(1)}'), so I won't do it now. "
+                           "I can only schedule a timed task: say 'In 5 minutes, ...'", quip=quip("clarify"),
+                           trace=trace + [f"future condition '{m.group(1)}'"])
 
     goal = text.strip()
 
