@@ -380,6 +380,57 @@ def test_a_failing_robot_stop_still_stops_the_brain(monkeypatch):
             c.post("/stop/clear")
 
 
+ROBOT_OK = {"stopped": True, "latched": True}  # the robot server's reply to /robot/stop
+# Review round 7: a reply confirms a stop only when it says so explicitly, in its target's own shape. Anything
+# else (missing, malformed, unknown, or a string where a boolean belongs) does not.
+STOP_REPLIES = [  # (robot reply, brain reply or None when the brain bridge is off, confirmed)
+    (ROBOT_OK, None, True),
+    ({"stopped": True}, None, True),
+    ({"status": "stopped", "simulated": True}, None, True),  # the console's mock robot
+    (ROBOT_OK, {"adapter": "mock", "stopped": True}, True),  # the brain answers /stop with its robot's state
+    (ROBOT_OK, {"adapter": "brian8200", "connected": True, "stopped": True}, True),
+    (None, None, False), ({}, None, False), ([], None, False), ("stopped", None, False), (True, None, False),
+    ({"status": "error"}, None, False), ({"status": "ok"}, None, False), ({"status": "STOPPED"}, None, False),
+    ({"stopped": "yes"}, None, False), ({"stopped": "true"}, None, False), ({"stopped": 1}, None, False),
+    ({"stopped": None}, None, False), ({"latched": True}, None, False),
+    ({"stopped": True, "latched": False}, None, False), ({"stopped": True, "latched": "yes"}, None, False),
+    ({"stopped": True, "error": "driver fault"}, None, False), ({"status": "stopped", "stopped": False}, None, False),
+    ([], {"adapter": "mock", "stopped": True}, False),
+    (ROBOT_OK, {}, False), (ROBOT_OK, {"stopped": False}, False), (ROBOT_OK, {"adapter": "masterpi", "stopped": "yes"}, False),
+    # When the brain cannot reach its robot, its state says "stopped" anyway, next to the failure.
+    (ROBOT_OK, {"adapter": "brian8200", "connected": False, "error": "timed out", "stopped": True}, False),
+    (ROBOT_OK, {"adapter": "masterpi", "connected": False, "stopped": True}, False),
+    (ROBOT_OK, {"error": "brain unreachable"}, False),
+]
+
+
+@pytest.mark.parametrize("robot_reply,brain_reply,confirmed", STOP_REPLIES)
+def test_only_an_explicit_reply_confirms_a_stop(monkeypatch, robot_reply, brain_reply, confirmed):
+    async def robot_stop():
+        return robot_reply
+
+    async def brain_stop():
+        return brain_reply
+
+    async def brain_clear():
+        return {}
+
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.engine.robot, "stop", robot_stop)
+            if brain_reply is not None:
+                m.setattr(main.brain, "enabled", lambda: True)
+                m.setattr(main.brain, "stop", brain_stop)
+                m.setattr(main.brain, "clear_stop", brain_clear)
+            voice = c.post("/commands", json={"text": "Stop.", "source": "voice"})
+            button = c.post("/stop")
+            latched = main.engine.stopped
+            c.post("/stop/clear")
+    assert voice.status_code == 200 and voice.json()["stop_confirmed"] is confirmed and latched, voice.json()
+    assert button.status_code == (200 if confirmed else 502), button.status_code
+
+
 @pytest.mark.parametrize("failure", ["robot stop raises", "robot stop request failed", "robot says not stopped",
                                      "brain stop failed"])
 def test_an_unconfirmed_stop_says_so_and_stays_latched(monkeypatch, failure):
@@ -441,17 +492,53 @@ def test_a_confirmed_stop_says_stopping():
 
 
 class StalledDisk:
-    """A ledger file whose every open hangs, like a stalled SD card, until released."""
+    """A ledger file whose every open hangs, like a stalled SD card, until released. With reads_stall, looking
+    the file up (exists()) hangs too, and `reading` is set once a read is stuck."""
 
-    def __init__(self, release: threading.Event):
-        self.release = release
+    def __init__(self, release: threading.Event, reads_stall: bool = False):
+        self.release, self.reads_stall, self.reading = release, reads_stall, threading.Event()
 
     def open(self, *args, **kwargs):
         self.release.wait(3)
         raise OSError("the disk stalled")
 
     def exists(self):
+        if self.reads_stall:
+            self.reading.set()
+            self.release.wait(5)
         return False
+
+
+def test_a_stalled_ledger_read_never_delays_a_stop(monkeypatch):
+    # Review round 7: Ledger.find() read the file on the event loop, so an evidence lookup during a disk stall
+    # blocked a concurrent stop. The read now happens on the ledger's reader thread, within a time budget.
+    release = threading.Event()
+    disk = StalledDisk(release, reads_stall=True)
+    lookup = {}
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.ledger, "path", disk)
+            m.setattr(main.ledger, "read_timeout_s", 1.0, raising=False)
+
+            def look():
+                t0 = time.monotonic()
+                lookup["status"] = c.get("/evidence/ev_not_there").status_code
+                lookup["s"] = time.monotonic() - t0
+
+            reader = threading.Thread(target=look)
+            reader.start()
+            assert disk.reading.wait(5), "the lookup never reached the disk"
+            t0 = time.monotonic()
+            r = c.post("/commands", json={"text": "Stop.", "source": "voice"})
+            stop_s = time.monotonic() - t0
+            latched = main.engine.stopped
+            reader.join(10)
+        release.set()
+        assert main.ledger.flush(10)
+        c.post("/stop/clear")
+    assert r.status_code == 200 and r.json()["kind"] == "stop" and latched and stop_s < 1.0, stop_s
+    assert lookup["status"] == 404 and lookup["s"] < 3.0, lookup  # the lookup gave up after its time budget
 
 
 def test_a_stalled_ledger_disk_never_delays_a_stop(monkeypatch):
@@ -478,7 +565,7 @@ def test_a_stalled_ledger_disk_never_delays_a_stop(monkeypatch):
                 other = c.post("/commands", json={"text": "What do you see?", "source": "typed"})
                 other_s = time.monotonic() - t1
                 eid = main.ledger.append("probe")
-                found = main.ledger.find(eid)
+                found = asyncio.run(main.ledger.find(eid))
                 latched = main.engine.stopped
         finally:
             release.set()

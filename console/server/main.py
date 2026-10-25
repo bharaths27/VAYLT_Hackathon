@@ -392,7 +392,7 @@ async def evidence(eid: str):
     ev = await memory.evidence(eid)
     if ev:
         return ev
-    rec = ledger.find(eid)
+    rec = await ledger.find(eid)  # read off the event loop: a stalled disk cannot hold up a stop
     if rec:
         return {"id": eid, "title": "Ledger record", "passage": rec, "immutable": True}
     raise HTTPException(404, "no such evidence")
