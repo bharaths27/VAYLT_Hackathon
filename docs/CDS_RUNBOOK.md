@@ -105,8 +105,9 @@ address: set your laptop's Ethernet adapter to IPv4 address `10.0.0.1`, mask `25
 (Windows: Settings > Network > Ethernet > IP assignment > Edit > Manual), then `ssh starrasp@10.0.0.2`.
 
 **Backup 2, the Pi's own Wi-Fi** (once you are in over SSH, and after step 5, which needs internet):
-`bash ~/engram_hub/console/scripts/hotspot.sh` makes the Pi its own Wi-Fi called **ENGRAM-LAB** (password
-`engram2026`); the iPad joins it and the robot is at `10.42.0.1`. Your SSH session over Wi-Fi drops when it
+`bash ~/engram_hub/console/scripts/hotspot.sh` makes the Pi its own Wi-Fi called **ENGRAM-LAB** and prints its
+password (made on this Pi the first time and kept in `~/.engram-lab-wifi`; never post it: anyone on this network
+can approve a plan). The iPad joins it and the robot is at `10.42.0.1`. Your SSH session over Wi-Fi drops when it
 switches; reconnect over the cable or by joining ENGRAM-LAB.
 
 ---
@@ -372,8 +373,18 @@ Wait until the Pi's green light stops blinking, then unplug the Pi and switch of
 
 ## What is proven and what is not (as of 2026-10-25)
 
-- **Proven on the warden's PC, simulated robot:** all test suites (881 brain, 187 console, 30 web, 56 robot server),
-  voice end to end about 0.7 s from end of speech to the plan, stop/negation/deferral behavior, questions never
-  become plans.
+Check it yourself from the repo root, on Linux or macOS (the Pi included). Each should end with no failures:
+`python -m pytest -q` (brain and memory), `cd console && python -m pytest -q tests` (console),
+`cd robot/engram_robot && python -m pytest -q tests` (robot server) and
+`python scripts/cortex_demo.py --out /tmp/cortex-demo.json` (the Cortex checks).
+
+- **Tests at main 5026150, on the warden's PC with a simulated robot:** brain and memory 926 passed and 6 skipped
+  (the skipped ones need Linux), console 248 passed, robot server 56 passed, web front page 11 passed. On a Windows
+  checkout that converts line endings, one file-checksum test fails; it passes on a normal checkout.
+- **The CDS scripts, end to end on a simulated Pi** (Linux, a copy of the old Pi checkout): update with backup and
+  exact undo, a failed fetch that changes nothing, mock start, the `--real` refusals, a simulated robot server on
+  IPv4 and IPv6, the stop latch, shutdown, and a program that is not ours left running on an ENGRAM port.
+- **Observed, not reproducible from this repo yet** (warden's PC, simulated robot; the timing harness is not in
+  the repo): about 0.7 s from the end of speech to the plan card.
 - **Not yet proven on the Pi:** speed of speech recognition and the spoken reply, Qwen timing, the camera frame
   rate, and every real-hardware step in sections 9 to 11. Today's tests are what prove them.
