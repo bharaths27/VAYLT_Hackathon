@@ -41,10 +41,13 @@ running() {
 }
 
 # Canonical path (symlinks and .. resolved, also for a path that does not exist yet; '/' separators) and file
-# identity (device + inode, so a hard link counts), both by the Python that runs Cortex: portable beyond GNU
-# realpath/stat. same_file answers with a word, so a failed check can never read as "different".
+# identity, both by the Python that runs Cortex: portable beyond GNU realpath/stat. Two paths are the same file when
+# they resolve to one canonical path (whether or not it exists yet) or, existing, share device + inode (a hard link).
+# same_file answers with a word, so a failed check can never read as "different".
 canon() { "$(python_bin)" -c 'import os,sys;print(os.path.realpath(sys.argv[1]).replace(os.sep,"/"))' "$1"; }
-same_file() { "$(python_bin)" -c 'import os,sys;a,b=sys.argv[1:];print("same" if os.path.exists(a) and os.path.exists(b) and os.path.samefile(a,b) else "different")' "$1" "$2"; }
+same_file() { "$(python_bin)" -c 'import os,sys;a,b=sys.argv[1:]
+same=os.path.realpath(a)==os.path.realpath(b) or (os.path.exists(a) and os.path.exists(b) and os.path.samefile(a,b))
+print("same" if same else "different")' "$1" "$2"; }
 
 # The listener on the port is our child: the listening socket's inode is in the child's fd table (Linux /proc).
 # Until that is shown no credential goes to whatever answers there; without /proc it cannot be shown: not ours.
@@ -90,9 +93,10 @@ tunnel_host() { case $HOST in *:*) echo "[$HOST]" ;; *) echo "$HOST" ;; esac; }
 
 url() { case $HOST in *:*) echo "http://[$HOST]:$PORT" ;; *) echo "http://$HOST:$PORT" ;; esac; }
 
+# A loopback check, never through an environment proxy (as ours() too).
 health() {
     "$(python_bin)" -c 'import sys,urllib.request
-try:print(urllib.request.urlopen(sys.argv[1]+"/health",timeout=2).read().decode())
+try:print(urllib.request.build_opener(urllib.request.ProxyHandler({})).open(sys.argv[1]+"/health",timeout=2).read().decode())
 except Exception as e:sys.exit(1)' "$1"
 }
 
