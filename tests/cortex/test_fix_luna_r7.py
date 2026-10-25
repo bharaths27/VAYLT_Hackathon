@@ -42,6 +42,19 @@ def test_a_reset_the_adapter_does_not_confirm_keeps_the_latch(store,arena):
     with pytest.raises(Conflict,match='did not confirm'): b.clear_stop(principal='carther')
     assert store.one(LATCH) and b._stopped.is_set()
 
+class StopOnConfirm(FakeRobot):
+    """The adapter, except that a STOP lands right after it confirmed the reset (between the reset and the clear)."""
+    brain=None
+    def state(self):
+        s=super().state()
+        if self.brain: b,self.brain=self.brain,None; b.stop()
+        return s
+
+def test_a_stop_arriving_after_the_reset_was_confirmed_wins(store,arena):
+    b=Brain(store,StopOnConfirm(arena));b.stop();b.robot.brain=b
+    with pytest.raises(Conflict,match='a stop arrived'): b.clear_stop(principal='carther')
+    assert store.one(LATCH) and b._stopped.is_set() and b.robot.stopped
+
 class StopAfterCommit:
     """The vault connection, except that a STOP lands right after the next COMMIT (the clear has committed, memory not)."""
     def __init__(self,conn,brain): self.conn,self.brain,self.armed=conn,brain,True
