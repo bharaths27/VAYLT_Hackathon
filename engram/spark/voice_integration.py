@@ -21,7 +21,7 @@ from typing import Any, Hashable
 from ..engine import Engine
 from ..planner import refusal
 from ..skills import APPROVED
-from .presets import PRESETS
+from .presets import PRESETS, register_presets
 from .voice import Classifier, GateResult, SpeculationGate
 
 ACTING = ("propose", "schedule")   # gate actions that lead to an engine proposal, now or when a trigger fires
@@ -46,8 +46,7 @@ def memory_version(engine: Engine) -> Hashable:
 class VoiceIntegration:
     def __init__(self, engine: Engine, classifier: Classifier, **gate_options: Any):
         self.engine = engine
-        for preset in PRESETS.values():
-            engine.register_fixed_request(preset.request, preset.plan_steps())
+        register_presets(engine)
         self.gate = SpeculationGate(classifier, prefetch=self._prefetch,
                                     context_version=lambda: memory_version(engine), **gate_options)
 

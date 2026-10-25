@@ -50,3 +50,14 @@ def _validate() -> None:
 
 
 _validate()
+
+
+def register_presets(engine: Any) -> None:
+    """Let the engine plan each preset's canonical request ("Open the gripper") as its fixed steps.
+
+    Uses Engine.register_fixed_request: only planning is skipped. Refusal rules, the checker and a
+    person's digest-bound approval still apply to every proposal. Used by VoiceIntegration and,
+    at startup, by the HTTP API (engram/api.py).
+    """
+    for p in PRESETS.values():
+        engine.register_fixed_request(p.request, p.plan_steps())

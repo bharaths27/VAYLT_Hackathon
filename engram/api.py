@@ -15,6 +15,9 @@ Environment:
     ENGRAM_LLM_URL    llama.cpp server completion URL, e.g. http://127.0.0.1:8080/completion.
                       Leave unset to use the rule planner. Any model problem falls back to rules.
     ENGRAM_LLM_TIMEOUT  seconds to wait for the model (default 60; a Pi 4 is slow)
+    ENGRAM_VOICE_PRESETS  1 (default) lets "Open the gripper", "Close the gripper" and "Look around"
+                      plan as fixed steps (engram/spark/presets.py); 0 turns that off. Either way a
+                      person approves every plan by digest before anything moves.
 """
 
 from __future__ import annotations
@@ -34,8 +37,13 @@ from .db import connect
 from .engine import Engine, EngineError
 from .robot.mock import MockRobot
 from .skills import SkillError
+from .spark.presets import register_presets
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def voice_presets_enabled() -> bool:
+    return os.environ.get("ENGRAM_VOICE_PRESETS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 class SourceIn(BaseModel):
@@ -105,6 +113,8 @@ def default_engine() -> Engine:
 
 def create_app(engine: Engine | None = None) -> FastAPI:
     engine = engine or default_engine()
+    if voice_presets_enabled():
+        register_presets(engine)   # same checker and digest-bound approval as every other plan
     app = FastAPI(title="ENGRAM Cortex", version="0.1.0")
     app.state.engine = engine
     # The iPad page is served from the same laptop on the local network.
