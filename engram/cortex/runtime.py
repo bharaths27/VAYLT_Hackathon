@@ -59,7 +59,7 @@ class Brain:
                 self.store.settle(r['id'],'unknown',('running',),'Restart interrupted execution; no automatic replay')
                 self.journal(r['id'],'recovery',{},'unknown','requires operator reconciliation')
             if running: self._latch('restart interrupted execution')
-            if self._latched(): self._stopped.set()
+            if self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): self._stopped.set()
             self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<?)",(self.store.clock(),))
             self.store.conn.execute("UPDATE cx_wake SET status='pending' WHERE status='preparing'")
             # Existing task links remain durable; recovery never dispatches physical effects.
@@ -228,7 +228,7 @@ class Brain:
                     r=self.operation(ep); plan=r['plan']
                     if r['owner']!=principal: raise Denied('approver does not own this operation')
                     if r['status']!='proposed': raise Conflict('operation is not awaiting approval')
-                    if self._latched() or self.robot.state().get('stopped'): raise Denied('stop is latched')
+                    if self._stopped.is_set() or self.robot.state().get('stopped'): raise Denied('stop is latched')
                     self._require_reconciled('new motion')
                     if self.store.clock()>=r['expires_at']: raise Stale('proposal expired')
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
@@ -353,12 +353,9 @@ class Brain:
         return self.robot.state()
 
     def _latch(self,reason: str):
-        # The stop latch is durable: a restart must not silently re-arm motion.
+        # The stop latch is durable: recover() restores it, so a restart cannot silently re-arm motion.
         self._stopped.set()
         with self.store.tx(): self.store.conn.execute("INSERT OR IGNORE INTO meta VALUES('cortex_stop',?)",(canonical({'at':self.store.clock(),'reason':reason}),))
-
-    def _latched(self) -> bool:
-        return self._stopped.is_set() or bool(self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"))
 
     def _require_reconciled(self,action: str):
         # Cortex operations only, as operation() and verify_outcome() can see them; ids let the operator reconcile each one.
