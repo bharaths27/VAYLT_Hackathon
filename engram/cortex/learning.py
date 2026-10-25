@@ -280,7 +280,10 @@ class Dreamer:
                         if not isinstance(h,dict) or set(h)!={'text','refs'} or not isinstance(h['refs'],list) or not all(isinstance(x,str) for x in h['refs']):
                             raise Missing('malformed hypothesis candidate')
                         if not h['refs'] or not set(h['refs'])<=set(refs): raise Missing('hypothesis must cite allowed refs')
-                        kept.append(self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600)},h['refs'],origin='qwen_idle_hypothesis')['id'])
+                        # It rests on everything its prompt showed, whatever it cites: it may quote a passage it does not
+                        # cite, so revocation and privacy follow every ref of that prompt, its citations kept as such.
+                        kept.append(self.store.derive('hypothesis',{'text':text(h['text'],'hypothesis',600),'cites':sorted(set(h['refs']))},
+                                                      sorted(set(refs)),origin='qwen_idle_hypothesis')['id'])
                     except CortexError as e: rejected.append('hypothesis rejected: '+type(e).__name__)
                 st=self._model_state(); st.update(answered=asked,input=None,attempts=0); self._save_model_state(st)
         made.extend(kept); errors.extend(rejected); return True

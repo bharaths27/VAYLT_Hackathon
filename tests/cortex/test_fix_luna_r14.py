@@ -147,3 +147,27 @@ def test_an_operation_purged_while_it_runs_stops_before_its_next_step(tmp_path,a
     assert not b.store.rows("SELECT 1 FROM operation_event WHERE episode_id=? AND op='speak'",(p['operation_id'],))   # was: journalled
     for name,row in dump(s): assert 'zqxmarker' not in row,(name,row)
     b.close()
+
+
+# P1-2 (class B): an idle hypothesis rests on everything its prompt showed, whatever the model cited. Revoking a source it
+# was shown (and may quote) withdraws it, and an operator's episode in that prompt keeps it that operator's.
+from .test_fix_learn_dream import Stub,idle_brain
+
+def test_an_idle_hypothesis_rests_on_its_whole_prompt_not_on_its_citations(arena,clock):
+    b=idle_brain(arena,clock)
+    quoted=b.store.teach('Note','The zqxsecret cabinet code is kept with Sample A.',owner='alice')['source_id']
+    cited=b.store.teach('Note','Sample B is usually at the bench.',owner='bob')['source_id']
+    p=b.command('Go to the shelf b',principal='alice');approve(b,p,'alice')          # her episode enters the dream prompt
+    def make(bundle):
+        assert 'source:'+quoted in bundle['allowed_refs'] and any('zqxsecret' in c['text'] for c in bundle['source_passages'])
+        return [{'text':'The zqxsecret code may matter.','refs':['source:'+cited]}]  # quotes one source, cites another
+    b.dreamer.qwen=Stub(make)
+    assert b.dreamer.cycle(force=True)['status']=='complete'
+    h=b.store.one("SELECT id,refs_json,payload_json FROM cx_derived WHERE kind='hypothesis'");refs=json.loads(h['refs_json'])
+    assert 'source:'+quoted in refs and 'episode:'+p['operation_id'] in refs,refs    # was: only what it cited
+    assert json.loads(h['payload_json'])['cites']==['source:'+cited]
+    shown=lambda who:[d['id'] for d in b.store.derived() if b.store.visible(d['refs'],who)]
+    assert h['id'] in shown('alice') and h['id'] not in shown('bob')                 # was: shown to Bob too
+    b.store.revoke_source(quoted)
+    assert b.store.derived(h['id'])['status']=='STALE'                               # was: still a candidate
+    b.close()
