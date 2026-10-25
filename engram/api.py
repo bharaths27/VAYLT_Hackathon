@@ -55,7 +55,9 @@ class QueryIn(BaseModel):
 
 
 class CommandIn(BaseModel):
-    text: str = Field(min_length=1, max_length=500)
+    # May be empty: nothing heard is a misheard command, which is answered "... Please clarify." and stops a
+    # running plan (Engine.command), so a voice client sends even an empty transcript.
+    text: str = Field(max_length=500)
     who: str = "user"
 
 
@@ -206,6 +208,12 @@ def create_app(engine: Engine | None = None) -> FastAPI:
     def operations_pending() -> list[dict[str, Any]]:
         """Plans waiting for approval that the iPad did not ask for (gestures, fired triggers)."""
         return engine.pending()
+
+    @app.get("/operations/running")
+    def operations_running() -> list[dict[str, Any]]:
+        """Approved plans executing now. The console reads it to apply the stop-and-clarify rule to a command
+        it answers itself (a misheard one), whoever started the plan."""
+        return engine.running()
 
     @app.post("/operations/{operation_id}/approve")
     def approve(operation_id: str, body: ApproveIn) -> dict[str, Any]:

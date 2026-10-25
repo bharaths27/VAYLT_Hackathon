@@ -270,10 +270,64 @@ class Command(BaseModel):
     source: str = "typed"   # typed | voice | prospective
 
 
+def _running_ops() -> list:
+    """Operations approved or executing here: the console's own, and the brain's that the console approved."""
+    return [op for op in engine.ops.values() if op.status in ("APPROVED", "EXECUTING")]
+
+
+async def _task_running() -> bool:
+    """Is a task running? One of _running_ops(), or, with the brain bridge on, a plan the brain is executing,
+    whoever started it. When the brain cannot say, one is assumed: a needless stop costs one Clear Stop."""
+    if _running_ops():
+        return True
+    if not brain.enabled():
+        return False
+    try:
+        return bool(await brain.running())
+    except Exception as e:  # noqa: BLE001
+        await best_effort(lambda: bus.emit("log", level="warn", msg=f"brain running state unknown ({e}): treated as running"))
+        return True
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    return text + "." if text and text[-1] not in ".?!" else text
+
+
+def clarify_reply(reason: str, stopped: bool) -> str:
+    """Carter's rule, in words: "I stopped. <reason> Please clarify.", or "<reason> Please clarify." when nothing was
+    running (the same wording as engram.engine.clarify_reply)."""
+    reason = _sentence(reason)
+    return ("I stopped. " if stopped else "") + (reason + " " if reason else "") + "Please clarify."
+
+
+async def _clarify(out: dict, reason: str, source: str, running: bool | None = None) -> dict:
+    """Carter's rule (16:3xZ): "ambiguous or misheard command: we stop the task and ask user to please clarify."
+    A task that is running is stopped with the latching stop a stop word uses (engine.stop: Clear Stop is needed
+    to move again, and nothing resumes on its own); with nothing running nothing is stopped, so a cough latches
+    nothing. `out` becomes the clarification: kind "clarify", the spoken reply, and whether it stopped.
+    running: already known (the brain stopped its own plan), or None to check now."""
+    if running is None:
+        running = await _task_running()
+    out.update(kind="clarify", stopped=running)
+    if running:
+        res = await engine.stop(by=f"clarify:{source}")
+        unconfirmed = stop_unconfirmed(res, engine.robot)
+        out.update(robot=res, stop_confirmed=not unconfirmed)
+        if unconfirmed:  # as a stop word's answer does: the latch holds, but the robot may still be moving
+            out["reply"] = ("I could not confirm the robot stopped. Cut the motor power. "
+                            + clarify_reply(reason, False))
+            return out
+    out["reply"] = clarify_reply(reason, running)
+    return out
+
+
 async def handle_command(text: str, source: str) -> dict:
     t0 = time.time()
     if is_stop(text):  # first: not even the "heard" telemetry may delay or skip a stop
         return await _stop_command(text, source, t0)
+    if voice.no_speech(text):  # nothing heard but noise: misheard, known at once, so it too acts before telemetry
+        return await _misheard_command(text, source, t0)
     await bus.emit("heard", text=text, source=source)
     ledger.append("command", text=text, source=source)
     if brain.enabled():
@@ -297,14 +351,21 @@ async def handle_command(text: str, source: str) -> dict:
         planner_calls = 1
         r.trace.append(why)
         if plan:
-            r.kind, r.plan, r.quip = "plan", plan, quip("plan")
+            r.kind, r.plan, r.quip, r.classification = "plan", plan, quip("plan"), "understood"
         else:
             r.reason = why
     metrics = {"memory_ms": memory_ms, "parse_ms": parse_ms, "planner_calls": planner_calls,
                "plan_ms": int((time.time() - t0) * 1000)}
     out = {"kind": r.kind, "reason": r.reason, "quip": r.quip, "trace": r.trace, "data": r.data, "metrics": metrics}
+    # A result that does not act follows Carter's rule unless the parser states it was understood (a refusal: unsafe,
+    # a limit, "don't", a plan that failed validation, a request that cannot be scheduled as said). Whatever does
+    # not say so is unclear: the parser asks, nothing it knows matched and no model plan came of it, or nothing was
+    # heard. Stated, never worked out from the kind or the words.
+    unclear = r.kind not in ("plan", "rule", "prospective", "stop") and r.classification != "understood"
 
-    if r.kind == "stop":
+    if unclear:
+        await _clarify(out, r.short or r.reason, source)
+    elif r.kind == "stop":
         await engine.stop(by=f"command:{source}")
     elif r.kind == "rule":
         res = await memory.add_rule(r.data["rule_text"])
@@ -322,10 +383,29 @@ async def handle_command(text: str, source: str) -> dict:
         op = Operation(r.plan, source, text, bundle, metrics, r.trace)
         await engine.stage(op)
         out["operation"] = op.public()
-    ledger.append("parse", text=text, result_kind=r.kind, reason=r.reason, trace=r.trace, metrics=metrics)
+    ledger.append("parse", text=text, result_kind=out["kind"], reason=r.reason, trace=r.trace, metrics=metrics)
     await bus.emit("parsed", **{k: v for k, v in out.items() if k != "operation"})
-    if r.quip:
+    if unclear:
+        await bus.emit("say", text=out["reply"])
+    elif r.kind == "clarify":  # understood, refused as said: its reason, and nothing is stopped
+        await bus.emit("say", text=_sentence(r.short or r.reason))
+    elif r.quip:
         await bus.emit("say", text=r.quip if r.kind != "abstain" else f"{r.quip} {r.reason}.")
+    return out
+
+
+async def _misheard_command(text: str, source: str, t0: float) -> dict:
+    """Nothing was heard but noise (an empty transcript, or only whisper's markers): misheard, so Carter's rule.
+    As for a stop word, the stop (if a task is running) comes first and the telemetry after it, best effort."""
+    out = {"kind": "clarify", "reason": "I didn't catch that.", "quip": "", "trace": ["misheard: no words in it"],
+           "data": {}, "metrics": {"plan_ms": int((time.time() - t0) * 1000), "planner_calls": 0}}
+    await _clarify(out, out["reason"], source)
+    await best_effort(lambda: ledger.append("command", text=text, source=source),
+                      lambda: ledger.append("parse", text=text, result_kind="clarify", reason=out["reason"],
+                                            trace=out["trace"], metrics=out["metrics"]),
+                      lambda: bus.emit("heard", text=text, source=source),
+                      lambda: bus.emit("parsed", **out),
+                      lambda: bus.emit("say", text=out["reply"]))
     return out
 
 
@@ -361,6 +441,15 @@ async def _fire_later(task: dict, delay: float):
     await handle_command(task["text"], "prospective")
 
 
+_declined_brain_plans: set[str] = set()  # brain plans a command's reply did not state understood
+
+
+def _brain_understood(p: dict) -> bool:
+    """Did the brain state that it understood this proposal? Only when it says so both ways it can: classification
+    "understood" and needs_clarification false. A missing or contradictory field counts as unclear."""
+    return p.get("classification") == "understood" and p.get("needs_clarification") is False
+
+
 async def _brain_command(text: str, source: str, t0: float) -> dict:
     """EC08: Bharath's brain plans; the console shows it and relays the human approval."""
     try:
@@ -375,12 +464,26 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
         await bus.emit("bundle", bundle=brain.to_bundle(p["memory"]), memory_ms=0)
     kind = p.get("kind")
     out = {"kind": kind, "brain": p, "metrics": metrics}
-    if kind == "proposal" and p.get("status") == "proposed" and p.get("digest"):
+    if kind == "proposal" and not _brain_understood(p):
+        # Unclear or misheard (an unknown object, a time that did not parse, nothing heard): Carter's rule. It is
+        # checked for every proposal before anything is staged: a plan the brain does not state it understood is
+        # never staged, and a refusal it does not state it understood is not an understood refusal.
+        reason = p.get("reason") or "I'm not sure what you meant."
+        out["reason"] = reason
+        if p.get("operation_id") and p.get("digest"):  # a plan declined here is not staged later from the pending list
+            _declined_brain_plans.add(p["operation_id"])
+        await _clarify(out, reason, source, running=True if p.get("stopped") is True else None)
+        trace = [f"brain: {p.get('status')}", f"brain: classification {p.get('classification')!r}, needs_clarification "
+                 f"{p.get('needs_clarification')!r}: not stated understood, so unclear"]
+        await bus.emit("parsed", kind="clarify", reason=reason, quip="", trace=trace, data={}, metrics=metrics,
+                       stopped=out["stopped"])
+        await bus.emit("say", text=out["reply"])
+    elif kind == "proposal" and p.get("status") == "proposed" and p.get("digest"):
         op = brain.RemoteOperation(p, text, source, metrics)
         await engine.stage(op)
         out["kind"], out["operation"] = "plan", op.public()
         await bus.emit("say", text="Here's my plan. Hold to approve.")
-    elif kind == "proposal":
+    elif kind == "proposal":  # understood and refused (a prohibited action, "don't"): unchanged
         reason = p.get("reason") or p.get("status") or "refused"
         out.update(kind="abstain", reason=reason)
         await bus.emit("parsed", kind="abstain", reason=reason, quip="", trace=[f"brain: {p.get('status')}"], data={}, metrics=metrics)
@@ -399,17 +502,23 @@ async def _brain_command(text: str, source: str, t0: float) -> dict:
     return out
 
 
+async def _stage_brain_pending() -> None:
+    """Show each new plan the brain lists as waiting (gestures, fired triggers) for approval. Not one the console
+    declined when a command's reply brought it: the brain did not state it understood it, so it is never staged."""
+    for p in await brain.pending():
+        oid = p.get("operation_id")
+        if oid and oid not in engine.ops and oid not in _declined_brain_plans and p.get("digest"):
+            try:
+                await engine.stage(brain.RemoteOperation(p, (p.get("plan") or {}).get("goal", ""), "brain", {}))
+                await bus.emit("say", text="A new plan is waiting for your approval.")
+            except Exception as e:  # noqa: BLE001
+                await bus.emit("log", level="warn", msg=f"pending plan not shown: {e}")
+
+
 async def _brain_pending_loop():
     """Plans the brain made on its own (gestures, fired triggers) also show up for approval."""
     while True:
-        for p in await brain.pending():
-            oid = p.get("operation_id")
-            if oid and oid not in engine.ops and p.get("digest"):
-                try:
-                    await engine.stage(brain.RemoteOperation(p, (p.get("plan") or {}).get("goal", ""), "brain", {}))
-                    await bus.emit("say", text="A new plan is waiting for your approval.")
-                except Exception as e:  # noqa: BLE001
-                    await bus.emit("log", level="warn", msg=f"pending plan not shown: {e}")
+        await _stage_brain_pending()
         await asyncio.sleep(2)
 
 
@@ -555,7 +664,15 @@ async def stt(request: Request):
     """Multipart form: audio (the clip) and auto ("1": run it as a command). Room in the STT
     queue is reserved BEFORE any of the upload is parsed or read, for the declared length (or
     the queue's byte limit when none is declared): a full queue answers 503 busy, unread. The
-    clip is then read bounded by that reservation, which is trimmed to its real size."""
+    clip is then read bounded by that reservation, which is trimmed to its real size.
+
+    A clip that was transcribed but has no words in it (an empty transcript, or only whisper's
+    noise markers) is a misheard command: speech was detected, since the iPad sends only what was
+    recorded while the mic was held. It is answered like any command, with "misheard": true, so
+    Carter's rule applies (a running task stops, and the reply asks to clarify): run here with
+    auto=1; with auto=0 the iPad runs the transcript through /commands as usual, and /stt itself
+    still broadcasts nothing. Only a transcription that failed (busy, STT missing, whisper or ffmpeg
+    failed) is a 503, as before."""
     limit = config.STT_MAX_PENDING_BYTES
     declared = _declared_length(request.headers.get("content-length"))
     try:
@@ -589,9 +706,11 @@ async def stt(request: Request):
             text, why = await voice.transcribe(data, suffix, reservation=reservation)
         finally:
             del data  # the queue released its byte reservation: the handler must not keep the clip either
-    if not text:
+    if text is None:  # the transcription failed: nothing was heard wrong, it was not heard at all
         return JSONResponse({"ok": False, "reason": why}, status_code=503)
     res = {"ok": True, "text": text}
+    if voice.no_speech(text):
+        res["misheard"] = True
     if auto == "1":
         res["result"] = await handle_command(text, "voice")
     return res

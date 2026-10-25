@@ -75,10 +75,11 @@ request -> memory bundle (sources, objects, rules, past lessons)
 | POST | /memory/sources | Teach a document; returns rules found, with citations |
 | POST | /memory/query | Memory bundle for a goal |
 | GET | /memory/objects | Where each tagged object was last seen |
-| POST | /commands | Typed or spoken command: "remember ...", "when X, Y", or a task |
+| POST | /commands | Typed or spoken command: "remember ...", "when X, Y", or a task. An unclear or misheard one stops a running plan and asks: "I stopped. ... Please clarify." Every result states `classification` (`understood`, `unclear` or `misheard`), and a proposal also `needs_clarification`; the console stages a plan only when both say understood. |
 | POST | /plan | Plan only |
 | POST | /plan/rest | Propose "return to rest" (drive home); needs approval |
 | GET | /operations/pending | Plans waiting for approval, including ones from gestures and fired triggers |
+| GET | /operations/running | Approved plans executing now |
 | POST | /operations/{id}/approve | Approve the exact plan digest and run it |
 | POST | /stop | Stop now |
 | GET | /robot/state | Robot state |

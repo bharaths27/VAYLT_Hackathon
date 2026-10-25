@@ -152,11 +152,15 @@ In your browser go to **http://127.0.0.1:8000** (tested here with Chrome on Wind
   under the box then shows what the console received.
 - Ignore the grey example in the box and the round quick buttons under it ("prep the bench for calibration",
   "bring the blue block to zone A", and so on). They belong to the console's own demo and the brain answers them
-  with "I don't know which object you mean".
+  with "I don't know which object you mean. Please clarify."
 - **Approve = press and hold** the orange **HOLD TO APPROVE** button for about a second, until it fills. A quick
   click does nothing. You have 90 seconds (the countdown circle), then the plan expires.
 - **STOP** is the red button at the bottom right (or press **Esc** twice). To carry on afterwards, click
   **CLEAR E-STOP** at the top.
+- **An unclear or misheard command stops a running plan.** If a plan is running and the console cannot tell what
+  you meant (T4 below), or the mic heard nothing but noise, it stops the robot exactly as STOP does and says
+  "I stopped. <why> Please clarify." Click **CLEAR E-STOP**, then say it again. With nothing running it only
+  asks ("<why> Please clarify.") and nothing is latched. A clear refusal (T3) never stops anything.
 - **Answers are spoken, not written.** The console reads its replies aloud with your computer's voice, so turn
   your sound on. (Not tested here: the test browser had no sound.) If you also want to read them: click
   **Simple** at the top right (it changes to **Expert**) and zoom the browser out (Ctrl and minus on Windows, Cmd
@@ -176,7 +180,7 @@ came back in well under a second here (10 to 40 ms).
 | T1 | `Open the gripper.` | Plan panel: "Waiting for your approval.", **Open the gripper.**, PENDING APPROVAL, one step **Release** (Gripper open). ("Missing evidence: no source found for this request" in the **Before you approve** box is normal.) Hold **HOLD TO APPROVE**: a green **VERIFIED** banner, the step shows **SUCCEEDED** and the panel says "Done." (pretend robot). |
 | T2 | `Stop.` | No plan. A red **E-STOP** banner ("all motion halted · pending plans cancelled"), a red frame, **Robot Stopped** at the top and a **CLEAR E-STOP** button. Click it: "E-STOP cleared. Re-issue commands to continue." |
 | T3 | `Don't open the claw.` | No plan. Plan panel: "I won't do that. You said 'don't', so I will not move anything. To make it a rule, say 'Remember that ...'. Nothing was planned, and nothing moved." |
-| T4 | `Open the claw in two days.` | No plan. "I won't do that" with "I don't know which object you mean. Can you name it?" (The runbook's other wording, `Open the claw after calibration finishes.`, gives "That sounds like something to do later ('after'), so I will not move now. Say it as 'When <event>, <task>' and I will schedule it.") |
+| T4 | `Open the claw in two days.` | No plan. "I need a bit more" with "I don't know which object you mean." It says out loud "I don't know which object you mean. Please clarify." Nothing was running, so nothing is stopped. (The runbook's other wording, `Open the claw after calibration finishes.`, gives "That sounds like something to do later ('after'), so I will not move now. Say it as 'When <event>, <task>' and I will schedule it.", also followed by "Please clarify.") |
 | T5 | `Can the beaker go in the drying oven?` | No plan. It says out loud "I have no record of that." **The Plan panel does not change**: it still shows the previous command's result. HEARD shows your question. (Answers are spoken only, see section 8.) |
 | T6 | `Remember that safety goggles must be at the bench before handling Sample B.` | An orange **RULE LEARNED** banner ("cited as src_... · no retraining"), and it says "Got it. I saved that as a new source." |
 | T7 | `Bring Sample B to the bench.` | A plan waiting for approval: first **Look**, **Grab** and **Drive** for `object_id=goggles` to `zone=bench`, then the same three for `sample_b`, then a "Say it out loud" step. **Why: rules it found** shows your goggles rule. You don't need to approve it. |

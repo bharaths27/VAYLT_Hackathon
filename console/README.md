@@ -50,7 +50,9 @@ python3 scripts/smoke.py      # live end-to-end run against a running console
 
 ## Safety rules built in
 - Only 10 allowlisted moves, each with hard limits (max 50 cm drive, max 180° turn). Anything else is refused.
-- Unsafe or unclear requests are refused or answered with a question. No plan is made.
+- Unsafe requests are refused. Unclear or misheard ones are answered with a question that ends "Please clarify.";
+  if a task is running, it is stopped first, latched like STOP ("I stopped. ... Please clarify."), and it never
+  resumes on its own. With nothing running, nothing is stopped. No plan is made either way.
 - Approval is a 0.8 second hold, tied to a fingerprint (digest) of the exact plan shown, and it expires.
 - The console checks LiDAR before every forward move, on top of Brian's own veto.
 - Success is only shown when a sensor confirms it, or when you confirm it. A timeout is never retried.

@@ -52,6 +52,9 @@ BRAIN_URL = _env("ENGRAM_BRAIN_URL", "off")
 # "could not confirm what the robot did" while the robot was still moving.
 BRAIN_PLAN_TIMEOUT_S = _seconds("ENGRAM_BRAIN_PLAN_TIMEOUT_S", 90.0, 600.0)
 BRAIN_RUN_TIMEOUT_S = _seconds("ENGRAM_BRAIN_RUN_TIMEOUT_S", 600.0, 3600.0)
+# Asking the brain whether a plan is running, before a misheard or unclear command stops it: a stop may be waiting
+# on the answer, so this is short; no answer in time counts as "running".
+BRAIN_QUICK_TIMEOUT_S = 2.0
 # Where Deniz's metrics / dream compiler lives. "off" = skip.
 METRICS_URL = _env("ENGRAM_METRICS_URL", "off")
 

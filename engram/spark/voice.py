@@ -17,10 +17,14 @@ The SpeculationGate enforces these rules:
    answer is the final's answer. A final whose text differs is asked again: more words can
    change the meaning.
 5. A final that negates ("don't"), defers ("after calibration finishes") or corrects ("no,
-   I mean") never becomes an immediate action. Negation and correction mean no action; a
-   deferral becomes a "When <event>, <task>" commitment for the existing prospective path, or
-   a request to rephrase. Local word checks and the model's flags are combined, and either one
-   is enough to block.
+   I mean") never becomes an immediate action. Negation means no action; a correction asks to
+   clarify; a deferral becomes a "When <event>, <task>" commitment for the existing prospective
+   path, or a request to rephrase. Local word checks and the model's flags are combined, and
+   either one is enough to block. Every final that does not act names its cause (GateResult.cause).
+   A command that was ambiguous or misheard (RULE_CAUSES: nothing caught, a correction, no answer
+   from the model) is one VoiceIntegration stops a running task for and asks to clarify; its
+   reason is a short statement, and the caller adds the rest. A final that memory moved past, or
+   that took too long, is understood: it is asked again and stops nothing.
 6. STOP words are detected locally and returned at once, for partials and finals, without
    asking the intent model. A false stop is safe; a missed one is not. A stop also voids all
    speculation: the prediction, the pending partial and any answer still in flight are
@@ -127,6 +131,17 @@ class GateResult:
     bundle: Any = None
     commitment: str | None = None   # "When <event>, <task>" for action == "schedule"
     reused: bool = False
+    # Why a final does not act. RULE_CAUSES are Carter's rule (a running task stops, and the reply asks to
+    # clarify); every other cause keeps its own reply. misheard: the words were not caught (nothing heard,
+    # audio that overflowed). ambiguous: what was meant is not clear (a correction, "later" with no event to
+    # wait for, no usable answer from the intent model). memory_changed / expired: understood, but memory moved
+    # on, or it took too long, while it was worked out: said again, nothing stopped. negated, not_a_preset:
+    # understood and declined. Ignored, and every one names why: superseded (a newer utterance), stopped,
+    # rejected (by reject()), already_final (a second final), out_of_order (an older revision).
+    cause: str = ""
+
+
+RULE_CAUSES = ("ambiguous", "misheard")
 
 
 @dataclass
@@ -247,7 +262,7 @@ class SpeculationGate:
             self._ctx_now = ctx
             why = self._observe(utterance, revision, text)
             if why:
-                return GateResult("ignored", utterance, revision, text, reason=why)
+                return GateResult("ignored", utterance, revision, text, reason=why[0], cause=why[1])
             if not text or (self._pred and self._valid(self._pred.key)) or \
                     (self._in_flight and self._current(self._in_flight)):
                 action = "unchanged"
@@ -274,22 +289,26 @@ class SpeculationGate:
         with self._cv:
             why = self._observe(utterance, revision, text)
             if why:
-                return GateResult("ignored", utterance, revision, text, reason=why)
+                return GateResult("ignored", utterance, revision, text, reason=why[0], cause=why[1])
             self._final, self._pending = True, None
             # Single flight: wait for the request already out. If it is about this same text, reuse its answer.
             while self._in_flight is not None and self._utt == utterance and not self._is_stopped(utterance):
                 left = deadline - time.monotonic()
                 if left <= 0:
                     return GateResult("clarify", utterance, revision, text,
-                                      reason="The intent model did not answer in time. Please say it again.")
+                                      reason="The intent model did not answer in time.", cause="ambiguous")
                 self._cv.wait(left)
         ctx = self._context()   # on the caller's thread, with the lock released
         with self._cv:
             self._ctx_now = ctx
-            if self._utt != utterance or self._is_stopped(utterance):
-                return GateResult("ignored", utterance, revision, text, reason="stopped or superseded")
+            if self._utt != utterance:
+                return GateResult("ignored", utterance, revision, text, reason="superseded", cause="superseded")
+            if self._is_stopped(utterance):
+                return GateResult("ignored", utterance, revision, text, reason=self._void_why(utterance),
+                                  cause=self._void_why(utterance))
             if not text:
-                return GateResult("none", utterance, revision, text, reason="I didn't catch anything.")
+                return GateResult("clarify", utterance, revision, text, reason="I didn't catch anything.",
+                                  cause="misheard")
             # A still-valid prediction for exactly this text is the final's answer (the intent client asks the
             # same question for a partial and a final), so it is reused as it is, actionable or not.
             pred = self._pred if self._pred and self._current(self._pred.key) else None
@@ -310,8 +329,8 @@ class SpeculationGate:
             if nxt is not None:
                 self._spawn(lambda: self._run(nxt))
             if decision is None:
-                return GateResult("clarify", utterance, revision, text,
-                                  reason="I could not work out what you meant. Please say it again.")
+                return GateResult("clarify", utterance, revision, text, reason="I could not work out what you meant.",
+                                  cause="ambiguous")
         # After every wait (the model above, the prefetch below), go on only if nothing moved on meanwhile:
         # a final that a stop, a newer utterance or new memory has already voided prefetches nothing.
         void = self._void_final(key, utterance, revision, text)
@@ -329,15 +348,17 @@ class SpeculationGate:
         with self._cv:
             self._ctx_now = ctx
             if self._is_stopped(utterance):
-                return GateResult("ignored", utterance, revision, text, reason=self._void_why(utterance))
+                return GateResult("ignored", utterance, revision, text, reason=self._void_why(utterance),
+                                  cause=self._void_why(utterance))
             if not self._current(key):
                 self.stats.stale_dropped += 1
                 return GateResult("none", utterance, revision, text,
-                                  reason="Things changed while I was listening. Please say it again.")
+                                  reason="Things changed while I was listening. Please say it again.",
+                                  cause="memory_changed")
             if self._clock() >= key.expires_at:   # with _current above, this is _valid(): TTL included
                 self.stats.expired += 1
                 return GateResult("clarify", utterance, revision, text,
-                                  reason="That took too long to work out. Please say it again.")
+                                  reason="That took too long to work out. Please say it again.", cause="expired")
             return None
 
     def _read_context(self) -> None:
@@ -358,21 +379,31 @@ class SpeculationGate:
                 return p
             return None
 
-    def reject(self, utterance: int, reason: str = "I could not hear that properly. Please say it again.") -> GateResult:
+    def reject(self, utterance: int, reason: str = "I could not hear that properly.") -> GateResult:
         """This utterance, and only this one, cannot be trusted (for example, its audio overflowed the
         window): void its prediction, pending partial and in-flight answer, and refuse its later partials
-        and final. Any other utterance, a newer one in particular, is untouched; only a stop is global."""
+        and final. Any other utterance, a newer one in particular, is untouched; only a stop is global.
+
+        Says whether it took the utterance: "clarify", cause misheard, for the one being heard now (or one
+        newer than any heard yet), the only case its caller may act on (Carter's rule). One the gate had
+        already set aside is "ignored", cause superseded (a newer one has begun), stopped or rejected: the
+        caller has nothing to ask, and must stop nothing, since a task running now is not this one's."""
         with self._cv:
             self.stats.rejected += 1
-            if _valid_id(utterance):
-                self._rejected = {u for u in self._rejected if self._utt is None or u >= self._utt}
-                self._rejected.add(utterance)
-                if utterance == self._utt:
-                    self._pred = None              # an in-flight answer fails _current() when it lands
-                    if self._pending is not None and self._pending[0] == utterance:
-                        self._pending = None
-                self._cv.notify_all()
-        return GateResult("clarify", utterance, -1, "", reason=reason)
+            if not _valid_id(utterance):
+                return GateResult("ignored", utterance, -1, "", reason="not an utterance", cause="invalid")
+            aside = ("superseded" if self._utt is not None and utterance < self._utt
+                     else self._void_why(utterance) if self._is_stopped(utterance) else None)
+            self._rejected = {u for u in self._rejected if self._utt is None or u >= self._utt}
+            self._rejected.add(utterance)
+            if utterance == self._utt:
+                self._pred = None              # an in-flight answer fails _current() when it lands
+                if self._pending is not None and self._pending[0] == utterance:
+                    self._pending = None
+            self._cv.notify_all()
+        if aside:
+            return GateResult("ignored", utterance, -1, "", reason=aside, cause=aside)
+        return GateResult("clarify", utterance, -1, "", reason=reason, cause="misheard")
 
     def _latch_stop(self, utterance: Any) -> None:
         """A stop: void all speculation, and refuse further transcripts of the utterance it was heard in
@@ -393,19 +424,19 @@ class SpeculationGate:
     def _void_why(self, utterance: int) -> str:
         return "rejected" if utterance in self._rejected else "stopped"
 
-    def _observe(self, utterance: int, revision: int, text: str) -> str | None:
-        """Record a transcript revision. Returns why it was ignored, or None."""
+    def _observe(self, utterance: int, revision: int, text: str) -> tuple[str, str] | None:
+        """Record a transcript revision. Returns (why it was ignored, its cause), or None."""
         if self._utt is not None and utterance < self._utt:
-            return "older utterance"
+            return "older utterance", "superseded"
         if self._is_stopped(utterance):
-            return self._void_why(utterance)
+            return self._void_why(utterance), self._void_why(utterance)
         if utterance != self._utt:
             self._utt, self._rev, self._text, self._text_since, self._final = utterance, -1, "", -1, False
             self._pending, self._pred = None, None
         if self._final:
-            return "utterance already final"
+            return "utterance already final", "already_final"
         if revision < self._rev or (revision == self._rev and text != self._text):
-            return "older revision"
+            return "older revision", "out_of_order"
         if text != self._text:
             self._text, self._text_since = text, revision
         self._rev = revision
@@ -524,9 +555,9 @@ class SpeculationGate:
                 "reused": reused}
         negated, corrected, future = self._flags(key.text, d)
         if negated:
-            return GateResult("none", reason="You said not to, so nothing will move.", **base)
+            return GateResult("none", reason="You said not to, so nothing will move.", cause="negated", **base)
         if corrected:
-            return GateResult("none", reason="You corrected yourself, so nothing will move. Please say it again.",
+            return GateResult("clarify", reason="You corrected yourself, so nothing will move.", cause="ambiguous",
                               **base)
         ready = d.ready >= self.thresholds.ready
         if future:
@@ -535,7 +566,7 @@ class SpeculationGate:
                 return GateResult("schedule", preset=d.preset, commitment=f"When {event}, {PRESETS[d.preset].request}",
                                   **base)
             return GateResult("clarify", reason="That sounds like something for later. "
-                                                "Say it as 'When <event>, <task>'.", **base)
+                                                "Say it as 'When <event>, <task>'.", cause="ambiguous", **base)
         if not self._preset_ok(d) or not ready:
-            return GateResult("none", reason="That is not one of the voice presets.", **base)
+            return GateResult("none", reason="That is not one of the voice presets.", cause="not_a_preset", **base)
         return GateResult("propose", preset=d.preset, bundle=bundle, **base)

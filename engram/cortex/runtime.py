@@ -23,6 +23,13 @@ from .types import Conflict,CortexError,Denied,Goal,Missing,Stale,canonical,dige
 WHEN=re.compile(r'^\s*(?:when|once|after|as soon as)\s+(.+?),\s*(?:then\s+)?(.+)$',re.I)
 
 
+def taken(result: dict,classification: str) -> dict:
+    """A command result with how the request was taken, stated where the result is made: classification
+    ('understood', 'unclear' or 'misheard') and needs_clarification. The console stages a plan only when both say
+    understood, and stops a running task for anything else."""
+    return {**result,'classification':classification,'needs_clarification':classification!='understood'}
+
+
 class Brain:
     CLOCK_JUMP_S=3600.0  # a larger forward step between sweeps needs operator confirmation
     CATCHUP_MAX=2        # overdue timers woken by such a step; the rest wait for the operator
@@ -78,32 +85,34 @@ class Brain:
         request=text(request,'request',2000); principal=text(principal,'principal',100)
         with self.activity.foreground():
             low=normalize(request)
-            if low in {'stop','stop now','halt','emergency stop'}: return {'kind':'stop',**self.stop()}
+            if low in {'stop','stop now','halt','emergency stop'}: return taken({'kind':'stop',**self.stop()},'understood')
             # Cheap deterministic controls/recall precede optional cloud classification.
             if RECALL.search(request):
-                return self.store.recall(request,principal=principal)
+                return taken(self.store.recall(request,principal=principal),'understood')
             if low.startswith('remember '):
                 body=re.sub(r'^remember\s+(?:that\s+)?','',request,flags=re.I)
-                return self.store.teach('Instruction from '+principal,body,owner=principal,kind='spoken',cloud_ok=cloud_allowed)
+                return taken(self.store.teach('Instruction from '+principal,body,owner=principal,kind='spoken',cloud_ok=cloud_allowed),'understood')
             match=WHEN.match(request)
             if match and not request.rstrip().endswith('?'):
-                return self.schedule(match[1],match[2],principal=principal)
+                return taken(self.schedule(match[1],match[2],principal=principal),'understood')
             # Any other question asks memory ("what do you see" stays an observe proposal, "can you ..." an instruction).
             if asks_memory(request):
                 answer=self.store.recall(request,principal=principal)
                 if not asks_memory(request.rstrip().rstrip('?')):   # only the "?" made it a question: keep the instruction hint
                     answer['reply']='Answered as a question, so nothing was proposed; to have the robot act, say it without the question mark. '+answer['reply']
-                return answer
+                return taken(answer,'understood')
             # Advisory interpretation cannot remove qualifiers or alter the original request.
             advice=self.intent.route(request,disclosure_allowed=bool(cloud_allowed and self.store.policy.cloud_enabled))
             self.store.decision('route',advice.get('provider','local'),advice.get('model'),advice['status']=='ok',advice['status'])
             if advice['status']=='ok' and (advice['scores'].get('negated',0)>=0.5 or advice['scores'].get('ambiguous',0)>=0.8):
-                return {'kind':'proposal','status':'refused','reason':'Intent needs clarification; advisory signal is not permission.'}
+                return taken({'kind':'proposal','status':'refused','reason':'Intent needs clarification; advisory signal is not permission.'},'unclear')
+            # A goal that does not parse needs more input (NEEDS_INPUT): unclear. That includes a safety refusal, which
+            # parse_goal does not tell apart from the rest, so it errs toward the stop.
             try: goal=parse_goal(request,self.store)
-            except CortexError as e: return {'kind':'proposal','status':'refused','reason':str(e),'code':e.code}
+            except CortexError as e: return taken({'kind':'proposal','status':'refused','reason':str(e),'code':e.code},'unclear')
             alias_source=self.store.one("SELECT g.source_id FROM cx_goal g JOIN cx_source s ON s.source_id=g.source_id WHERE g.name=? AND s.status='accepted'",(normalize(request),))
             alias_refs=['source:'+alias_source['source_id']] if alias_source else []
-            return {'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,cloud_allowed=cloud_allowed)}
+            return taken({'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,cloud_allowed=cloud_allowed)},'understood')
 
     def propose(self,goal: Goal,request: str,*,principal: str,idempotency_key: str | None=None,
                 extra_refs: list[str] | None=None,cloud_allowed: bool=False,wake: tuple | None=None) -> dict:

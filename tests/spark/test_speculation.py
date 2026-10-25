@@ -2,6 +2,7 @@
 
 import re
 import threading
+import time
 
 import pytest
 
@@ -205,13 +206,14 @@ def test_negation_from_the_model_blocks_even_without_negation_words(spawn, clock
 def test_correction_words_block_even_when_the_model_is_confident(spawn, clock, text):
     fake = FakeIntent({text: decision("close_gripper", confidence=0.97, ready=0.95, correction=0.05)})
     r = make_gate(fake, spawn, clock).on_final(1, 0, text)
-    assert r.action == "none" and r.preset is None
+    assert r.action == "clarify" and r.preset is None
 
 
-def test_correction_means_no_action(spawn, clock):
+def test_a_correction_asks_to_clarify_and_never_acts(spawn, clock):
     text = "Open the claw, I mean close it"
     fake = FakeIntent({text: decision("close_gripper")})
-    assert make_gate(fake, spawn, clock).on_final(1, 0, text).action == "none"
+    r = make_gate(fake, spawn, clock).on_final(1, 0, text)
+    assert (r.action, r.preset, r.reason) == ("clarify", None, "You corrected yourself, so nothing will move.")
 
 
 @pytest.mark.parametrize("text", ["Where are the goggles?", "Open the"])
@@ -705,3 +707,139 @@ def test_pump_does_not_fetch_for_a_prediction_the_memory_has_moved_past(fake, sp
     ctx.v += 1                                                  # then the memory changes
     gate.pump()
     assert fetched == [] and gate.prepared() is None            # stale: nothing fetched for it
+
+
+# ---- a final that does not act names its cause: Carter's rule follows the cause, never the words ------------
+
+
+@pytest.mark.parametrize("text,intent,action,cause", [
+    ("", FakeIntent(), "clarify", "misheard"),                                    # nothing caught
+    ("Open the claw, I mean close it", FakeIntent(), "clarify", "ambiguous"),     # a correction
+    ("Open the claw later", FakeIntent(), "clarify", "ambiguous"),                # later, but no event to wait for
+    ("Open the claw", FakeIntent(fail=True), "clarify", "ambiguous"),             # no answer: what was meant is unknown
+    ("Open the claw, no, don't", FakeIntent(), "none", "negated"),                # understood: "don't"
+    ("Where are the goggles?", FakeIntent(), "none", "not_a_preset"),             # understood: not a preset
+], ids=["nothing caught", "a correction", "later without an event", "no answer", "said not to", "not a preset"])
+def test_a_final_that_does_not_act_names_its_cause(spawn, clock, text, intent, action, cause):
+    r = make_gate(intent, spawn, clock).on_final(1, 0, text)
+    assert (r.action, r.cause) == (action, cause), r
+
+
+def test_memory_that_changes_while_the_final_is_worked_out_is_memory_changed(spawn, clock):
+    ctx, fake = Ctx(), FakeIntent()
+
+    def classifier(text, partial):
+        ctx.v += 1                                        # memory moves on while the model answers
+        return fake(text, partial)
+
+    r = make_gate(classifier, spawn, clock, ctx=ctx).on_final(1, 0, "Open the claw")
+    assert (r.action, r.cause) == ("none", "memory_changed")
+    assert r.reason == "Things changed while I was listening. Please say it again."     # the retry, as before
+
+
+def test_a_final_that_took_too_long_is_expired_and_says_try_again(spawn, clock):
+    fake = FakeIntent()
+
+    def classifier(text, partial):
+        clock.advance(30.0)                               # past the TTL: understood, but too late to act on
+        return fake(text, partial)
+
+    r = make_gate(classifier, spawn, clock).on_final(1, 0, "Open the claw")
+    assert (r.action, r.cause) == ("clarify", "expired")
+    assert r.reason == "That took too long to work out. Please say it again."
+
+
+def test_a_final_that_waits_in_vain_for_the_model_is_ambiguous(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock, final_wait_s=0.05)
+    gate.on_partial(1, 0, "Open the claw")               # dispatched but never run
+    r = gate.on_final(1, 1, "Open the claw")
+    assert (r.action, r.cause) == ("clarify", "ambiguous")
+
+
+# ---- reject() says whether it took the utterance, so an overflow cannot stop a newer task ---------------------
+
+
+def test_reject_takes_only_an_utterance_the_gate_has_not_set_aside(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Open the claw")
+    gate.on_partial(2, 0, "Close the claw")                   # utterance 2 has begun
+    r = gate.reject(1)                                         # 1's overflow, reported late
+    assert (r.action, r.cause) == ("ignored", "superseded")
+    r = gate.reject(2)                                         # the current one: taken, and misheard
+    assert (r.action, r.cause) == ("clarify", "misheard")
+    r = gate.reject(2)                                         # taken once only
+    assert (r.action, r.cause) == ("ignored", "rejected")
+
+
+def test_reject_of_a_stopped_utterance_is_ignored(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    assert gate.on_partial(1, 0, "Open the claw, stop").action == "stop"
+    r = gate.reject(1)
+    assert (r.action, r.cause) == ("ignored", "stopped")
+
+
+def test_reject_of_an_utterance_the_gate_has_not_heard_yet_is_taken(fake, spawn, clock):
+    gate = make_gate(fake, spawn, clock)
+    gate.on_partial(1, 0, "Open the claw")
+    r = gate.reject(2)                                         # 2 overflowed before any of its partials arrived
+    assert (r.action, r.cause) == ("clarify", "misheard")
+    assert gate.on_final(2, 0, "Open the claw").action == "ignored"   # and it is still set aside
+
+
+# ---- a late final names why it was ignored ------------------------------------------------------------------
+
+
+def _late_final(gate, case):
+    if case == "stopped":
+        gate.on_partial(1, 0, "Open the claw, stop")
+        return gate.on_final(1, 1, "Open the claw")
+    if case == "rejected":
+        gate.on_partial(1, 0, "Open the claw")
+        gate.reject(1)
+        return gate.on_final(1, 1, "Open the claw")
+    if case == "superseded":
+        gate.on_partial(1, 0, "Open the claw")
+        gate.on_partial(2, 0, "Close the claw")
+        return gate.on_final(1, 1, "Open the claw")
+    if case == "already_final":
+        gate.on_final(1, 0, "Open the claw")
+        return gate.on_final(1, 1, "Open the claw")
+    gate.on_partial(1, 5, "Open the claw")                    # out_of_order: revision 3 arrives after 5
+    return gate.on_final(1, 3, "Close the claw")
+
+
+@pytest.mark.parametrize("case", ["stopped", "rejected", "superseded", "already_final", "out_of_order"])
+def test_a_late_final_names_why_it_was_ignored(fake, spawn, clock, case):
+    r = _late_final(make_gate(fake, spawn, clock), case)
+    assert (r.action, r.cause) == ("ignored", case)
+
+
+def test_a_final_whose_utterance_was_stopped_while_it_waited_names_the_stop():
+    fake = FakeIntent()
+    fake.hold()
+    gate = SpeculationGate(fake)
+    gate.on_partial(1, 0, "Open the")
+    assert fake.entered.acquire(timeout=5)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 1, "Open the claw")))
+    t.start()
+    assert gate.on_partial(1, 2, "stop").action == "stop"
+    t.join(5)
+    fake.release.set()
+    assert (out["r"].action, out["r"].cause) == ("ignored", "stopped")
+
+
+def test_a_final_superseded_while_it_waited_names_the_newer_utterance():
+    fake = FakeIntent()
+    fake.hold()
+    gate = SpeculationGate(fake)
+    gate.on_partial(1, 0, "Open the")
+    assert fake.entered.acquire(timeout=5)               # utterance 1's partial is with the model
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 1, "Open the claw")))
+    t.start()
+    time.sleep(0.05)                                     # the final waits for that answer
+    gate.on_partial(2, 0, "Close the claw")              # utterance 2 begins meanwhile
+    fake.release.set()
+    t.join(5)
+    assert (out["r"].action, out["r"].cause) == ("ignored", "superseded")

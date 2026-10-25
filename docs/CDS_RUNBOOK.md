@@ -194,7 +194,7 @@ Write down what happened for each; you will post it (section 13).
 | T1 | "Open the gripper." | A plan card with one step (open gripper). Tap **Approve** → success (mock) and a spoken reply. |
 | T2 | "Stop." | Stops immediately, no plan, status shows **stopped**. Clear it with the console's clear/re-arm control. |
 | T3 | "Don't open the claw." | Refused or a question back. **No plan.** |
-| T4 | "Open the claw in two days." / "Open the claw after calibration finishes." | It asks you to rephrase. **No plan.** |
+| T4 | "Open the claw in two days." / "Open the claw after calibration finishes." | It asks you to rephrase: "... Please clarify." **No plan.** (Said while a plan is running, it first stops the robot like STOP: "I stopped. ... Please clarify.") |
 | T5 | "Can the beaker go in the drying oven?" | An **answer** from memory (or "I have no record"). **No plan.** |
 | T6 | "Remember that safety goggles must be at the bench before handling Sample B." | "Taught" / rule saved. |
 | T7 | "Bring Sample B to the bench." | Plan moves the **goggles to the bench first**, then Sample B. (Do not approve on the real robot yet.) |

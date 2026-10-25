@@ -8,6 +8,7 @@ robot signing and execution; the console never calls the robot for these plans.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -49,8 +50,8 @@ async def _post(path: str, body: dict | None = None, timeout: float | None = Non
     return r.json()
 
 
-async def _get(path: str) -> Any:
-    r = await _c.get(URL + path)
+async def _get(path: str, timeout: float | None = None) -> Any:
+    r = await _c.get(URL + path, **({"timeout": timeout} if timeout else {}))
     r.raise_for_status()
     return r.json()
 
@@ -71,6 +72,14 @@ async def pending() -> list[dict]:
         return await _get("/operations/pending")
     except Exception:  # noqa: BLE001
         return []
+
+
+async def running() -> list[dict]:
+    """The plans the brain is executing now, whoever started them. Raises if the brain cannot say within
+    config.BRAIN_QUICK_TIMEOUT_S, whatever the transport (a stop may be waiting on the answer): the caller then
+    assumes one is running."""
+    return await asyncio.wait_for(_get("/operations/running", timeout=config.BRAIN_QUICK_TIMEOUT_S),
+                                  config.BRAIN_QUICK_TIMEOUT_S)
 
 
 async def approve(oid: str, digest: str) -> dict:
@@ -201,8 +210,11 @@ async def run(engine, op: RemoteOperation) -> None:
         else:
             s["status"] = "skipped"
     outcome = str(res.get("outcome", "unknown")).lower()
-    op.status = {"success": "VERIFIED", "failed": "FAILED", "failure": "FAILED", "stopped": "STOPPED",
-                 "refused": "FAILED"}.get(outcome, "NEEDS_VERIFICATION")
+    if outcome == "aborted" and res.get("stopped") is True:  # stopped (a stop, or Carter's rule): it did not finish
+        op.status = "STOPPED"
+    else:
+        op.status = {"success": "VERIFIED", "failed": "FAILED", "failure": "FAILED", "stopped": "STOPPED",
+                     "refused": "FAILED"}.get(outcome, "NEEDS_VERIFICATION")
     if res.get("failure"):
         op.trace.append(f"brain failure: {res.get('failure')}")
     op.metrics["exec_ms"] = int((time.time() - t0) * 1000)
