@@ -178,7 +178,7 @@ def _configured_brain()->Brain:
     qwen=QwenClient(endpoint=os.environ.get('CORTEX_LLM_URL','http://127.0.0.1:8080'),
         contract_path=os.environ.get('CORTEX_CONTRACT') or None,
         input_budget=int(os.environ.get('CORTEX_INPUT_TOKENS','2048')),
-        timeout_s=float(os.environ.get('CORTEX_LLM_TIMEOUT','30'))) if os.environ.get('CORTEX_QWEN','0')=='1' else None
+        timeout_s=float(os.environ.get('CORTEX_LLM_TIMEOUT','120'))) if os.environ.get('CORTEX_QWEN','0')=='1' else None
     return Brain(s,robot,qwen=qwen,intent=IntentAdvisor(enabled=policy.cloud_enabled))
 
 
