@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from . import vault_lock
 from .schema import migrate
-from .types import (Conflict, CortexError, Denied, Goal, Missing, Policy, Stale,
+from .types import (CONTROL_OPS, Conflict, CortexError, Denied, Goal, Missing, Policy, Stale,
                     canonical, digest, finite, normalize, text, uid)
 
 # Commitment status implied by its proposal's outcome; a settled commitment is never rewritten.
@@ -436,7 +436,9 @@ class Store:
             raise CortexError('invalid task definitions')
         for n, g in defs.items():
             text(n, 'task name', 100)
-            Goal.from_dict(g)
+            alias = Goal.from_dict(g)
+            if alias.kind == 'primitive' and alias.primitive in CONTROL_OPS:
+                raise Denied(f'a task definition cannot be the {alias.primitive} control: STOP has its own path, never a task')
         sid, cid, t = uid('src'), uid('chk'), self.clock()
         # A source may add a constraint or retire the one it revises; a commitment adds none (and is scheduled from inside
         # the caller's transaction).

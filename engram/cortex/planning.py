@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .store import Store
-from .types import Conflict, CortexError, Goal, Missing, Policy, canonical, digest, finite, normalize
+from .types import CONTROL_OPS, Conflict, CortexError, Denied, Goal, Missing, Policy, canonical, digest, finite, normalize
 
 NEGATED = re.compile(r"\b(do not|don't|dont|never|no need to|must not|mustn't|not now|stop moving|cancel|cancell?ed|never ?mind|scratch that|forget (?:it|that)|hold on|hold off|wait|undo|abort)\b", re.I)
 FUTURE = re.compile(r'\b(when|once|after|until|later|tomorrow|tonight|in\s+\d+\s+(?:seconds?|minutes?|hours?))\b', re.I)
@@ -35,11 +35,12 @@ PHYSICAL = set(CAPS) - {'stop','observe','locate_tag','speak'}
 NAVIGATION = {'go_to_zone','drive_bounded','turn_bounded','approach_tag'}
 # Ops that act on whatever the claw holds.
 CLAW = {'gripper_open','gripper_close'}
-# The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table).
+# The ONLY ops a plan for each goal kind may contain (the model's JSON schema uses the same table). A control op
+# (CONTROL_OPS) is none of them: a primitive goal naming one allows no step at all.
 GOAL_OPS = {'fetch':('observe','locate_tag','pick_tagged_object','place_at_zone'),'goto':('go_to_zone',),'inspect':('observe','locate_tag')}
 def goal_ops(goal: dict | Goal | None) -> tuple[str, ...]:
     g=goal.to_dict() if isinstance(goal,Goal) else goal or {}
-    return (g.get('primitive'),) if g.get('kind')=='primitive' and g.get('primitive') in CAPS else GOAL_OPS.get(g.get('kind'),())
+    return (g.get('primitive'),) if g.get('kind')=='primitive' and g.get('primitive') in set(CAPS)-CONTROL_OPS else GOAL_OPS.get(g.get('kind'),())
 
 # Grammar: refuse by default. Anything below means the utterance says more than "move X to Y".
 QUESTION = re.compile(r"\?\s*$|^\s*(?:should|shall|do|does|did|is|are|was|were|am|may|might|must|what|why|how|which|who|whose|whether|where|when|(?:can|could|would|will)\s+(?:i|we)\b)\b", re.I)
@@ -127,6 +128,8 @@ def parse_goal(request: str, store: Store) -> Goal:
 def validate_step(step: Any, object_ids: set[str], zones: set[str]) -> None:
     if not isinstance(step,dict) or set(step)!={'op','args'} or step.get('op') not in CAPS:
         raise CortexError('step must contain an allowlisted op and args')
+    # Checked for every plan (composed, a stored procedure, a model's) and again at dispatch.
+    if step['op'] in CONTROL_OPS: raise Denied(f"{step['op']} is a control action, never a plan step: use the STOP control")
     op,args=step['op'],step['args']
     if not isinstance(args,dict) or set(args)!=set(CAPS[op]): raise CortexError('wrong primitive argument names')
     for key,want in CAPS[op].items():
@@ -312,7 +315,10 @@ class Compiler:
 
     def refuse(self, goal: Goal, f: dict, rules: list[dict]) -> None:
         """Raise the refusal current memory sets for this goal in this world: an unresolved statement or a prohibition on
-        what it involves or handles (a claw primitive handles the held object), or conflicting applicable rules."""
+        what it involves or handles (a claw primitive handles the held object), or conflicting applicable rules. A control
+        action is no goal at all: it has its own path (Brain.stop)."""
+        if goal.kind=='primitive' and goal.primitive in CONTROL_OPS:
+            raise Denied(f'{goal.primitive} is a control action, not a goal: use the STOP control (POST /stop, or say "stop")')
         held=self.held(goal,f); handles=goal.kind=='fetch' or bool(held)
         if self.store.unresolved_for(self.store.scope(goal,rules)|held,handles=handles):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
         if self.store.prohibitions(set(goal.targets)|{r['object'] for r in rules}|held) and handles: raise DeniedPlan('current source prohibits moving an involved object')

@@ -147,4 +147,10 @@ class Policy:
         return digest(asdict(self))
 
 
+# Robot operations with a dedicated control path, never a goal or a plan step. STOP is Brain.stop: the in-memory and durable
+# latch, the STOP count, the revocation of every pending proposal, and the adapter's own stop. Run as an ordinary step it
+# would stop the robot with none of that, leaving a pending motion usable after a reset or a restart.
+CONTROL_OPS = frozenset({'stop'})
+
+
 MEMORY_KINDS = ("working", "semantic", "episodic", "procedural", "external", "parametric", "prospective")
