@@ -33,13 +33,18 @@ FAIL_CLOSED=[
     ('Everything may be moved if approved.',{'*'}),
     ('Nothing is safe to move today.',{'*'}),
     ('Lunch is served daily except Sunday.',{'*'}),
+    # only the conditional catches these (no hazard, permission or deontic word)
+    ('Sample A goes to the bench if it is clean.',{'sample_a','bench'}),
+    ('Provided it is dry, Sample B goes on shelf B.',{'sample_b','shelf_b'}),
+    ('The tray is used for transport if the bench is busy.',{'tray','bench'}),
 ]
 @pytest.mark.parametrize('sentence,scope',FAIL_CLOSED)
 def test_conditional_hazard_and_permission_wording_fails_closed(store,sentence,scope):
     x=store.teach('Note',sentence,owner='carther')
     mentions=set().union(*[set(json.loads(r['mentions_json'])) for r in store.rows('SELECT mentions_json FROM cx_unresolved WHERE source_id=?',(x['source_id'],))])
     assert x['unresolved_rules'] and scope<=mentions,(sentence,mentions)
-    goal=Goal('goto',zone='shelf_b') if 'shelf_b' in scope else Goal('fetch',(next(iter(sorted(scope-{'*'})),'sample_a'),),'bench')
+    objs=sorted(scope&{'sample_a','sample_b','goggles','tray'})
+    goal=Goal('goto',zone='shelf_b') if 'shelf_b' in scope else Goal('fetch',(objs[0] if objs else 'sample_a',),'bench')
     with pytest.raises(Missing,match='structured review'): Compiler(store).compile(goal)
 
 @pytest.mark.parametrize('sentence',['Sample A is stored in fridge 2.','The tray is on the bench.','Lena prefers labels in blue ink.',
