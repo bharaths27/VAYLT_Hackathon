@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS cx_station(id TEXT PRIMARY KEY,name TEXT NOT NULL,ali
 CREATE TABLE IF NOT EXISTS cx_goal(name TEXT PRIMARY KEY,goal_json TEXT NOT NULL,source_id TEXT NOT NULL REFERENCES source(id),version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_derived(id TEXT PRIMARY KEY,kind TEXT NOT NULL,status TEXT NOT NULL,payload_json TEXT NOT NULL,refs_json TEXT NOT NULL,basis_hash TEXT NOT NULL,fingerprint TEXT UNIQUE NOT NULL,origin TEXT NOT NULL,verifier TEXT,created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS cx_episode(id TEXT PRIMARY KEY REFERENCES episode(id),mode TEXT NOT NULL,goal_json TEXT NOT NULL,basis_hash TEXT NOT NULL,policy_hash TEXT NOT NULL,initial_json TEXT NOT NULL,request_key TEXT UNIQUE,input_hash TEXT NOT NULL,expires_at REAL NOT NULL,owner TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cx_episode_source(episode_id TEXT NOT NULL REFERENCES episode(id),source_id TEXT NOT NULL REFERENCES source(id),PRIMARY KEY(episode_id,source_id));
 CREATE TABLE IF NOT EXISTS cx_skill(id TEXT PRIMARY KEY REFERENCES skill_version(id),goal_key TEXT NOT NULL,basis_hash TEXT NOT NULL,policy_hash TEXT NOT NULL,validation_json TEXT,mode TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS cx_skill_goal ON cx_skill(goal_key);
 CREATE TABLE IF NOT EXISTS cx_commitment(id TEXT PRIMARY KEY REFERENCES prospective_task(id),owner TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 1,expires_at REAL,source_revision INTEGER NOT NULL DEFAULT 1);

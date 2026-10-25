@@ -14,7 +14,7 @@ from typing import Any
 
 from .learning import Activity,Dreamer,Skills
 from .models import IntentAdvisor,QwenClient,ModelUnavailable
-from .planning import CAPS,PHYSICAL,RECALL,STOP_WORDS,Compiler,asks_memory,parse_goal,safety_reason,validate_step,verify
+from .planning import CAPS,PHYSICAL,RECALL,STOP_WORDS,Compiler,CompilerGap,asks_memory,parse_goal,safety_reason,validate_step,verify
 from .store import Store
 from .seeding import synthetic_seed_present
 from . import vault_lock
@@ -134,6 +134,10 @@ class Brain:
                                         (ep,canonical(goal.to_dict()),request,'preparing',t))
                 self.store.conn.execute('INSERT INTO cx_episode VALUES(?,?,?,?,?,?,?,?,?,?)',
                     (ep,self.mode,canonical(goal.to_dict()),basis,self.store.policy.fingerprint(),canonical(self._fixture()),key,ih,t+self.store.policy.approval_ttl_s,principal))
+                # Where the request came from (a task alias's or a commitment's source), kept from the start: deleting that
+                # source finds this episode even when planning failed before any plan cited it.
+                for ref in extra_refs or []:
+                    if ref.startswith('source:'): self.store.conn.execute('INSERT OR IGNORE INTO cx_episode_source VALUES(?,?)',(ep,ref[len('source:'):]))
             else:
                 self.store.conn.execute('UPDATE cx_episode SET basis_hash=?,initial_json=?,expires_at=? WHERE id=?',
                     (basis,canonical(self._fixture()),t+self.store.policy.approval_ttl_s,ep))
@@ -161,20 +165,17 @@ class Brain:
                 else:
                     plan=None
                     if self.qwen and self.qwen.planning_order=='model_first':
-                        try:
-                            calls+=1; out=self.qwen.complete('plan',bundle,goal=goal.to_dict())
-                            v=verify(goal,out.value['steps'],fixture,self.store.related_rules(goal),self.store.policy)
-                            self.store.decision('plan','llama.cpp',out.model,v.ok,'verified' if v.ok else 'goal verification rejected model plan')
-                            if v.ok:
-                                base=self.compiler.compile(goal,fixture)
-                                plan={**base,'steps':out.value['steps'],'refs':sorted(set(base['refs']+out.refs)),'verification':v.to_dict()}; source='model'
-                                self.store.manifest('last_qwen_request','parametric',{'contract_sha256':out.contract_hash,'prompt_sha256':out.prompt_hash,
-                                    'input_tokens':out.input_tokens,'model':out.model,'elapsed_ms':out.elapsed_ms,'response_accepted':True})
-                            else: note='Model plan failed independent goal verification; composed from accepted rules.'
-                        except CortexError as e:
-                            note='Local model unavailable or invalid: '+type(e).__name__
+                        calls+=1; plan,note=self._model_plan(goal,bundle,fixture)
+                        if plan: source='model'
                     if plan is None:
-                        plan=self.compiler.compile(goal,fixture); source='fallback' if calls else 'composed'
+                        try: plan=self.compiler.compile(goal,fixture); source='fallback' if calls else 'composed'
+                        except CompilerGap as gap:
+                            # Compiler first: a goal it cannot compose (its own plan fails the independent check, never a
+                            # refusal) goes to the local model, whose plan meets the same refusals and the same check.
+                            if not self.qwen or calls: raise
+                            calls+=1; plan,note=self._model_plan(goal,bundle,fixture)
+                            if plan is None: raise gap
+                            source='model'
                     plan['refs']=sorted(set(plan['refs']+refs))
                     d=self.store.derive('task_recipe',{'task':goal.to_dict(),'steps':plan['steps'],'mode':'SIMULATED_VERIFICATION'},self.skills.identity_refs(goal,plan['refs']),
                         origin='new_task_synthesis',verified=True,verifier='symbolic-verifier-v1',basis=plan['basis'])
@@ -211,6 +212,21 @@ class Brain:
                 with self.store.tx(): self.store.conn.execute("UPDATE episode SET outcome='rejected',failure=?,finished_at=? WHERE id=? AND outcome='preparing'",(str(e)[:500] if isinstance(e,CortexError) else type(e).__name__,self.store.clock(),ep))
                 if isinstance(e,CortexError): raise
                 raise CortexError('planning failed: '+type(e).__name__) from None
+
+    def _model_plan(self, goal: Goal, bundle: dict, fixture: dict) -> tuple[dict | None, str]:
+        """The local model's plan for this goal, held to the compiler's refusals and its independent check: (plan, '')
+        or (None, why not) when the model is unavailable or invalid, or its plan is rejected."""
+        try: out=self.qwen.complete('plan',bundle,goal=goal.to_dict())
+        except CortexError as e: return None,'Local model unavailable or invalid: '+type(e).__name__
+        try: plan=self.compiler.compile(goal,fixture,steps=out.value['steps'])
+        except CortexError as e:
+            self.store.decision('plan','llama.cpp',out.model,False,'goal verification rejected model plan' if type(e) is Conflict else 'model plan refused: '+type(e).__name__)
+            return None,'Model plan failed independent goal verification; composed from accepted rules.'
+        self.store.decision('plan','llama.cpp',out.model,True,'verified')
+        self.store.manifest('last_qwen_request','parametric',{'contract_sha256':out.contract_hash,'prompt_sha256':out.prompt_hash,
+            'input_tokens':out.input_tokens,'model':out.model,'elapsed_ms':out.elapsed_ms,'response_accepted':True})
+        plan['refs']=sorted(set(plan['refs']+out.refs))
+        return plan,''
 
     def _fixture(self) -> dict:
         """The verification world: current observations plus what the adapter reports in the claw (absent = unknown)."""
@@ -375,19 +391,23 @@ class Brain:
         return self.operation(ep)
 
     def stop(self):
-        self._stop_gen+=1; self._stopped.set(); self.activity.touch(); confirmed=False
-        try:
-            # Durable first: a crash during the robot call still leaves the latch set and every pending proposal revoked.
-            with self.store.tx():
-                self._latch('operator stop')
-                for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
-                    self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
-        finally:
-            # The hardware STOP goes out even when that transaction failed: storage never swallows a STOP. The in-memory
-            # latch stays set, and a storage error still reaches the caller, after the stop.
-            try:
-                self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
-            except Exception: pass
+        # The physical STOP goes out first, on a path that takes no store lock and no lock the planner holds: a held
+        # transaction or stalled storage never delays it for an action already dispatched (the adapter latches it too).
+        # The in-memory latch is set before it, so nothing new is dispatched; the durable latch follows, even when the
+        # robot call itself failed or ended the process's call (re-raised once the latch is stored). If storing fails,
+        # the robot stays stopped, the in-memory latch stays set, and the storage error reaches the caller.
+        self._stop_gen+=1; self._stopped.set(); sent=False; crash=None
+        try: self.robot.stop(); sent=True
+        except Exception: pass
+        except BaseException as e: crash=e
+        self.activity.touch()
+        with self.store.tx():
+            self._latch('operator stop')
+            for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
+                self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
+        if crash is not None: raise crash
+        try: confirmed=sent and bool(self.robot.state().get('stopped'))
+        except Exception: confirmed=False
         self.journal(None,'stop',{},'confirmed' if confirmed else 'requested')
         return {'stop_requested':True,'stop_confirmed':confirmed,'auto_resume':False}
 

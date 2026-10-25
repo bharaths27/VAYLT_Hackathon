@@ -301,15 +301,18 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.post('/commands')
     def command(body:Command,principal=Depends(operator)):
         return present(b.command(body.text,principal=principal,idempotency_key=body.idempotency_key,cloud_allowed=body.cloud_allowed))
+    # Every planning request is foreground work for its whole length, as /commands is: idle dreaming yields to it.
     @app.post('/plan')
     def plan(body:PlanInput,principal=Depends(operator)):
-        return present(b.command(body.request,principal=principal))
+        with b.activity.foreground():return present(b.command(body.request,principal=principal))
     @app.post('/plan/rest')
     @app.post('/plan/goto')
     def goto(body:ZoneInput,principal=Depends(operator)):
-        return present(b.propose(Goal('goto',zone=body.zone),'Go to '+body.zone,principal=principal))
+        with b.activity.foreground():return present(b.propose(Goal('goto',zone=body.zone),'Go to '+body.zone,principal=principal))
     @app.post('/goals/propose')
     def goal(body:GoalInput,principal=Depends(operator)):
+        with b.activity.foreground():return propose_goal(body,principal)
+    def propose_goal(body:GoalInput,principal:str):
         selected=Goal.from_dict(body.goal)
         if safety_reason(body.request):raise Denied(safety_reason(body.request))
         try:parsed=parse_goal(body.request,b.store)
@@ -348,10 +351,14 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
     @app.get('/capabilities')
     def capabilities(principal=Depends(operator)):
         return [{'name':name,'args':{k:t.__name__ for k,t in args.items()},'physical':name in PHYSICAL,'acceptance':b.mode} for name,args in CAPS.items()]
+    # A procedure built from another operator's commitment stays that operator's, as its derived memories do.
     @app.get('/skills')
-    def skills(principal=Depends(operator)):return b.skills.list()
+    def skills(principal=Depends(operator)):return [s for s in b.skills.list() if b.store.visible(s['definition'].get('refs',[]),principal)]
     @app.get('/skills/{sid}')
-    def get_skill(sid:str,principal=Depends(operator)):return b.skills.get(sid)
+    def get_skill(sid:str,principal=Depends(operator)):
+        s=b.skills.get(sid)
+        if not b.store.visible(s['definition'].get('refs',[]),principal):raise Missing('skill not found in the Cortex registry')
+        return s
     @app.post('/skills/{sid}/test')
     def test_skill(sid:str,principal=Depends(operator)):
         with b.activity.foreground():return b.skills.test(sid)

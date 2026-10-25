@@ -248,6 +248,9 @@ class QwenClient:
                  timeout_s: float=120, input_budget: int=2048, output_budget: int=384,
                  transport: Callable=request_json, planning_order: str | None=None):
         self.endpoint=validate_loopback(endpoint)
+        # Plain http: an idle call a foreground one preempts is closed through its tracked socket (_Tracked), which an
+        # https request does not have here, so it would hold the local slot instead of yielding.
+        if urllib.parse.urlsplit(self.endpoint).scheme!='http': raise Denied('the local model endpoint must be plain http on loopback (an https call could not yield to an interactive one)')
         self.timeout_s=finite(timeout_s,'model timeout',0.1,600)
         if not 256<=input_budget<=8192 or not 32<=output_budget<=1024: raise CortexError('invalid model token budget')
         self.input_budget,self.output_budget=input_budget,output_budget
@@ -377,6 +380,7 @@ class IntentAdvisor:
         # The model id comes from the environment only: no default in code and no constructor override.
         self.model=os.environ.get('TYPESAFE_INTENT_MODEL','').strip()
         self.timeout=finite(timeout_s,'intent model timeout',0.1,15)
+        if isinstance(max_calls,bool) or not isinstance(max_calls,int) or not 0<=max_calls<=10000: raise CortexError('advisory call budget must be a whole number from 0')
         self.transport=transport; self.max_calls=max_calls; self.window_s=finite(window_s,'advisory rate window',1,86400)
         self.calls=0; self._recent=collections.deque(); self._clock=monotonic
         self._lock=threading.Lock(); self.last_result=None
@@ -391,8 +395,8 @@ class IntentAdvisor:
         with self._lock:
             now=self._clock()
             while self._recent and now-self._recent[0]>=self.window_s: self._recent.popleft()
-            if len(self._recent)>=self.max_calls:
-                return {'status':'budget_exhausted','stage':stage,'scores':{},'retry_after_s':round(self.window_s-(now-self._recent[0]),3)}
+            if len(self._recent)>=self.max_calls:     # a budget of zero has no call to wait for: no retry time
+                return {'status':'budget_exhausted','stage':stage,'scores':{},'retry_after_s':round(self.window_s-(now-self._recent[0]),3) if self._recent else None}
             self._recent.append(now); self.calls+=1
         start=time.perf_counter()
         try:

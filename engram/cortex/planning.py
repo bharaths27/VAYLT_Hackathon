@@ -247,6 +247,11 @@ def verify(goal: Goal, steps: list[dict], fixture: dict, rules: list[dict], poli
 class DeniedPlan(CortexError): pass
 
 
+class CompilerGap(Conflict):
+    """The compiler composed a plan for a supported goal that its own independent check rejects: a gap in the
+    compiler, not a refusal. Only this may go to the local model (whose plan passes the same refusals and checks)."""
+
+
 class Compiler:
     """Deterministic synthesis from a supported goal and CURRENT accepted rules."""
     def __init__(self, store: Store): self.store=store
@@ -265,7 +270,9 @@ class Compiler:
         return {'mode':mode,'positions':pos,'objects':objects,'zones':zones,'at_zone':None,'unknown_positions':sorted(k for k,v in pos.items() if v is None),
                 'holding':None,'holding_known':symbolic}
 
-    def compile(self, goal: Goal, fixture: dict | None=None) -> dict:
+    def compile(self, goal: Goal, fixture: dict | None=None, *, steps: list[dict] | None=None) -> dict:
+        """The plan for a supported goal: composed here or, given steps (the local model's), those, held to the same
+        refusals and the same independent check. A composed plan that check rejects is a CompilerGap."""
         goal=Goal.from_dict(goal.to_dict())
         f=copy.deepcopy(fixture or self.fixture(symbolic=True))   # no live world given: the symbolic start state
         rules=self.store.related_rules(goal)
@@ -273,9 +280,29 @@ class Compiler:
         if self.store.unresolved_for(self.store.scope(goal,rules),handles=goal.kind=='fetch'):raise Missing('an applicable source has an unresolved conditional rule or safety statement; structured review required')
         if self.store.prohibitions(relevant) and goal.kind=='fetch': raise DeniedPlan('current source prohibits moving an involved object')
         if any(r['status']!='active' for r in rules): raise Conflict('conflicting applicable source rules need resolution')
-        positions=dict(f['positions']); steps=[]; ancestry=set()
         if not set(goal.targets)<=set(f['objects']): raise Missing('unregistered goal target')
         if goal.zone and goal.zone not in f['zones']: raise Missing('unregistered destination')
+        if goal.kind=='fetch':
+            # Refuse a cyclic or too deep prerequisite graph, even where the current fixture already satisfies a rule.
+            def visit(oid,path=()):
+                if oid in path: raise Conflict('cyclic prerequisite graph')
+                if len(path)>self.store.policy.max_depth: raise Conflict('dependency depth exceeded')
+                for r in rules:
+                    if r['subject']==oid: visit(r['object'],path+(oid,))
+            for oid in goal.targets: visit(oid)
+        composed=steps is None
+        if composed: steps=self._compose(goal,f,rules)
+        v=verify(goal,steps,f,rules,self.store.policy)
+        if not v.ok: raise (CompilerGap if composed else Conflict)('; '.join(v.errors))
+        refs=sorted(set('source:'+r['source_id'] for r in rules)|set('rule:'+r['id'] for r in rules))
+        plan={'goal':goal.to_dict(),'steps':steps,'rules_used':[r['id'] for r in rules],
+              'evidence':sorted(set(r['chunk_id'] for r in rules)), 'refs':refs,
+              'basis':self.store.basis(goal),'policy_hash':self.store.policy.fingerprint(),
+              'verification':v.to_dict(),'origin':'composed_from_current_memory' if composed else 'proposed_and_verified'}
+        return plan
+
+    def _compose(self, goal: Goal, f: dict, rules: list[dict]) -> list[dict]:
+        positions=dict(f['positions']); steps=[]; ancestry=set()
 
         def place(oid,zone,depth=0):
             if depth>self.store.policy.max_depth: raise Conflict('dependency depth exceeded')
@@ -293,13 +320,6 @@ class Compiler:
             if len(steps)>self.store.policy.max_steps: raise Missing('task exceeds bounded primitive budget')
 
         if goal.kind=='fetch':
-            # Validate graph cycles even when the current fixture already satisfies a rule.
-            def visit(oid,path=()):
-                if oid in path: raise Conflict('cyclic prerequisite graph')
-                if len(path)>self.store.policy.max_depth: raise Conflict('dependency depth exceeded')
-                for r in rules:
-                    if r['subject']==oid: visit(r['object'],path+(oid,))
-            for oid in goal.targets: visit(oid)
             def needs(oid,acc):
                 for r in rules:
                     if r['subject']==oid and r['object'] not in acc: acc.add(r['object']); needs(r['object'],acc)
@@ -309,12 +329,4 @@ class Compiler:
         elif goal.kind=='goto': steps=[{'op':'go_to_zone','args':{'zone':goal.zone}}]
         elif goal.kind=='inspect': steps=[{'op':'locate_tag','args':{'object_id':oid}} for oid in goal.targets]
         elif goal.kind=='primitive': steps=[{'op':goal.primitive,'args':goal.args}]
-        if not steps: steps=[{'op':'observe','args':{}}]
-        v=verify(goal,steps,f,rules,self.store.policy)
-        if not v.ok: raise Conflict('; '.join(v.errors))
-        refs=sorted(set('source:'+r['source_id'] for r in rules)|set('rule:'+r['id'] for r in rules))
-        plan={'goal':goal.to_dict(),'steps':steps,'rules_used':[r['id'] for r in rules],
-              'evidence':sorted(set(r['chunk_id'] for r in rules)), 'refs':refs,
-              'basis':self.store.basis(goal),'policy_hash':self.store.policy.fingerprint(),
-              'verification':v.to_dict(),'origin':'composed_from_current_memory'}
-        return plan
+        return steps or [{'op':'observe','args':{}}]

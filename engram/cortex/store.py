@@ -521,17 +521,19 @@ class Store:
             if self.path != ':memory:' and self._depth == 0: self.conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
 
     def _purge_episodes(self, sid: str, aliases: list[dict], tasks: set[str]) -> None:
-        """Caller holds the transaction. The episodes built from a deleted source: plans citing it, its task aliases (a goal
-        with its own arguments), the wakes of its commitments (planned or not). Each keeps its outcome as an audit record
+        """Caller holds the transaction. The episodes built from a deleted source: those it was recorded as the origin of
+        (a task alias or commitment request, planned or not), plans citing it, a goal with its free-text arguments, the
+        wakes of its commitments. Each keeps its outcome as an audit record
         but loses every copy of the source: request (a commitment's text, a task alias's name) and its search row, plan,
         evidence bundle, the step arguments journalled at execution, a goal's free-text arguments, and the idle memories
         made from it (summaries, practice, procedures)."""
         redacted, gone, goals = canonical({'redacted': True}), set(), []
+        linked = {r['episode_id'] for r in self.rows('SELECT episode_id FROM cx_episode_source WHERE source_id=?', (sid,))}
         for e in self.rows('SELECT e.id,e.plan_json,c.goal_json,c.request_key FROM episode e JOIN cx_episode c ON c.id=e.id'):
             key, goal = e['request_key'] or '', json.loads(e['goal_json'])
             woken = ':wake:' in key and key.rsplit(':wake:', 1)[1].rsplit(':', 1)[0] in tasks
             refs = json.loads(e['plan_json']).get('refs', []) if e['plan_json'] else []
-            if not (woken or 'source:'+sid in refs or (goal.get('args') and goal in aliases)): continue
+            if not (woken or e['id'] in linked or 'source:'+sid in refs or (goal.get('args') and goal in aliases)): continue
             gone.add('episode:'+e['id'])
             self.settle(e['id'], 'invalidated', ('preparing','proposed'), 'source deleted')    # its plan is gone: never approvable
             if goal.get('args'): goals.append(goal); goal = {**goal, 'args': {'redacted': True}}
@@ -631,8 +633,8 @@ class Store:
                      'JOIN cx_source x ON x.source_id=s.id WHERE c.id=? AND x.workspace=?', (chunk_id, self.workspace))
         if not r or r['status'] in {'deleted','revoked'} or (not history and r['status'] != 'accepted'):
             raise Missing('evidence is unavailable, revoked or superseded')
-        if principal is not None and r['kind'] == 'future' and r['origin'] != principal:
-            raise Missing('evidence is unavailable, revoked or superseded')    # another owner's commitment
+        if r['kind'] == 'future' and (principal is None or r['origin'] != principal):
+            raise Missing('evidence is unavailable, revoked or superseded')    # a commitment is its owner's alone
         return r
 
     def search(self, query: str, limit: int = 5) -> list[dict]:
@@ -695,11 +697,22 @@ class Store:
             else: b['omitted'].append(name)
         return b
 
-    def visible(self, refs: list[str], principal: str | None) -> bool:
-        """Whether a memory may be shown to this principal (None: any). One citing another operator's episode is not: its
-        payload may quote that operator's request, which episode reads keep to the owner."""
-        eps = [r[len('episode:'):] for r in refs if r.startswith('episode:')]
-        return principal is None or all((o := self.one('SELECT owner FROM cx_episode WHERE id=?', (e,))) and o['owner'] == principal for e in eps)
+    def visible(self, refs: list[str], principal: str | None, _seen: frozenset = frozenset()) -> bool:
+        """Whether a memory may be shown to this principal. One citing another operator's episode is not (None: any
+        operator's), nor one citing a commitment (a 'future' source) but to its owner (None: nobody), directly or
+        through a derived memory it cites: its payload may quote that operator's request."""
+        for ref in refs:
+            kind, _, rid = ref.partition(':')
+            if kind == 'episode' and principal is not None:
+                o = self.one('SELECT owner FROM cx_episode WHERE id=?', (rid,))
+                if not o or o['owner'] != principal: return False
+            elif kind == 'source':
+                s = self.one('SELECT kind,origin FROM source WHERE id=?', (rid,))
+                if s and s['kind'] == 'future' and (principal is None or s['origin'] != principal): return False
+            elif kind == 'derived' and ref not in _seen and len(_seen) <= self.policy.max_nodes:
+                d = self.one('SELECT refs_json FROM cx_derived WHERE id=?', (rid,))
+                if d and not self.visible(json.loads(d['refs_json']), principal, _seen | {ref}): return False
+        return True
 
     def prohibitions(self, object_ids=None):
         rs=self.rows("SELECT a.id,a.subject,a.source_id,a.chunk_id,c.effect FROM assertion a JOIN cx_constraint c ON c.assertion_id=a.id JOIN cx_source s ON s.source_id=a.source_id WHERE c.status='active' AND s.status='accepted' AND s.workspace=? ORDER BY a.id",(self.workspace,))
