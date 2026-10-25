@@ -336,6 +336,9 @@ class LiveTranscriber:
     it with poll(), on the caller's own thread (so the gate's database work stays there).
 
     finish() is called at end of speech. Before it transcribes the whole utterance it:
+    - seals the window, before anything else that can take time: audio arriving after that is
+      refused, and if it arrives while the final is being made, the utterance is not final (it
+      must be said again);
     - stops partials: none is started, and none is handed out, after end of speech;
     - drops a partial that was not taken yet;
     - cancels the partial request in flight: its connection is closed at once, so this client
@@ -392,19 +395,22 @@ class LiveTranscriber:
             return None if self._ended.is_set() or not self._window.intact(self._generation) else p
 
     def finish(self, join_s: float = 1.0) -> str:
-        """End of speech: stop and cancel partials, then make the final transcript.
+        """End of speech: seal the window, stop and cancel partials, then make the final transcript.
 
-        The window is sealed first: the transcript is of exactly the audio that had arrived, and any
-        later append is refused. Raises AudioOverflow (not final) if the utterance overflowed, if the
-        window moved on to another utterance, or if audio for this one was refused while the final
-        was being made. Never returns a transcript of part of an utterance."""
+        The window is sealed first, before anything that can take time (cancelling the partial in
+        flight included): the transcript is of exactly the audio that had arrived when finish() was
+        called, and any later append is refused. Raises AudioOverflow (not final) if the utterance
+        overflowed, if the window moved on to another utterance, or if audio for this one was refused
+        while the final was being made. Never returns a transcript of part of an utterance."""
         with self._lock:
             self._ended.set()      # from now on: no new partial or worker, and poll() hands out nothing
             token, worker = self._token, self._thread
-        if token is not None:
-            token.cancel()
         try:
-            sealed = self._window.seal(self._generation)
+            try:
+                sealed = self._window.seal(self._generation)   # first: no audio from after the end of speech
+            finally:
+                if token is not None:
+                    token.cancel()                             # then the partial, even if the seal refused
             text = speech_only(self._final_client.transcribe(sealed.audio))
             if not self._window.finalize(sealed):
                 raise AudioOverflow("audio for this utterance arrived while its final was made; it must be said again")

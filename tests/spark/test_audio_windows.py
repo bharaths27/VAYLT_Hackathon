@@ -421,6 +421,73 @@ def test_a_second_start_makes_no_second_worker():
     assert fake.active == 0 and fake.calls == ["partial", "final"]   # nothing still holds the server
 
 
+class _SlowCancelWhisper:
+    """Partials whose cancellation is held (inside cancel(), on the cancelling thread) until the test lets
+    it finish; the audio of every final is kept."""
+
+    def __init__(self):
+        self.in_flight, self.cancelling, self.let_cancel = threading.Event(), threading.Event(), threading.Event()
+        self.finals = []
+
+    def transcribe(self, wav, cancel=None):
+        if cancel is None:
+            self.finals.append(wav)
+            return "Open the claw."
+
+        def hold():
+            self.cancelling.set()
+            assert self.let_cancel.wait(5)
+
+        assert cancel._attach(hold)
+        self.in_flight.set()
+        while not cancel.cancelled:
+            time.sleep(0.005)
+        raise Cancelled("cancelled")
+
+
+def test_audio_after_the_end_of_speech_never_reaches_the_final_even_while_the_partial_is_cancelled():
+    fake, window = _SlowCancelWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    heard = window.snapshot()                                   # all of the utterance
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.in_flight.wait(2)                               # a partial is in flight
+    out = {}
+
+    def finish():
+        try:
+            out["text"] = tr.finish()
+        except AudioOverflow as e:
+            out["error"] = e
+
+    t = threading.Thread(target=finish)
+    t.start()
+    try:
+        assert fake.cancelling.wait(2)                          # finish() is inside the cancel, held there
+        with pytest.raises(WindowSealed):
+            _speech(window, 0.3)                                # the next utterance starting: refused
+    finally:
+        fake.let_cancel.set()
+        t.join(5)
+    assert fake.finals == [heard]                               # the final was sent this utterance and no more
+    assert "error" in out and "text" not in out                 # and audio arrived during it: not final
+    assert tr.cancelled == 1
+
+
+def test_a_seal_refused_at_the_end_of_speech_still_cancels_the_partial():
+    fake, window = _FakeWhisper(), PcmWindow()
+    _speech(window, 0.6)
+    tr = LiveTranscriber(fake, window, poll_s=0.005)
+    tr.start()
+    assert fake.started.acquire(timeout=2)                      # a partial is in flight, held
+    with pytest.raises(ValueError):
+        window.append(bytes(1))                                 # half a sample: refused, the utterance is not whole
+    with pytest.raises(AudioOverflow):
+        tr.finish()                                             # the seal refuses: no final
+    assert tr.cancelled == 1 and fake.active == 0               # but the partial was cancelled all the same
+    assert fake.calls == ["partial"]
+
+
 def test_start_after_finish_is_refused():
     fake, window = _FakeWhisper(), PcmWindow()
     _speech(window, 0.6)
