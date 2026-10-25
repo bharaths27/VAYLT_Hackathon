@@ -43,12 +43,23 @@ General rules for every ticket:
 - **Evidences:** EC19, EC20 (parametric memory), EC07
 - **Do:** with the existing llama-server already running on 127.0.0.1:8080:
   ```bash
+  ~/llama-server --version              # record it; builds without --jinja ignore "thinking off"
   python scripts/cortex_model_probe.py --qwen --url http://127.0.0.1:8080 \
     --model-file /home/starrasp/offline/models/Qwen3-1.7B-Q8_0.gguf --out ~/qwen-memory-proof.json
   ```
-- **Pass:** every probe case returns a plan that passes the independent goal check, *or* fails and is labeled fallback. Both source revisions produce the plan their rule requires. The prompt token count is under `CORTEX_INPUT_TOKENS`. Latency is recorded per case.
-- **Evidence:** the whole `qwen-memory-proof.json`, including the contract hash, prompt token count, per-case goal check and latency.
-- **Note:** the same probe against a real llama-server with the same model on an x86 workstation is in the PR thread. The Pi run is still required for latency and memory.
+- **Pass:**
+  - Every probe case returns a plan that passes the independent goal check, *or* fails and is labeled fallback.
+  - Both source revisions produce the plan their rule requires.
+  - The applied template has thinking disabled (the probe records it).
+  - The prompt token count is under `CORTEX_INPUT_TOKENS`.
+  - Latency is recorded per case, and `CORTEX_LLM_TIMEOUT` is set from the measured p95.
+- **Evidence:** the whole `qwen-memory-proof.json`, including the contract hash, prompt token count, thinking-off check, per-case goal check and latency.
+- **Workstation result (x86 Ryzen 5950X, 3 threads, llama.cpp b11552, the same Qwen3-1.7B-Q8_0 file with sha256 `061b54da...6590cb1a`, server flags copied from `ai_module/start_model.sh`):**
+  - The wire protocol works.
+  - Two mismatches the author's stub hid were fixed: schema key order, and a plan schema that didn't restrict ops and arguments.
+  - Qwen still failed every fetch that has a prerequisite; the local compiler planned those correctly.
+  - Single-step plans took 15–37 s; multi-step plans took 20–60 s.
+  - Expect the Pi to be slower. Plan the demo with the compiler first and Qwen only for tasks the compiler cannot plan.
 
 ## CXV4: Live hosted intent-model probe
 - **Owner:** warden (done once on the workstation; repeat from the Pi network when Carter enables cloud mode)
