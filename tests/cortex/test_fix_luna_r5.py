@@ -47,6 +47,13 @@ def test_conditional_hazard_and_permission_wording_fails_closed(store,sentence,s
 def test_control_plain_notes_add_no_constraint(store,sentence):
     assert not store.teach('Note',sentence,owner='carther')['unresolved_rules']
 
+def test_registered_names_never_count_as_hazard_wording(arena):
+    arena['objects'].append({'id':'warning_sign','name':'Warning sign','tag':9})   # a name that holds a hazard word
+    s=Store();s.register_arena(arena)
+    assert not s.teach('Note','The warning sign is on shelf B.',owner='carther')['unresolved_rules']
+    assert s.teach('Note','The warning sign is fragile.',owner='carther')['unresolved_rules']     # its wording still counts
+    s.close()
+
 def test_control_a_reviewers_ban_covers_a_hazard_sentence_about_exactly_that_object(store):
     assert not store.teach('Note','Sample B is unsafe to move.',owner='carther',rules=[],prohibitions=['sample_b'])['unresolved_rules']
     with pytest.raises(CortexError,match='prohibits'): Compiler(store).compile(Goal('fetch',('sample_b',),'bench'))
@@ -153,19 +160,21 @@ def test_control_a_real_false_graspable_is_kept(arena):
 # P2-6: deleting a source removes every copy of its text, in the vault and on disk.
 def test_deleting_a_source_removes_every_copy_of_its_text(tmp_path,arena,clock):
     mark='zqxmarker';s=Store(tmp_path/'v.db',clock=clock);s.register_arena(arena);b=Brain(s,FakeRobot(arena))
-    src=s.teach('Note',f'Tray must be at the bench before handling Sample A. The goggles are fragile {mark}. The tray code is {mark}.',owner='carther',
-                facts=[{'subject':'tray','predicate':'colour','object':mark}],goal_definitions={f'prepare {mark}':Goal('fetch',('sample_a',),'bench').to_dict()})
-    p=b.command('Bring Sample A to the shelf b.',principal='carther')               # its bundle quotes the source
-    assert mark in json.dumps(p) and s.rows('SELECT reason FROM cx_unresolved')
+    s.teach('Lab rule','Tray must be at the bench before handling Sample A.',owner='carther')          # kept
+    src=s.teach('Note',f'Goggles are fragile {mark}.',owner='carther',                              # deleted; no word of the request
+                facts=[{'subject':'Sample A','predicate':'colour code','object':mark}],goal_definitions={f'prepare {mark}':Goal('fetch',('sample_a',),'bench').to_dict()})
+    p=b.command('Bring Sample A to the shelf b.',principal='carther')               # its bundle quotes the fact only
+    assert mark in json.dumps(p['memory']['declared_facts']) and not [e for e in p['memory']['evidence'] if e.get('source_id')==src['source_id']]
     t=b.schedule(f'the {mark} arrives','bring Sample A to the bench',principal='carther')
     future=s.one('SELECT source_id FROM prospective_task WHERE id=?',(t['task_id'],))['source_id']
     s.revoke_source(src['source_id'],delete=True);s.revoke_source(future,delete=True)
     for (name,) in [tuple(r.values()) for r in s.rows("SELECT name FROM sqlite_master WHERE type='table'")]:
         for row in s.rows(f'SELECT * FROM "{name}"'):
             assert mark not in json.dumps(row,default=str).lower(),(name,row)
+    disk=lambda:[f for f in tmp_path.iterdir() if not f.name.endswith('.cortex.lock')]   # the lock file holds no data
+    for f in disk(): assert mark.encode() not in f.read_bytes(),f.name           # on disk while the vault is open
     b.close()
-    for f in tmp_path.iterdir():
-        assert mark.encode() not in f.read_bytes(),f.name
+    for f in disk(): assert mark.encode() not in f.read_bytes(),f.name
 
 
 # P2-7: a full practice cap defers to its earliest expiry instead of logging a run every tick.
