@@ -44,6 +44,8 @@ def normalize_state(raw: dict[str, Any]) -> dict[str, Any]:
 class MockRobot:
     """Tiny 2D world: 3 tagged objects, 2 zones, 1 LiDAR ring."""
 
+    STOP_REPLY = "mock"  # its stop answers {"status": "stopped"} (see core.stop_unconfirmed)
+
     def __init__(self) -> None:
         self.x, self.y, self.th = 0.0, 0.0, 0.0  # cm, cm, rad (0 = facing +y)
         self.objects = {9: [-40.0, 120.0, "A"], 7: [10.0, 140.0, None], 8: [55.0, 110.0, None]}  # tag ids match Brian's arena (objects 7, 8)
@@ -274,6 +276,7 @@ class HttpRobot:
       - statuses come back upper case; only SUCCEEDED with postcondition.verified counts as sensor-verified
     """
 
+    STOP_REPLY = "robot_server"  # its stop answers the robot server's {"stopped": true, "latched": true}
     PHYSICAL = {"drive_bounded", "turn_bounded", "approach_tag", "gripper_open", "gripper_close",
                 "pick_tagged", "place_at", "search_tag"}
     STATUS = {"SUCCEEDED": "succeeded", "FAILED": "failed", "UNKNOWN": "unknown", "VETOED": "vetoed",

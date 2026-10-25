@@ -386,7 +386,8 @@ def _parse(text: str, bundle: dict) -> ParseResult:
                            "one thing; I plan one action on one object per command.)", quip=quip("clarify"),
                            trace=trace + [f"multiple: '{w}'"])
 
-    # 3. prospective ("in 2 minutes, bring the vial to zone B")
+    # 3. prospective ("in 2 minutes, bring the vial to zone B"). Only a robot action, a plan that moves the
+    # robot, is scheduled; anything else asks (_not_schedulable). A stop word anywhere has stopped already (0.).
     m = PROSPECTIVE.match(t)
     if m:
         n = _num(m.group(1))
@@ -395,15 +396,8 @@ def _parse(text: str, bundle: dict) -> ParseResult:
         secs = n * (60 if m.group(2).startswith("min") else 1)
         inner = m.group(3)
         sub = parse(inner, bundle)
-        if sub.kind == "prospective":  # "In 5 minutes, in 5 seconds, ..." would schedule 5 s and drop the 5 min
-            return ParseResult("clarify", text, reason="Give one delay, for example 'In 5 minutes, open the claw'",
-                               quip=quip("clarify"), trace=trace + ["nested delay"])
-        if sub.kind != "plan" or sub.plan is None:
-            # Only a plan is scheduled. Anything else (stop, refusal, question) comes back as itself, and never
-            # goes to the LLM fallback, which would plan the task for NOW and drop the delay.
-            sub.data.pop("llm_eligible", None)
-            sub.trace = trace + ["prospective inner command failed"] + sub.trace
-            return sub
+        if sub.kind != "plan" or sub.plan is None or not sub.plan.physical():
+            return _not_schedulable(text, inner, sub, trace)
         return ParseResult("prospective", text, plan=sub.plan, quip=quip("prospective"),
                            data={"delay_s": secs, "inner": inner}, trace=trace + [f"prospective in {secs:.0f}s"] + sub.trace)
 
@@ -517,6 +511,17 @@ def _parse(text: str, bundle: dict) -> ParseResult:
 
     return ParseResult("abstain", text, reason="I don't have a safe primitive for that yet", quip=quip("abstain"),
                        trace=trace + ["no grammar rule matched"], data={"llm_eligible": True})
+
+
+def _not_schedulable(text: str, inner: str, sub: ParseResult, trace: list[str]) -> ParseResult:
+    """A clarification for a delay ("In N minutes, ...") around anything but a robot action. A rule inside it
+    would be taught at once, a question or a look answered at once, and a second delay, an unclear command or
+    one with no grammar must not run later on a guess (or go to the model fallback, which would plan it now)."""
+    why = {"rule": "it is a rule", "prospective": "it has a delay of its own"}.get(sub.kind) or (
+        "it does not move the robot" if sub.kind == "plan" else (sub.reason or "I can't do it").rstrip(". "))
+    return ParseResult("clarify", text, reason=f"I can only schedule a robot action, and not '{inner.strip(' .')}': "
+                       f"{why}. Say the rule now, or schedule a robot action, like 'In 5 minutes, open the claw'.",
+                       quip=quip("clarify"), trace=trace + [f"only a robot action is scheduled, not a {sub.kind}"] + sub.trace)
 
 
 def _ok(goal, steps, evidence, trace, physical=True) -> ParseResult:

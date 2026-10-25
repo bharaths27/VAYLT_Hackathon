@@ -17,6 +17,8 @@ STOP = [
     "Wait!", "Wait, don't open the gripper.", "Pause.", "Hold on.", "Hold  on, bring Sample B to the bench.",
     "Hold it!", "Hang on.", "Freeze!",
     "Remember to wait for the student.",  # deliberate: teach it with POST /memory/sources instead
+    # A stop inside "When X, ..." still stops at once: it is never scheduled, and never refused as a rule.
+    "When calibration ends, hold on.", "When calibration ends, remember to stop at the bench.",
 ]
 
 # Phrases, not words: holding something is not a stop.

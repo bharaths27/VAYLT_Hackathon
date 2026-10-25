@@ -29,7 +29,8 @@ from .prospective import Prospective, normalize, parse_when
 from .recall import Recall, asks_question, is_memory_question
 from .robot.base import RobotAdapter
 from .skills import Skills
-from .teach import extract_rules
+from .teach import extract_rules, rule_body
+from .prospective import deferred_rule  # a line of its own, so the prospective import above stays as it is
 
 APPROVAL_TTL_S = 120.0
 # A stop word anywhere in a command stops the robot ("Stop.", "STOP!", "Please stop.", "Wait!", "Hold on.",
@@ -111,17 +112,21 @@ class Engine:
         if STOP_WORDS.search(text):
             return {"kind": "stopped", **self.stop()}
         stripped = text.strip()
-        low = stripped.lower()
-        if low.startswith("remember"):
-            body = stripped.split(" ", 1)[1] if " " in stripped else ""
-            body = body.lstrip(":, ").strip()
-            if body.lower().startswith("that "):
-                body = body[5:]
+        body = rule_body(stripped)  # "Remember that ...", "Note that ...", "From now on, ..."
+        if body is not None:
             return {"kind": "taught", **self.teach(f"Spoken note from {who}", body, kind="spoken", origin=who)}
         if is_memory_question(stripped) or asks_question(stripped):
             # Answered from memory: never scheduled, never planned, nothing moves (practice check M2).
             # Any question counts, not only memory-shaped ones: a question is never a request to move.
             return {"kind": "answer", **Recall(self.memory).recall(stripped)}
+        rule = deferred_rule(stripped)  # "When X, remember that ...": a rule cannot wait for an event
+        if rule is not None:
+            reason = (f"I can only schedule a robot action, and not '{rule}': it is a rule. Say the rule now, or "
+                      "schedule a robot action, like 'When calibration ends, bring Sample B to the bench'.")
+            episode_id = new_id("ep")
+            self._episode(episode_id, stripped, None, {}, "refused", reason, PlanResult(None))
+            self.executor.journal(new_id("op"), episode_id, "propose", {"request": stripped}, "rejected", reason)
+            return {"kind": "proposal", "operation_id": episode_id, "status": "refused", "reason": reason}
         when = parse_when(stripped)
         if when:
             trigger, request = when

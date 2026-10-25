@@ -22,7 +22,8 @@ from starlette.requests import ClientDisconnect
 from . import brain, config, llm, voice
 from .adapters.memory import make_memory
 from .adapters.robot import make_camera, make_robot
-from .core import Bus, Engine, Ledger, Operation, best_effort, hash_models, stop_unconfirmed, upstream_online
+from .core import (Bus, Engine, Ledger, LedgerBusy, Operation, best_effort, hash_models, stop_unconfirmed,
+                   upstream_online)
 from .parser import is_stop, parse, quip
 
 WEB = config.ROOT / "web"
@@ -184,7 +185,8 @@ async def index():
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "robot": config.ROBOT_URL, "memory": config.MEMORY_URL, "uptime_s": int(time.time() - STATUS["boot"])}
+    return {"ok": True, "robot": config.ROBOT_URL, "memory": config.MEMORY_URL, "uptime_s": int(time.time() - STATUS["boot"]),
+            "ledger_dropped": ledger.dropped}  # records dropped while the ledger's disk was stalled (Ledger)
 
 
 @app.get("/status")
@@ -334,7 +336,7 @@ async def _stop_command(text: str, source: str, t0: float) -> dict:
     If a stop call did not confirm, the answer and the spoken text say so: the latch holds, but the robot may
     still be moving."""
     res = await engine.stop(by=f"command:{source}")
-    unconfirmed = stop_unconfirmed(res)
+    unconfirmed = stop_unconfirmed(res, engine.robot)
     out = {"kind": "stop", "reason": "", "quip": quip("stop"), "trace": ["stop word"], "data": {},
            "robot": res, "stop_confirmed": not unconfirmed,
            "metrics": {"plan_ms": int((time.time() - t0) * 1000), "planner_calls": 0}}
@@ -455,7 +457,7 @@ async def operations():
 @app.post("/stop")
 async def stop():
     res = await engine.stop(by="hud_button")
-    if stop_unconfirmed(res):  # 502: the HUD shows "STOP request failed: use the robot's physical button!"
+    if stop_unconfirmed(res, engine.robot):  # 502: the HUD shows "STOP request failed: use the robot's physical button!"
         return JSONResponse(res, status_code=502)
     return res
 
@@ -493,7 +495,10 @@ async def evidence(eid: str):
     ev = await memory.evidence(eid)
     if ev:
         return ev
-    rec = await ledger.find(eid)  # read off the event loop: a stalled disk cannot hold up a stop
+    try:
+        rec = await ledger.find(eid)  # read off the event loop: a stalled disk cannot hold up a stop
+    except LedgerBusy as e:  # the disk is not answering: say so, don't pretend the record is missing
+        raise HTTPException(503, str(e))
     if rec:
         return {"id": eid, "title": "Ledger record", "passage": rec, "immutable": True}
     raise HTTPException(404, "no such evidence")
