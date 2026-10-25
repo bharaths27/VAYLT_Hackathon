@@ -99,6 +99,31 @@ FAIL_CLOSED = [
     "Open the claw in place soonish.", "Open the claw in front of the deadline.",
 ]
 
+# Review round 6: a primitive planned whatever else was said ("Open the claw following calibration." planned an
+# immediate open). A command plans only when the whole utterance is that command, give or take filler such as
+# "please" or "can you"; anything left over asks and never goes to the model fallback. The rows after the first
+# block use words that no list knows, so only the whole-utterance rule can catch them.
+LEFTOVER = [
+    "Open the claw following calibration.", "Open the claw once calibration ends.",
+    "Open the claw as soon as calibration ends.", "Open the claw when calibration ends.",
+    "Open the claw whenever calibration ends.", "Open the claw upon calibration.",
+    "Open the claw pending calibration.", "Open the claw provided calibration passed.",
+    "Open the claw if calibration passed.", "Open the claw unless calibration failed.",
+    "Open the claw until calibration ends.", "Open the claw before calibration.",
+    "Open the claw by the time calibration ends.", "Open the claw the moment calibration ends.",
+    "Drive forward 10 cm following calibration.", "Turn left following calibration.",
+    "Find the vial following calibration.", "Bring the red cup to zone B following calibration.",
+    "Prep the bench for calibration following the meeting.", "Juggle following calibration.",
+    # words no list knows
+    "Open the claw subsequent to calibration.", "Open the claw contingent on calibration.", "Open the claw halfway.",
+    "Close the gripper gently.", "Turn left 90 degrees twice.", "Drive forward 10 cm three times.",
+    "Bring the red cup to zone B as needed.", "What do you see behind the bench?",
+]
+
+# Review round 6: only "In N seconds/minutes, ..." is scheduled; "After N seconds, ..." asks to be said that way.
+AFTER = ["After 5 seconds, close the claw.", "After 2 minutes, bring the red cup to zone B.",
+         "After five minutes, open the claw."]
+
 # Review round 4: the grammar plans one primitive, or one fetch of one object to one zone. A second action or
 # a second object was silently dropped ("close the claw and open the gripper" staged only the open).
 MULTIPLE = [
@@ -135,10 +160,20 @@ STILL_WORKS = [
     ("Bring the red cup to zone B.", "plan", "search_tag"),
     ("What do you see?", "plan", "observe"),
     ("In 5 seconds, open the claw.", "prospective", "gripper_open"),
-    ("After 5 seconds, close the claw.", "prospective", "gripper_close"),
     ("In 2 minutes, bring the red cup to zone B.", "prospective", "search_tag"),
     ("In five minutes, open the claw.", "prospective", "gripper_open"),
-    ("Bring the cup next to the vial to zone B.", "plan", "search_tag"),
+    # Round 6: this used to plan a fetch of the VIAL ("the cup" is not in memory, "vial" is); now it asks.
+    ("Bring the cup next to the vial to zone B.", "clarify", None),
+    # Filler around a command is fine.
+    ("Can you open the claw?", "plan", "gripper_open"),
+    ("Please close the gripper now.", "plan", "gripper_close"),
+    ("Hey robot, turn left 90 degrees.", "plan", "turn_bounded"),
+    ("Could you drive forward 10 cm for me?", "plan", "drive_bounded"),
+    ("Where is the vial?", "plan", "detect_tag"),
+    ("Look for the vial.", "plan", "detect_tag"),  # used to plan "observe"
+    ("Prep the bench for calibration.", "plan", "search_tag"),
+    ("Bring the vial to the bench for calibration.", "plan", "search_tag"),
+    ("Bring the red cup to the sample shelf.", "plan", "search_tag"),
     # Places after in/at/on/next are consumed by the grammar, not mistaken for time.
     ("Put the red cup in zone A.", "plan", "search_tag"),  # "the cup" alone is not a known object here
     ("Put the vial on the calibration bench.", "plan", "search_tag"),
@@ -191,6 +226,36 @@ def test_negated_command_is_refused_not_planned(text):
 def test_future_condition_is_not_run_now(text):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
+
+
+@pytest.mark.parametrize("text", LEFTOVER)
+def test_a_leftover_qualifier_asks_instead_of_planning(text):
+    r = parse(text, BUNDLE)
+    assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
+    assert not r.data.get("llm_eligible"), "a leftover qualifier must not go to the model fallback"
+
+
+@pytest.mark.parametrize("text", LEFTOVER)
+def test_a_leftover_qualifier_never_reaches_the_model(monkeypatch, text):
+    calls = []
+
+    async def propose(t, bundle):
+        calls.append(t)
+        return None, "model declined (test)"
+
+    monkeypatch.setattr(main.config, "LLM_URL", "http://model.test")
+    monkeypatch.setattr(main.llm, "propose", propose)
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        out = c.post("/commands", json={"text": text, "source": "voice"}).json()
+    assert out["kind"] == "clarify" and "operation" not in out and calls == [], (text, out.get("kind"), calls)
+
+
+@pytest.mark.parametrize("text", AFTER)
+def test_after_a_delay_asks_to_rephrase(text):
+    r = parse(text, BUNDLE)
+    assert (r.kind, r.plan) == ("clarify", None) and "'In " in r.reason, (text, r.kind, r.reason)
+    assert not r.data.get("llm_eligible")
 
 
 @pytest.mark.parametrize("text", MULTIPLE)

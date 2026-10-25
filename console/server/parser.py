@@ -65,7 +65,8 @@ NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never
 _NUMWORD = r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|fifty|sixty|ninety"
 DEFERRAL = re.compile(
     r"\b(after(?:wards?)?|thereafter|when|whenever|once(?=\s+\w)|as soon as|until|till|before|during|while|meanwhile"
-    r"|if|unless|upon|then|next(?!\s+to\b)|every|always|repeatedly|later|soon|shortly|presently|momentarily"
+    r"|if|unless|upon|following|pending|provided|providing|then|next(?!\s+to\b)|every|always|repeatedly|later|soon"
+    r"|shortly|presently|momentarily"
     r"|eventually|sometime|someday|today|tonight|tomorrow|overnight|from now"
     r"|moments?|secs?|seconds|mins|minutes|hrs?|hours?|days?|weeks?|weekends?|fortnights?|months?|years?"
     r"|mornings?|afternoons?|evenings?|nights?|noon|midnight|(?:mon|tues|wednes|thurs|fri|satur|sun)days?"
@@ -101,6 +102,16 @@ ACTION_VERB = (r"\b(open|close|shut|grab|grip|release|drop|pick|put|place|set|br
 NEXT_ACTION = re.compile(rf"[,.;:!?]\s*(?:(?:please|then|now|and|also|robot|okay|ok)\s+)*(?:{ACTION_VERB}"
                          r"|\b(the|a|an|this|that|these|those|another)\b|\b((?:tag|marker|aruco)\s*\d+))")
 _KEEP = ",;!?&"
+
+# The whole utterance must be the command. A grammar used to look for its own words anywhere and ignore the
+# rest, so "Open the claw following calibration" planned an immediate open. Now a command plans only when
+# nothing is left once one of its forms (_forms) and harmless FILLER are taken away. Anything left over
+# ("following calibration", "halfway", "twice", or any other words the grammar does not use) asks, and never
+# goes to the model fallback. The robot has no configured name, so FILLER takes "robot" and the product names.
+FILLER = re.compile(r"\b(?:please|now|just|kindly|okay|ok|hey|robot|engram|cortex|can you|could you|would you"
+                    r"|will you|for me|thanks|thank you)\b")
+_NUM = r"-?\d+(?:\.\d+)?|" + "|".join(re.escape(w) for w in sorted(NUM_WORDS, key=len, reverse=True))
+_ART = r"(?: (?:the|a|an|your|my))?"
 
 QUIPS = {
     "plan": ["Plan staged. Your signature, please.", "Drafted. Nothing moves until you say so.",
@@ -226,18 +237,70 @@ def skill_plan(t: str, goal: str, bundle: dict, tag: int, zone: str, evidence: l
 
 
 FETCH_VERB = r"\b(bring|fetch|get|grab|move|put|take|deliver|carry|place|set)\b"
-PROSPECTIVE = re.compile(r"^(?:in|after)\s+(\d+|\w+)\s*(seconds?|secs?|minutes?|mins?)\s*,?\s*(.+)$")
+# The one schedulable form is "In N seconds/minutes, <task>". "After N seconds, ..." asks to be said that way
+# (DEFERRAL), like any other "after".
+PROSPECTIVE = re.compile(r"^in\s+(\d+|\w+)\s*(seconds?|secs?|minutes?|mins?)\s*,?\s*(.+)$")
 
 
 def is_stop(text: str) -> bool:
     return STOP_WORDS.search(_norm(text)) is not None
 
 
-def _names(bundle: dict) -> list[str]:
-    """Normalized zone and object names and aliases from memory, longest first."""
-    names = {_norm(str(n)).strip(" .") for item in bundle.get("zones", []) + bundle.get("bindings", [])
+def _names(bundle: dict, kinds: tuple[str, ...] = ("zones", "bindings")) -> list[str]:
+    """Normalized zone and/or object names and aliases from memory, longest first."""
+    names = {_norm(str(n)).strip(" .") for kind in kinds for item in bundle.get(kind, [])
              for n in [item.get("name", "")] + list(item.get("aliases", []))}
     return sorted(names - {""}, key=len, reverse=True)
+
+
+def _forms(bundle: dict) -> dict[str, re.Pattern]:
+    """Each grammar's whole command (see FILLER), with this memory's object names, zone names and rule triggers."""
+    def alt(words: list[str]) -> str:
+        return "|".join(re.escape(w) for w in words)
+
+    obj = "|".join(filter(None, [r"(?:tag|marker|aruco) ?\d+", alt(_names(bundle, ("bindings",)))]))
+    zone = "|".join(filter(None, [r"zone ?[a-z]", alt(_names(bundle, ("zones",)))]))
+    triggers = {_norm(str(w)).strip(" .") for c in bundle.get("constraints", []) for w in c.get("applies_to", [])}
+    trig = alt(sorted(triggers - {""}, key=len, reverse=True)) or "(?!)"
+    place, num = f"(?:{obj}|{zone}|{_SCENE})", f"(?:{_NUM})"
+    rule_word = f"(?:{trig}|get|ready|prep|prepare|set up|for|the|run)"
+    forms = {
+        "observe": (rf"(?:what (?:do|can) you see|look around|look|observe|scan|take a look|what(?:'s| is|s) in front"
+                    rf"(?: of you)?)(?: (?:at|on|in|around){_ART} {place})?"),
+        "open": rf"open(?: up)?{_ART} (?:claw|gripper|hand)",
+        "close": rf"(?:close|shut){_ART} (?:claw|gripper|hand)",
+        "turn": rf"turn (?:around(?: in place)?|(?:left|right)(?: by)?(?: {num}(?: (?:degrees?|deg))?)?(?: once| in place)?)",
+        "drive": (rf"(?:drive|go|move|roll|back up|reverse)(?: (?:forward|forwards|ahead|straight|back|backward"
+                  rf"|backwards|up))?(?: by)?(?: {num} ?(?:cm|centimet(?:er|re)s?|in|inch(?:es)?|m|met(?:er|re)s?)?)?"),
+        "find": rf"(?:find|locate|where is|where's|wheres|look for|search for){_ART} (?:{obj})(?: (?:on|in|at|near|by){_ART} {place})?",
+        "fetch": (rf"(?:bring|fetch|get|grab|move|put|take|deliver|carry|place|set){_ART} (?:{obj})"
+                  rf"(?: (?:to|in|into|on|onto|at){_ART} (?:{zone}))?(?: (?:in|on|at|near|by|next to){_ART} {place})*"
+                  rf"(?: for(?: the)? (?:{trig}))?"),
+        "rule": rf"{rule_word}(?: {rule_word})*",  # "get ready for inventory", "prep the bench for calibration"
+    }
+    return {name: re.compile(f) for name, f in forms.items()}
+
+
+def _leftover(t: str, forms: tuple[str, ...], bundle: dict) -> str | None:
+    """What is left of the normalized command once one of these forms and FILLER are taken away, or None when the
+    whole utterance is that command."""
+    s = re.sub(r"(?<!\d)[.:]|[.:](?!\d)", " ", FILLER.sub(" ", t))  # sentence punctuation, not "10.5"
+    s = re.sub(r"\s+", " ", s).strip()
+    patterns = [_forms(bundle)[f] for f in forms]
+    if any(p.fullmatch(s) for p in patterns):
+        return None
+    ends = [m.end() for p in patterns if (m := p.match(s))]
+    return s[max(ends):].strip() if ends else s
+
+
+def _unfinished(text: str, t: str, forms: tuple[str, ...], bundle: dict, trace: list[str]) -> ParseResult | None:
+    """A clarification when the command has words its grammar does not use (see FILLER); None when it is whole."""
+    rest = _leftover(t, forms, bundle)
+    if rest is None:
+        return None
+    return ParseResult("clarify", text, reason=f"I don't understand '{rest}', so I won't do anything now. Say just "
+                       "the command, or 'In 5 minutes, ...' to schedule it.", quip=quip("clarify"),
+                       trace=trace + [f"leftover: '{rest}'"])
 
 
 def _deferral(t: str, bundle: dict) -> tuple[str, str] | None:
@@ -355,13 +418,18 @@ def _parse(text: str, bundle: dict) -> ParseResult:
     goal = text.strip()
 
     # 4. simple primitives
-    if re.search(r"\b(what do you see|look around|observe|scan|what's in front|whats in front|look)\b", t) and not re.search(FETCH_VERB, t):
-        return _ok(goal, [Step(op="observe", expect="fresh frame + detections")], [], trace + ["observe"], physical=False)
+    # Each primitive plans only when the whole utterance is that command (_unfinished; see FILLER).
+    if re.search(r"\b(what do you see|look around|observe|scan|what's in front|whats in front|look(?!\s+for\b))\b", t) \
+            and not re.search(FETCH_VERB, t):
+        return _unfinished(text, t, ("observe",), bundle, trace) or _ok(
+            goal, [Step(op="observe", expect="fresh frame + detections")], [], trace + ["observe"], physical=False)
 
     if re.search(r"\b(open)\b.*\b(claw|gripper|hand)\b", t):
-        return _ok(goal, [Step(op="gripper_open", expect="claw open")], [], trace + ["gripper open"])
+        return _unfinished(text, t, ("open",), bundle, trace) or _ok(
+            goal, [Step(op="gripper_open", expect="claw open")], [], trace + ["gripper open"])
     if re.search(r"\b(close|shut)\b.*\b(claw|gripper|hand)\b", t):
-        return _ok(goal, [Step(op="gripper_close", expect="claw closed (grasp state unknown)")], [], trace + ["gripper close"])
+        return _unfinished(text, t, ("close",), bundle, trace) or _ok(
+            goal, [Step(op="gripper_close", expect="claw closed (grasp state unknown)")], [], trace + ["gripper close"])
 
     m = re.search(r"\bturn\s+(around)\b|\bturn\s+(left|right)(?:\s+(.+?))?(?:\s*(?:degrees?|deg))?\.?$", t)  # "Turn left."
     if m:
@@ -375,7 +443,8 @@ def _parse(text: str, bundle: dict) -> ParseResult:
         if abs(deg) > 180:
             return ParseResult("abstain", text, reason=f"turns are bounded to 180 degrees per step (asked {abs(deg):.0f})",
                                quip=quip("abstain"), trace=trace)
-        return _ok(goal, [Step(op="turn_bounded", args={"degrees": deg}, expect=f"heading changed {deg:+.0f} deg")], [], trace + ["turn"])
+        return _unfinished(text, t, ("turn",), bundle, trace) or _ok(
+            goal, [Step(op="turn_bounded", args={"degrees": deg}, expect=f"heading changed {deg:+.0f} deg")], [], trace + ["turn"])
 
     m = re.search(rf"{DRIVE_VERB}\s*(forward|forwards|ahead|straight|back|backward|backwards|up)?\s*(.*)$", t)
     if m and not re.search(r"\bto\b", t) and not resolve_object(t, bundle):
@@ -394,15 +463,17 @@ def _parse(text: str, bundle: dict) -> ParseResult:
         if abs(n) > 50:
             return ParseResult("abstain", text, reason=f"drive is bounded to 50 cm per step (asked {abs(n):.0f} cm). Split it up or approve multiple steps.",
                                quip=quip("abstain"), trace=trace + [f"unit {unit}"])
-        return _ok(goal, [Step(op="drive_bounded", args={"distance_cm": round(n, 1)}, expect=f"moved {n:+.0f} cm, LiDAR clear")], [], trace + ["drive"])
+        return _unfinished(text, t, ("drive",), bundle, trace) or _ok(
+            goal, [Step(op="drive_bounded", args={"distance_cm": round(n, 1)}, expect=f"moved {n:+.0f} cm, LiDAR clear")], [], trace + ["drive"])
 
     m = re.search(r"\b(find|locate|where is|where's|look for|search for)\b", t)
     if m and not re.search(FETCH_VERB, t):
         obj = resolve_object(t, bundle)
         if not obj:
             return _clarify(text, "I don't know which tagged object you mean", bundle, trace)
-        return _ok(goal, [Step(op="detect_tag", args={"tag_id": obj["tag_id"]}, expect=f"tag {obj['tag_id']} visible")],
-                   [obj.get("source_id", "")], trace + [f"object -> tag {obj['tag_id']} via {obj.get('source_id')}"], physical=False)
+        return _unfinished(text, t, ("find",), bundle, trace) or _ok(
+            goal, [Step(op="detect_tag", args={"tag_id": obj["tag_id"]}, expect=f"tag {obj['tag_id']} visible")],
+            [obj.get("source_id", "")], trace + [f"object -> tag {obj['tag_id']} via {obj.get('source_id')}"], physical=False)
 
     # 5. composite fetch, possibly decided by a rule in memory
     rule = matching_constraint(t, bundle)
@@ -435,6 +506,9 @@ def _parse(text: str, bundle: dict) -> ParseResult:
                                trace=trace, data={"options": [z.get("name") for z in bundle.get("zones", [])]})
         evidence += [e for e in (obj.get("source_id"), zone.get("source_id")) if e and e not in evidence]
         trace.append(f"object '{obj['name']}' -> tag {obj['tag_id']}; destination '{zone['name']}' -> zone {zone['zone']}")
+        unfinished = _unfinished(text, t, ("fetch", "rule"), bundle, trace)  # before an approved skill, too
+        if unfinished:
+            return unfinished
         sp = skill_plan(t, goal, bundle, int(obj["tag_id"]), str(zone["zone"]), evidence)
         if sp:
             r = ParseResult("plan", text, plan=sp, quip=quip("skill"), trace=trace + [f"reused APPROVED skill {sp.skill_id}"])
