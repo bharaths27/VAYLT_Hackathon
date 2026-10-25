@@ -203,9 +203,9 @@ class Engine:
         if bundle is None or bundle.goal != request:
             bundle = self.memory.retrieve_memory_bundle(request, self.skills.approved_names())
         targets = targets_in(request, self.memory)
-        zone = find_zone(request, self.zones)
+        zone = find_zone(request, self.zones)  # None: a place that is not a zone, so no skill; the planner asks which
         fixed = self.fixed_requests.get(normalize(request))
-        skill = self.skills.find(targets, zone) if targets and fixed is None else None
+        skill = self.skills.find(targets, zone) if targets and zone and fixed is None else None
         if fixed is not None:
             plan = {"goal": request, "steps": copy.deepcopy(fixed), "evidence": [], "rules_used": []}
             res = PlanResult(plan, classification="understood", planner_calls=0, source="fixed", targets=targets,
