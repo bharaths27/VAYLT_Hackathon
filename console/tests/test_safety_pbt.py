@@ -9,6 +9,7 @@ Properties:
 """
 import asyncio
 
+import pytest
 from hypothesis import given, settings, strategies as st
 
 from server.adapters.memory import MockMemory
@@ -40,6 +41,14 @@ def test_p1_any_word_salad_is_safe(words):
     assert r.kind in {"plan", "abstain", "clarify", "rule", "prospective", "stop"}
     if r.plan is not None:
         assert_plan_safe(r.plan)
+
+
+@pytest.mark.parametrize("text", ["find tag 500", "find tag 250", "bring tag 9999 to the bench"])
+def test_p1_out_of_range_tag_is_a_clarification_not_a_crash(text):
+    # Found by test_p1_any_word_salad_is_safe: the tag-lookup plan failed validation and the
+    # PlanError escaped parse().
+    r = parse(text, BUNDLE)
+    assert r.kind == "clarify" and r.plan is None and "outside" in r.reason
 
 
 @settings(max_examples=400, deadline=None)

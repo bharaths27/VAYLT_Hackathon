@@ -159,6 +159,16 @@ PROSPECTIVE = re.compile(r"^(?:in|after)\s+(\d+|\w+)\s*(seconds?|secs?|minutes?|
 
 
 def parse(text: str, bundle: dict) -> ParseResult:
+    """Never raises for a request the primitives cannot express: a plan that fails validation
+    (for example a tag id outside the allowed range) comes back as a clarification."""
+    try:
+        return _parse(text, bundle)
+    except PlanError as e:
+        return ParseResult("clarify", text, reason=f"I can't plan that safely: {e}", quip=quip("clarify"),
+                           trace=[f"plan rejected by validation: {e}"])
+
+
+def _parse(text: str, bundle: dict) -> ParseResult:
     t = _norm(text)
     trace: list[str] = [f"normalized: '{t}'"]
     if not t:
