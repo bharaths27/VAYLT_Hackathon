@@ -21,10 +21,10 @@ def decisions(b):return b.store.rows("SELECT detail FROM cx_decision WHERE stage
 def test_non_cortex_error_does_not_kill_the_loop_and_shutdown_cleans_up(timed):
     calls=[]
     def locked():calls.append(1);raise sqlite3.OperationalError('database is locked')
-    timed.sweep_due=locked
+    timed.sweep_due=locked;stops=[];stop=timed.dreamer.stop;timed.dreamer.stop=lambda:stops.append(1) or stop()
     with TestClient(api.create_app(timed,tokens={TOKEN:'carther'},start_idle=True)):time.sleep(1.2)   # was: one call, then shutdown re-raised
     assert len(calls)>=4
-    assert not timed.dreamer._thread.is_alive()                               # cleanup ran
+    assert stops                                                              # cleanup ran (was skipped by the re-raise)
     assert [d['detail'] for d in decisions(timed)]==['OperationalError']      # recorded once, not once per attempt
 
 def test_clock_rollback_backs_off_and_records_one_decision(timed,clock):

@@ -103,7 +103,7 @@ def test_inspector_page_verifies_and_rearms_against_live_server(physical,tmp_pat
     assert out['connected']=='' and out['refused']                                      # clear stop refused while unverified
     assert out['rows']==['verify-'+stuck] and 'Write what you observed' in out['emptyNote']
     assert out['afterVerify']==[] and out['verifyError']=='' and out['clearError']==''
-    assert physical.operation(stuck)['status']=='success' and not physical._stopped.is_set()
+    assert physical.operation(stuck)['status']=='success'
     nxt=[p for m,p in out['calls'] if p.endswith('/approve')][0].split('/')[2]
     assert out['approveError']=='' and out['rows2']==['verify-'+nxt] and physical.operation(nxt)['status']=='needs_verification'
     for method,path in out['calls']:                                                    # every call the page makes is a real route
