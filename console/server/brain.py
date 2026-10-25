@@ -8,6 +8,7 @@ robot signing and execution; the console never calls the robot for these plans.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -74,9 +75,11 @@ async def pending() -> list[dict]:
 
 
 async def running() -> list[dict]:
-    """The plans the brain is executing now, whoever started them. Raises if the brain cannot say within a few
-    seconds (a stop may be waiting on the answer): the caller then assumes one is running."""
-    return await _get("/operations/running", timeout=config.BRAIN_QUICK_TIMEOUT_S)
+    """The plans the brain is executing now, whoever started them. Raises if the brain cannot say within
+    config.BRAIN_QUICK_TIMEOUT_S, whatever the transport (a stop may be waiting on the answer): the caller then
+    assumes one is running."""
+    return await asyncio.wait_for(_get("/operations/running", timeout=config.BRAIN_QUICK_TIMEOUT_S),
+                                  config.BRAIN_QUICK_TIMEOUT_S)
 
 
 async def approve(oid: str, digest: str) -> dict:

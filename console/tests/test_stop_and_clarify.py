@@ -382,3 +382,22 @@ def test_a_brain_plan_stopped_by_the_rule_shows_stopped(c, on_brain):
     assert j["kind"] == "clarify" and j["stopped"] is True
     done = wait(c, op["id"])
     assert done["status"] == "STOPPED" and [s["status"] for s in done["steps"]] == ["succeeded", "skipped"]
+
+
+class SlowBrain(FakeBrain):
+    """A brain that answers "what is running?" only after the console has stopped waiting."""
+
+    async def __call__(self, request):
+        if request.url.path == "/operations/running":
+            await asyncio.sleep(1.0)
+            return httpx.Response(200, json=[])              # "nothing", but too late to count
+        return super().__call__(request)
+
+
+def test_a_brain_too_slow_to_say_what_runs_counts_as_running(c, on_brain, monkeypatch):
+    monkeypatch.setattr(main.config, "BRAIN_QUICK_TIMEOUT_S", 0.2)
+    on_brain(SlowBrain(UNKNOWN))
+    t0 = time.monotonic()
+    j = c.post("/commands", json={"text": "bring the thing"}).json()
+    assert j["kind"] == "clarify" and j["stopped"] is True and main.engine.stopped
+    assert time.monotonic() - t0 < 0.9                       # it stopped without waiting for the slow answer
