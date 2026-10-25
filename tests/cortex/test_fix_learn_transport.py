@@ -65,7 +65,8 @@ def test_stalled_advisor_never_makes_qwen_capacity_busy(monkeypatch):
         return Fake()(url,payload,headers,timeout)
     monkeypatch.setattr(M,'_request_json_blocking',blocking)
     try:
-        adv=IntentAdvisor(model='test-intent-model',enabled=True,api_key='TEST_NOT_A_KEY',timeout_s=.1)
+        monkeypatch.setenv('TYPESAFE_INTENT_MODEL','test-intent-model')
+        adv=IntentAdvisor(enabled=True,api_key='TEST_NOT_A_KEY',timeout_s=.1)
         for _ in range(3): assert adv.route('synthetic',disclosure_allowed=True)['status']=='unavailable'
         out=QwenClient(timeout_s=2).complete('plan',{},goal=Goal('fetch',('sample_a',),'bench').to_dict())
         assert out.value['steps']==PLAN_A

@@ -250,7 +250,7 @@ class Dreamer:
                 if self.store.one('SELECT 1 FROM cx_practice WHERE id=?',(case_id,)): continue
                 # Unpractised goals left for a later cycle are a backlog: the watermark must not hide them.
                 if not still_idle() or len(practiced)>=self.store.policy.dream_batch: leftover=True; break
-                if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(self.store.clock()-self.PRACTICE_WINDOW_S,))['n']>=self.LIVE_CAP: break
+                if self.store.one('SELECT COUNT(*) n FROM cx_practice WHERE created_at>?',(self.store.clock()-self.PRACTICE_WINDOW_S,))['n']>=self.LIVE_CAP: leftover=True; break
                 fixture=compiler.fixture()
                 try:
                     plan=compiler.compile(goal,fixture); plan['refs']=sorted(set(plan['refs']+refs))
