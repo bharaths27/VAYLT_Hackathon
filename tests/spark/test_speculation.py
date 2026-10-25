@@ -420,6 +420,31 @@ def test_stop_ends_a_final_that_is_waiting_for_the_model():
     assert out["r"].action == "ignored" and len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("partial_first", [True, False], ids=["reused prediction", "fresh final"])
+def test_stop_during_the_finals_prefetch_discards_the_final(spawn, clock, partial_first):
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_prefetch(text):
+        entered.set()
+        assert release.wait(5)
+        return {"goal": text}
+
+    fake = FakeIntent()
+    gate = SpeculationGate(fake, prefetch=slow_prefetch, clock=clock, spawn=spawn)
+    if partial_first:
+        gate.on_partial(1, 0, "Open the claw")
+        spawn.run_all()                                  # prediction stored; its bundle not fetched yet
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", gate.on_final(1, 1, "Open the claw")))
+    t.start()
+    assert entered.wait(5)                               # the final is inside the prefetch
+    assert gate.on_partial(1, 2, "stop").action == "stop"
+    release.set()
+    t.join(5)
+    assert out["r"].action == "ignored" and out["r"].reason == "stopped"
+    assert len(fake.calls) == 1
+
+
 def test_stop_wins_even_with_malformed_ids(fake, spawn, clock):
     gate = make_gate(fake, spawn, clock)
     assert gate.on_partial(-1, True, "Stop").action == "stop"
@@ -461,6 +486,11 @@ def test_stop_word_matching_uses_whole_words():
 ])
 def test_future_event(text, event):
     assert future_event(text) == event
+
+
+def test_a_classifier_that_cannot_be_called_is_refused_when_wiring():
+    with pytest.raises(TypeError):
+        SpeculationGate(object())
 
 
 def test_thresholds_are_explicitly_experimental():

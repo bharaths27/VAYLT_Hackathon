@@ -26,7 +26,7 @@ class Recording:
         self.decisions = []
 
     def __call__(self, text, partial):
-        d = self.client.classify(text, partial)
+        d = self.client(text, partial)       # the client is itself the gate's classifier
         self.decisions.append((text, partial, d))
         return d
 

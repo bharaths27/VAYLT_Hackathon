@@ -2,6 +2,7 @@
 
 import json
 import logging
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -10,7 +11,7 @@ import pytest
 
 from engram.spark import _http
 from engram.spark.intent_client import (
-    ENDPOINT, QUESTIONS, IntentClient, IntentConfigError, IntentDecision, IntentError, parse_reply,
+    ENDPOINT, MAX_TEXT, QUESTIONS, IntentClient, IntentConfigError, IntentDecision, IntentError, parse_reply,
 )
 
 KEY = "unit-test-placeholder-value"   # not a real key; only checked for leaks
@@ -233,6 +234,93 @@ def test_a_trickling_server_cannot_hold_the_caller_past_the_deadline(phase):
         assert time.monotonic() - t0 < 1.5
     finally:
         srv.close()
+
+
+def _http_workers():
+    return sum(1 for t in threading.enumerate() if t.name == "spark-http" and t.is_alive())
+
+
+def test_a_stalled_resolver_cannot_pile_up_workers(monkeypatch):
+    assert _no_http_workers_left()
+    release = threading.Event()
+
+    def stuck_resolve(*args, **kwargs):          # a name lookup that never answers until the test ends
+        release.wait(10)
+        raise socket.gaierror("released by the test")
+
+    monkeypatch.setattr(_http, "_resolve", stuck_resolve)
+    outcomes = []
+    try:
+        for _ in range(3 * _http.MAX_OUTSTANDING):
+            t0 = time.monotonic()
+            with pytest.raises((TimeoutError, _http.Busy)) as err:
+                _http.post("https://intent.invalid/v1/systemone", b"{}", {}, 0.1)
+            outcomes.append(type(err.value).__name__)
+            assert time.monotonic() - t0 < 0.5
+            assert _http_workers() <= _http.MAX_OUTSTANDING
+    finally:
+        release.set()
+    assert outcomes == ["TimeoutError"] * _http.MAX_OUTSTANDING + ["Busy"] * (2 * _http.MAX_OUTSTANDING)
+    assert _no_http_workers_left()
+
+    def no_such_host(*args, **kwargs):
+        raise socket.gaierror("no such host")
+
+    monkeypatch.setattr(_http, "_resolve", no_such_host)
+    with pytest.raises(socket.gaierror):          # the slots came back: a new request runs again
+        _http.post("https://intent.invalid/v1/systemone", b"{}", {}, 1.0)
+
+
+class _StalledSocket:
+    """A socket whose connect is never answered: it waits out the timeout it was given, forever if none."""
+
+    release = threading.Event()
+    made: list = []
+
+    def __init__(self, *args):
+        self.timeout = None
+        _StalledSocket.made.append(self)
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def connect(self, sockaddr):
+        if not self.release.wait(self.timeout):
+            raise socket.timeout("timed out")
+        raise ConnectionRefusedError("released by the test")
+
+    def close(self):
+        pass
+
+
+def test_connect_attempts_end_by_the_deadline_so_workers_never_pile_up(monkeypatch):
+    assert _no_http_workers_left()
+    _StalledSocket.release.clear()
+    _StalledSocket.made.clear()
+    monkeypatch.setattr(_http, "_resolve", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                                                               ("192.0.2.1", 443))])
+    monkeypatch.setattr(_http, "_new_socket", _StalledSocket)
+    try:
+        for _ in range(2 * _http.MAX_OUTSTANDING):      # more than the cap: none may be refused as Busy
+            t0 = time.monotonic()
+            with pytest.raises(TimeoutError):
+                _http.post("https://intent.invalid/v1/systemone", b"{}", {}, 0.2)
+            assert time.monotonic() - t0 < 0.6
+            assert _no_http_workers_left(within_s=0.5)  # the connect itself gave up at the deadline
+        assert len(_StalledSocket.made) == 2 * _http.MAX_OUTSTANDING
+        assert all(s.timeout is not None and 0 < s.timeout <= 0.2 for s in _StalledSocket.made)
+    finally:
+        _StalledSocket.release.set()
+
+
+def test_overlong_transcripts_are_refused_and_nothing_is_sent():
+    t = FakeTransport()
+    c = client(t)
+    c.classify("a" * MAX_TEXT, True)                     # exactly at the limit is fine
+    assert len(t.sent) == 1
+    with pytest.raises(IntentError, match="longer than"):
+        c.classify("Open the claw " + "x" * MAX_TEXT + ", no, don't", False)
+    assert len(t.sent) == 1                              # the long one never left the machine
 
 
 @pytest.mark.parametrize("status", [301, 302, 307, 308])

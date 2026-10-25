@@ -36,7 +36,7 @@ from .presets import PRESETS
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_TIMEOUT_S = 4.0
 MAX_TIMEOUT_S = 10.0
-MAX_TEXT = 1000
+MAX_TEXT = 1000          # longer transcripts are refused (IntentError), never cut short
 NO_PRESET = "none"
 
 log = logging.getLogger("engram.spark.intent")
@@ -193,18 +193,25 @@ class IntentClient:
         return f"IntentClient(model={self.model!r}, timeout_s={self.timeout_s})"
 
     def request_body(self, text: str, partial: bool) -> dict[str, Any]:
+        if not isinstance(text, str) or len(text) > MAX_TEXT:
+            # Never classify a prefix: the words after the cut could be "no, don't" or "after ...".
+            raise IntentError(f"transcript longer than {MAX_TEXT} characters; not classified")
         return {
             "model": self.model,
             "state": {
-                "transcript": text[:MAX_TEXT],
+                "transcript": text,
                 "transcript_is_partial": bool(partial),
                 "listener": "a small lab robot with a gripper and a camera",
             },
             "questions": QUESTIONS,
         }
 
+    def __call__(self, text: str, partial: bool) -> IntentDecision:
+        """The client is itself a classifier: pass it straight to SpeculationGate or VoiceIntegration."""
+        return self.classify(text, partial)
+
     def classify(self, text: str, partial: bool) -> IntentDecision:
-        body = json.dumps(self.request_body(text, partial)).encode()
+        body = json.dumps(self.request_body(text, partial)).encode()   # raises before anything is sent
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.__key}"}
         t0 = time.perf_counter()
         failed = None

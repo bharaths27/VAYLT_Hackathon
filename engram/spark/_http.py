@@ -1,11 +1,14 @@
 """One small HTTP POST helper shared by the intent client and the local whisper client.
 
-- Absolute deadline: timeout_s bounds the WHOLE exchange (connect, send, status line,
-  headers and body), not each socket operation. A server that trickles one byte at a time
-  cannot hold the caller past the deadline: the exchange runs on a short-lived worker
-  thread, the caller stops waiting at the deadline and raises TimeoutError, and the socket
-  is shut down so the abandoned worker ends as well. The worker also checks the deadline
-  between body chunks.
+- Absolute deadline: timeout_s bounds the WHOLE exchange (resolve, connect, send, status
+  line, headers and body), not each socket operation. The exchange runs on a short-lived
+  worker thread; the caller stops waiting at the deadline and raises TimeoutError.
+- Bounded workers: an abandoned worker must end too, or repeated timeouts pile them up.
+  Each connect attempt is given only the time left before the deadline; once connected, the
+  socket is shut down at the deadline, which unblocks any read or TLS handshake; and the
+  worker checks the deadline between body chunks. Name resolution cannot be interrupted from
+  Python, so at most MAX_OUTSTANDING workers may exist at once: when they are all still
+  busy, post() fails fast with Busy instead of starting another thread.
 - Redirects are never followed (http.client has no redirect logic): a 3xx comes back as its
   status code, so a moved or hijacked endpoint cannot forward the request, or its
   Authorization header, anywhere else.
@@ -24,10 +27,43 @@ import time
 import urllib.parse
 
 MAX_REPLY_BYTES = 256 * 1024
+MAX_OUTSTANDING = 4          # worker threads (live or abandoned) allowed at once, across all callers
 _CHUNK = 16 * 1024
+_SLOTS = threading.BoundedSemaphore(MAX_OUTSTANDING)
+
+# Swapped out in tests to simulate a resolver or a connect that never answers.
+_resolve = socket.getaddrinfo
+_new_socket = socket.socket
 
 
-def _connection(url: str, timeout_s: float) -> tuple[http.client.HTTPConnection, str]:
+class Busy(OSError):
+    """Too many earlier requests are still unwinding; refusing to start another."""
+
+
+def _connect_by(deadline: float):
+    """A replacement for socket.create_connection whose connect attempts end by the deadline."""
+
+    def create_connection(address, timeout=None, source_address=None):  # noqa: ANN001, ARG001
+        host, port = address
+        last: OSError | None = None
+        for family, kind, proto, _, sockaddr in _resolve(host, port, 0, socket.SOCK_STREAM):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("deadline passed before connecting")
+            sock = _new_socket(family, kind, proto)
+            try:
+                sock.settimeout(left)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as e:
+                last = e
+                sock.close()
+        raise last or OSError(f"no address for {host}")
+
+    return create_connection
+
+
+def _connection(url: str, deadline: float, timeout_s: float) -> tuple[http.client.HTTPConnection, str]:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme == "https":
         conn: http.client.HTTPConnection = http.client.HTTPSConnection(
@@ -36,6 +72,8 @@ def _connection(url: str, timeout_s: float) -> tuple[http.client.HTTPConnection,
         conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout_s)
     else:
         raise ValueError("only http and https URLs are supported")
+    # http.client opens its socket through this attribute (HTTPS wraps it in TLS afterwards).
+    conn._create_connection = _connect_by(deadline)  # type: ignore[attr-defined]
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     return conn, path
 
@@ -52,9 +90,12 @@ def _abort(conn: http.client.HTTPConnection) -> None:
 
 def post(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tuple[int, bytes]:
     """POST and return (status, body) within timeout_s in total. Raises TimeoutError at the deadline,
-    OSError for connection failures and ValueError for an oversized reply."""
+    Busy when too many earlier workers are still unwinding, OSError for connection failures and
+    ValueError for an oversized reply."""
     deadline = time.monotonic() + timeout_s
-    conn, path = _connection(url, timeout_s)
+    conn, path = _connection(url, deadline, timeout_s)
+    if not _SLOTS.acquire(blocking=False):
+        raise Busy(f"{MAX_OUTSTANDING} earlier requests are still outstanding")
     out: dict[str, object] = {}
 
     def exchange() -> None:
@@ -77,9 +118,14 @@ def post(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tu
             out["error"] = e
         finally:
             conn.close()
+            _SLOTS.release()
 
     worker = threading.Thread(target=exchange, name="spark-http", daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        _SLOTS.release()
+        raise
     worker.join(max(0.0, deadline - time.monotonic()))
     if worker.is_alive():
         _abort(conn)

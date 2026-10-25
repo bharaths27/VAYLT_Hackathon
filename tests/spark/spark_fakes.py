@@ -103,3 +103,25 @@ def spawn():
 @pytest.fixture
 def clock():
     return Clock()
+
+
+def reply_body(preset="open_gripper", confidence=0.95, **probs):
+    """A well-formed intent model reply, as bytes."""
+    import json
+
+    answers = {name: {"type": "noul", "noul": probs.get(name, 0.9 if name in ("ready", "directed") else 0.02)}
+               for name in ("ready", "directed", "negated", "future", "correction")}
+    answers["preset"] = {"type": "choice", "choice": preset, "confidence": confidence}
+    return json.dumps({"answers": answers}).encode()
+
+
+class RecordingTransport:
+    """Stands in for the network under a real IntentClient; records every request it is given."""
+
+    def __init__(self, body=None):
+        self.body = body or reply_body()
+        self.sent = []
+
+    def __call__(self, url, body, headers, timeout_s):
+        self.sent.append(body)
+        return 200, self.body

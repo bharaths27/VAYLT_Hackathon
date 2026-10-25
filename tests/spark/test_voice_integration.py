@@ -10,9 +10,10 @@ from engram.capabilities import CAPABILITIES
 from engram.db import SCHEMA
 from engram.engine import Engine, EngineError
 from engram.robot.mock import MockRobot
+from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
 from engram.spark.voice_integration import VoiceIntegration, memory_version
-from spark_fakes import FakeIntent, clock, decision, fake, spawn  # noqa: F401  (fixtures)
+from spark_fakes import FakeIntent, RecordingTransport, clock, decision, fake, spawn  # noqa: F401  (fixtures)
 
 OBSERVED_ONLY = [("observe", {})]   # the fixture's overhead scan; nothing else may reach the robot
 ROOT = Path(__file__).resolve().parents[2]
@@ -138,6 +139,21 @@ def test_new_memory_between_partial_and_final_means_asking_again(voice, spawn, f
     assert memory_version(voice.engine) != before
     out = voice.on_final(1, 1, "Open the claw")
     assert out["status"] == "proposed" and not out["reused_prediction"] and len(fake.calls) == 2
+
+
+def test_an_overlong_transcript_is_never_classified_or_acted_on(taught, spawn, clock):
+    net = RecordingTransport()                                  # would answer "open the gripper", confidently
+    voice = VoiceIntegration(taught, IntentClient("placeholder", "intent-model-under-test", transport=net),
+                             spawn=spawn, clock=clock)
+    long_text = "Open the claw " + "and keep going " * 80        # over MAX_TEXT
+    assert len(long_text) > MAX_TEXT
+    voice.on_partial(1, 0, long_text)
+    spawn.run_all()
+    assert voice.gate.prepared() is None and voice.gate.stats.errors == 1
+    out = voice.on_final(1, 1, long_text)
+    assert out["kind"] == "clarify" and "say it again" in out["reason"] and net.sent == []
+    assert nothing_happened(taught)
+    assert voice.on_final(2, 0, "Open the claw")["status"] == "proposed" and len(net.sent) == 1   # control
 
 
 def test_not_a_preset_does_nothing(voice):

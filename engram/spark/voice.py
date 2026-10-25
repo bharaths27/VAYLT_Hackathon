@@ -164,6 +164,8 @@ class SpeculationGate:
                  ttl_s: float = DEFAULT_TTL_S, final_wait_s: float = DEFAULT_FINAL_WAIT_S,
                  clock: Callable[[], float] = time.monotonic,
                  spawn: Callable[[Callable[[], None]], None] = _spawn_thread):
+        if not callable(classifier):   # fail at wiring time, not as a silent error on every request
+            raise TypeError("classifier must be callable as classifier(text, partial)")
         self._classifier = classifier
         self._prefetch = prefetch
         self._context = context_version
@@ -285,29 +287,28 @@ class SpeculationGate:
                 key, reused = self._dispatch(), False
         if not reused:
             decision, bundle = self._ask(key, partial=False), None
-            ctx = self._context()
             with self._cv:
-                self._ctx_now = ctx
                 self._in_flight = None
-                stopped = self._is_stopped(utterance)
-                current = self._current(key)
                 nxt = self._take_pending()   # a newer utterance may have queued a partial meanwhile
                 self._cv.notify_all()
             if nxt is not None:
                 self._spawn(lambda: self._run(nxt))
-            if stopped:
-                return GateResult("ignored", utterance, revision, text, reason="stopped")
             if decision is None:
                 return GateResult("clarify", utterance, revision, text,
                                   reason="I could not work out what you meant. Please say it again.")
-            if not current:
-                with self._cv:
-                    self.stats.stale_dropped += 1
-                return GateResult("none", utterance, revision, text,
-                                  reason="Things changed while I was listening. Please say it again.")
         if bundle is None and self._actionable(text, decision):
             bundle = self._fetch_bundle(text)
-        return self._decide(key, decision, bundle, reused=reused)
+        # Last check, after every wait (the model, the prefetch): act only if nothing moved on meanwhile.
+        ctx = self._context()
+        with self._cv:
+            self._ctx_now = ctx
+            if self._is_stopped(utterance):
+                return GateResult("ignored", utterance, revision, text, reason="stopped")
+            if not self._current(key):
+                self.stats.stale_dropped += 1
+                return GateResult("none", utterance, revision, text,
+                                  reason="Things changed while I was listening. Please say it again.")
+            return self._decide(key, decision, bundle, reused=reused)
 
     # ---- internals (lock held unless noted) ------------------------------------
 
