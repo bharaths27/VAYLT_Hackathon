@@ -157,6 +157,5 @@ def test_restart_does_not_replay_unknown_effect(tmp_path,arena,clock):
 
 def test_only_one_process_owner(tmp_path,arena):
     pth=tmp_path/'db'; s=Store(pth); s.register_arena(arena); b=Brain(s,FakeRobot(arena))
-    s2=Store(pth)
-    with pytest.raises(Conflict): Brain(s2,FakeRobot(arena))
-    s2.close();b.close()
+    with pytest.raises(Conflict): Store(pth)  # refused before it can migrate or register an arena
+    b.close()

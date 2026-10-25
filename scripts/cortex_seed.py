@@ -10,7 +10,7 @@ from engram.cortex.types import Denied
 def main():
     p=argparse.ArgumentParser();p.add_argument('--db',type=Path,required=True);p.add_argument('--arena',type=Path,default=ROOT/'fixtures/cortex/arena.json');p.add_argument('--seed',type=Path,default=ROOT/'fixtures/cortex/memory_seed.json');p.add_argument('--reviewed-by',required=True);a=p.parse_args()
     with vault_lock.acquire(str(a.db)):
-        s=Store(a.db)
+        s=Store(a.db,lock=False)
         try:
             if s.one("SELECT 1 FROM cx_episode WHERE mode='PHYSICAL'") or s.one("SELECT 1 FROM cx_manifest WHERE id='runtime' AND payload_json LIKE '%PHYSICAL%'"):
                 raise Denied('refusing to seed a vault with physical runtime history')

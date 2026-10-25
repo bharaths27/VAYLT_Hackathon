@@ -23,6 +23,9 @@ WHEN=re.compile(r'^\s*(?:when|once|after|as soon as)\s+(.+?),\s*(?:then\s+)?(.+)
 
 
 class Brain:
+    CLOCK_JUMP_S=3600.0  # a larger forward step between sweeps needs operator confirmation
+    CATCHUP_MAX=2        # overdue timers woken by such a step; the rest wait for the operator
+
     def __init__(self,store: Store,robot,*,qwen: QwenClient | None=None,intent: IntentAdvisor | None=None,
                  acquire_lock: bool=True):
         self.store,self.robot=store,robot
@@ -34,7 +37,7 @@ class Brain:
         store.runtime_mode=self.mode
         if self.mode=='PHYSICAL' and not store.policy.live_enabled:
             raise Denied('live adapter requires an explicit trusted enablement and witnessed hardware acceptance')
-        if acquire_lock and store.path!=':memory:':
+        if acquire_lock and store.path!=':memory:' and store.file_lock is None:
             self._file_lock=vault_lock.acquire(store.path)
         self.recover()
         if qwen: store.manifest('qwen','parametric',qwen.manifest())
@@ -53,14 +56,15 @@ class Brain:
             self._recoverable_preparing={r['id'] for r in self.store.rows("SELECT id FROM episode WHERE outcome='preparing' AND id IN (SELECT id FROM cx_episode)")}
             running=self.store.rows("SELECT id FROM episode WHERE outcome='running' AND id IN (SELECT id FROM cx_episode)")
             for r in running:
-                self.store.conn.execute("UPDATE episode SET outcome='unknown',failure='Restart interrupted execution; no automatic replay',finished_at=? WHERE id=?",(self.store.clock(),r['id']))
+                self.store.settle(r['id'],'unknown',('running',),'Restart interrupted execution; no automatic replay')
                 self.journal(r['id'],'recovery',{},'unknown','requires operator reconciliation')
-            if running: self._stopped.set()
+            if running: self._latch('restart interrupted execution')
+            if self.store.one("SELECT 1 FROM meta WHERE key='cortex_stop'"): self._stopped.set()
             self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<?)",(self.store.clock(),))
             self.store.conn.execute("UPDATE cx_wake SET status='pending' WHERE status='preparing'")
             # Existing task links remain durable; recovery never dispatches physical effects.
             for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('unknown','success','failed','aborted','cancelled','rejected')"):
-                self._finish_task(r['id'],r['outcome'])
+                self.store.finish_task(r['id'],r['outcome'])
 
     def _advisor(self,stage,state,questions,allowed=False):
         answer=self.intent.evaluate(stage,state,questions,disclosure_allowed=bool(allowed and self.store.policy.cloud_enabled))
@@ -93,7 +97,7 @@ class Brain:
             return {'kind':'proposal',**self.propose(goal,request,principal=principal,idempotency_key=idempotency_key,extra_refs=alias_refs,cloud_allowed=cloud_allowed)}
 
     def propose(self,goal: Goal,request: str,*,principal: str,idempotency_key: str | None=None,
-                extra_refs: list[str] | None=None,cloud_allowed: bool=False) -> dict:
+                extra_refs: list[str] | None=None,cloud_allowed: bool=False,wake: tuple | None=None) -> dict:
         goal=Goal.from_dict(goal.to_dict()); principal=text(principal,'principal',100)
         if safety_reason(request): raise Denied(safety_reason(request))
         request=text(request,'request',2000)
@@ -106,6 +110,7 @@ class Brain:
                 if prior:
                     if prior['input_hash']!=ih: raise Conflict('idempotency key reused with changed input')
                     if prior['id'] not in self._recoverable_preparing:
+                        if wake: self._link(prior['id'],wake)
                         return self.operation(prior['id'])
                     ep=prior['id']; self._recoverable_preparing.remove(ep)
             t=self.store.clock(); basis=self.store.basis(goal)
@@ -183,6 +188,8 @@ class Brain:
                 with self.store.tx():
                     self.store.conn.execute("UPDATE episode SET outcome='proposed',plan_json=?,evidence_json=?,planner_calls=?,skill_id=? WHERE id=? AND outcome='preparing'",
                         (canonical(plan),canonical(meta),calls,skill['id'] if skill else None,ep))
+                    # A woken proposal becomes approvable only already linked to its commitment.
+                    if wake: self._link(ep,wake)
                 return self.operation(ep)
             except Exception as e:
                 with self.store.tx(): self.store.conn.execute("UPDATE episode SET outcome='rejected',failure=?,finished_at=? WHERE id=? AND outcome='preparing'",(str(e)[:500] if isinstance(e,CortexError) else type(e).__name__,self.store.clock(),ep))
@@ -204,7 +211,7 @@ class Brain:
         with self.store.tx():
             self.store.conn.execute("UPDATE episode SET outcome='expired' WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode WHERE expires_at<=?)",(self.store.clock(),))
         with self.store.tx():
-            for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('expired','invalidated')"):self._finish_task(r['id'],r['outcome'])
+            for r in self.store.rows("SELECT id,outcome FROM episode WHERE outcome IN ('expired','invalidated')"):self.store.finish_task(r['id'],r['outcome'])
         return [self.operation(r['id']) for r in self.store.rows("SELECT id FROM episode WHERE outcome='proposed' AND id IN (SELECT id FROM cx_episode) ORDER BY started_at DESC")]
 
     def journal(self,ep: str | None,op: str,args: dict,status: str,detail: str='',step: int=0):
@@ -222,6 +229,7 @@ class Brain:
                     if r['owner']!=principal: raise Denied('approver does not own this operation')
                     if r['status']!='proposed': raise Conflict('operation is not awaiting approval')
                     if self._stopped.is_set() or self.robot.state().get('stopped'): raise Denied('stop is latched')
+                    self._require_reconciled('new motion')
                     if self.store.clock()>=r['expires_at']: raise Stale('proposal expired')
                     actual=digest({k:v for k,v in plan.items() if k!='verification'})
                     if supplied_digest!=actual or supplied_digest!=r['digest']: raise Conflict('approval does not match this exact plan')
@@ -230,6 +238,10 @@ class Brain:
                         recipe=self.store.derived(r['derived_memory_id'])
                         if recipe['status']!='VERIFIED' or recipe['payload'].get('steps')!=plan['steps'] or not self.store.refs_valid(recipe['refs']):
                             raise Stale('execution recipe changed or lost its evidence')
+                    if r['skill_id']:
+                        skill=self.store.one('SELECT status,definition_json FROM skill_version WHERE id=?',(r['skill_id'],))
+                        if not skill or skill['status']!='APPROVED' or json.loads(skill['definition_json']).get('steps')!=plan['steps']:
+                            raise Stale('procedure was revoked or changed after proposal')
                     if plan['basis']!=self.store.basis(goal) or plan['policy_hash']!=self.store.policy.fingerprint() or not self.store.refs_valid(plan['refs']):
                         raise Stale('rule, binding, source or policy changed after proposal')
                     if self.store.prohibitions(set(goal.targets)|{r['object'] for r in self.store.related_rules(goal)}) and goal.kind=='fetch': raise Denied('current prohibition blocks this operation')
@@ -298,29 +310,23 @@ class Brain:
             try: self.robot.stop()
             except Exception: reason=(reason or '')+'; stop not confirmed'
         with self.store.tx():
-            self.store.conn.execute('UPDATE episode SET outcome=?,failure=?,finished_at=? WHERE id=?',(outcome,reason,self.store.clock(),ep))
-            self._finish_task(ep,outcome)
+            if outcome in {'unknown','aborted','failed'}: self._latch(f'{ep} ended {outcome}')
+            self.store.settle(ep,outcome,('running',),reason)
         return {**self.operation(ep),'steps':steps}
 
     def verify_outcome(self,ep: str,*,principal: str,ok: bool,note: str):
-        text(note,'verification evidence',1000)
-        r=self.operation(ep)
-        if r['owner']!=principal: raise Denied('verification principal does not own the operation')
-        if r['status'] not in {'needs_verification','unknown'}: raise Conflict('no unresolved effect to verify')
+        note=text(note,'verification evidence',1000); outcome='success' if ok else 'failed'
+        # Check and write in one transaction: a second submission finds nothing left to verify.
         with self.store.tx():
-            outcome='success' if ok else 'failed'
-            self.store.conn.execute('UPDATE episode SET outcome=?,failure=?,finished_at=? WHERE id=?',(outcome,'operator observation: '+note,self.store.clock(),ep))
+            if self.operation(ep)['owner']!=principal: raise Denied('verification principal does not own the operation')
+            if not self.store.settle(ep,outcome,('needs_verification','unknown'),'operator observation: '+note): raise Conflict('no unresolved effect to verify')
             self.journal(ep,'verify',{},outcome,principal+': '+note)
-            self._finish_task(ep,outcome)
         return self.operation(ep)
 
     def reject(self,ep: str,*,principal: str):
         with self.store.tx():
-            r=self.operation(ep)
-            if r['owner']!=principal: raise Denied('not the operation owner')
-            if r['status'] not in {'preparing','proposed'}: raise Conflict('cannot reject an executing or completed operation')
-            self.store.conn.execute("UPDATE episode SET outcome='cancelled',finished_at=? WHERE id=?",(self.store.clock(),ep))
-            self._finish_task(ep,'cancelled')
+            if self.operation(ep)['owner']!=principal: raise Denied('not the operation owner')
+            if not self.store.settle(ep,'cancelled',('preparing','proposed')): raise Conflict('cannot reject an executing or completed operation')
         return self.operation(ep)
 
     def stop(self):
@@ -329,15 +335,32 @@ class Brain:
             self.robot.stop(); confirmed=bool(self.robot.state().get('stopped'))
         except Exception: pass
         with self.store.tx():
-            self.store.conn.execute("UPDATE episode SET outcome='cancelled',failure='stop revoked pending proposal' WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)")
+            self._latch('operator stop')
+            for r in self.store.rows("SELECT id FROM episode WHERE outcome IN ('preparing','proposed') AND id IN (SELECT id FROM cx_episode)"):
+                self.store.settle(r['id'],'cancelled',('preparing','proposed'),'stop revoked pending proposal')
             self.journal(None,'stop',{},'confirmed' if confirmed else 'requested')
         return {'stop_requested':True,'stop_confirmed':confirmed,'auto_resume':False}
 
     def clear_stop(self,*,principal: str):
-        text(principal,'operator',100)
-        if self.store.one("SELECT 1 FROM episode WHERE outcome IN ('running','unknown','needs_verification')"): raise Denied('reconcile running/unknown operations before rearming')
-        self.robot.reset_stop(); self._stopped.clear(); self.activity.touch()
+        principal=text(principal,'operator',100)
+        with self.store.tx():
+            self._require_reconciled('rearming')
+            self.robot.reset_stop()
+            self.store.conn.execute("DELETE FROM meta WHERE key='cortex_stop'")
+            self.journal(None,'clear_stop',{},'cleared',principal)
+            self._stopped.clear()
+        self.activity.touch()
         return self.robot.state()
+
+    def _latch(self,reason: str):
+        # The stop latch is durable: recover() restores it, so a restart cannot silently re-arm motion.
+        self._stopped.set()
+        with self.store.tx(): self.store.conn.execute("INSERT OR IGNORE INTO meta VALUES('cortex_stop',?)",(canonical({'at':self.store.clock(),'reason':reason}),))
+
+    def _require_reconciled(self,action: str):
+        # Cortex operations only, as operation() and verify_outcome() can see them; ids let the operator reconcile each one.
+        ids=[r['id'] for r in self.store.rows("SELECT e.id FROM episode e JOIN cx_episode c ON c.id=e.id WHERE e.outcome IN ('running','unknown','needs_verification') ORDER BY e.started_at,e.id")]
+        if ids: raise Denied(f'reconcile unresolved operations before {action}: '+', '.join(ids[:10])+(f' and {len(ids)-10} more' if len(ids)>10 else ''))
 
     def schedule(self,trigger: str,request: str,*,principal: str,expires_at: float | None=None) -> dict:
         trigger=text(trigger,'trigger',200); request=text(request,'future task',2000)
@@ -368,16 +391,34 @@ class Brain:
 
     def sweep_due(self) -> list[dict]:
         if not self.store.policy.clock_trusted: return []
-        now=self.store.clock()
+        now=self.store.clock(); limit=8
         with self.store.tx():
             last=self.store.one("SELECT value FROM meta WHERE key='cortex_last_utc'")
+            if self.store.one("SELECT 1 FROM meta WHERE key='cortex_clock_hold'"): raise Stale('UTC clock jumped forward; operator must re-establish trusted time')
             if last and now<float(last['value'])-1: raise Stale('UTC clock moved backward; operator must re-establish trusted time')
+            if last and now-float(last['value'])>self.CLOCK_JUMP_S:
+                # Bad NTP, an RTC-less boot or a long outage: wake a bounded few overdue timers, hold the rest for the operator.
+                jump={'last_utc':float(last['value']),'utc':now}
+                self.store.conn.execute("INSERT INTO meta VALUES('cortex_clock_hold',?)",(canonical(jump),))
+                self.journal(None,'clock_jump',jump,'held','operator must re-establish trusted time'); limit=self.CATCHUP_MAX
             self.store.conn.execute("INSERT INTO meta VALUES('cortex_last_utc',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(now),))
-        due=self.store.rows("SELECT p.id,p.trigger,c.owner,c.generation,d.due_at FROM prospective_task p JOIN cx_commitment c ON c.id=p.id JOIN cx_due d ON d.task_id=p.id WHERE p.status='waiting' AND d.due_at<=? ORDER BY d.due_at LIMIT 8",(now,))
+        due=self.store.rows("SELECT p.id,p.trigger,c.owner,c.generation,d.due_at FROM prospective_task p JOIN cx_commitment c ON c.id=p.id JOIN cx_due d ON d.task_id=p.id WHERE p.status='waiting' AND d.due_at<=? ORDER BY d.due_at LIMIT ?",(now,limit))
         results=[]
         for task in due:
             results+=self.trigger(task['trigger'],event_id='due:'+task['id']+':'+str(task['generation']),principal=task['owner'])
         return results
+
+    def reestablish_time(self,*,principal: str,note: str) -> dict:
+        """Operator attests the UTC clock is correct again: resets the high-water mark and releases a jump hold."""
+        principal=text(principal,'operator',100); note=text(note,'time evidence',1000)
+        if not self.store.policy.clock_trusted: raise Denied('timed commitments require a trusted UTC clock policy')
+        now=self.store.clock()
+        with self.store.tx():
+            last=self.store.one("SELECT value FROM meta WHERE key='cortex_last_utc'"); prior=float(last['value']) if last else None
+            self.store.conn.execute("INSERT INTO meta VALUES('cortex_last_utc',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(now),))
+            self.store.conn.execute("DELETE FROM meta WHERE key='cortex_clock_hold'")
+            self.journal(None,'clock_reestablished',{'previous_utc':prior,'utc':now},'confirmed',principal+': '+note)
+        return {'utc':now,'previous_utc':prior,'reestablished_by':principal}
 
     def cancel_task(self,tid: str,*,principal: str) -> dict:
         with self.store.tx():
@@ -385,14 +426,8 @@ class Brain:
             if not r: raise Missing('task not found')
             if r['owner']!=principal: raise Denied('not the task owner')
             if r['status']=='done': raise Conflict('cannot cancel an already completed task')
-            if r['proposal_id']:
-                ep=self.operation(r['proposal_id'])
-                if ep['status'] in {'running','unknown','needs_verification'}:
-                    raise Conflict('effect may have started; stop/reconcile it, do not claim cancellation')
-                self.store.conn.execute("UPDATE episode SET outcome='cancelled',failure='commitment cancelled' WHERE id=? AND outcome IN ('proposed','preparing')",(r['proposal_id'],))
-            self.store.conn.execute("UPDATE prospective_task SET status='cancelled' WHERE id=?",(tid,))
-            self.store.conn.execute('UPDATE cx_commitment SET generation=generation+1 WHERE id=?',(tid,))
-            self.store.conn.execute("UPDATE cx_wake SET status='cancelled' WHERE task_id=? AND status IN ('pending','preparing')",(tid,))
+            if not self.store.withdraw_commitment(tid,'commitment cancelled'):
+                raise Conflict('effect may have started; stop/reconcile it, do not claim cancellation')
         return {'task_id':tid,'status':'cancelled'}
 
     def trigger(self,trigger: str,*,event_id: str,principal: str) -> list[dict]:
@@ -420,23 +455,16 @@ class Brain:
             if w['status']=='linked':
                 out.append({'task_id':task['id'],'proposal':self.operation(w['proposal_id'])}); continue
             if w['status']!='pending' or task['status']!='fired' or task['generation']!=w['generation']: continue
+            key=(w['event_id'],task['id'],w['generation'])
             with self.store.tx():
-                claim=self.store.conn.execute("UPDATE cx_wake SET status='preparing' WHERE event_id=? AND task_id=? AND generation=? AND status='pending'",(w['event_id'],task['id'],w['generation'])).rowcount
+                claim=self.store.conn.execute("UPDATE cx_wake SET status='preparing' WHERE event_id=? AND task_id=? AND generation=? AND status='pending'",key).rowcount
             if not claim: continue
-            proposal=None
             try:
                 goal=parse_goal(task['request'],self.store)
                 proposal=self.propose(goal,task['request'],principal=task['owner'],
-                    idempotency_key=f"wake:{task['id']}:{w['generation']}",extra_refs=['source:'+task['source_id']])
-                with self.store.tx():
-                    current=self.store.one('SELECT p.status,c.generation FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.id=?',(task['id'],))
-                    if current['status']!='fired' or current['generation']!=w['generation']:
-                        if proposal['status'] in {'preparing','proposed'}: self.reject(proposal['operation_id'],principal=task['owner'])
-                        self.store.conn.execute("UPDATE cx_wake SET status='cancelled' WHERE event_id=? AND task_id=? AND generation=?",(w['event_id'],task['id'],w['generation']))
-                        continue
-                    self.store.conn.execute('UPDATE prospective_task SET proposal_id=? WHERE id=?',(proposal['operation_id'],task['id']))
-                    self.store.conn.execute("UPDATE cx_wake SET status='linked',proposal_id=? WHERE event_id=? AND task_id=? AND generation=?",(proposal['operation_id'],w['event_id'],task['id'],w['generation']))
-                out.append({'task_id':task['id'],'proposal':proposal})
+                    idempotency_key=f"wake:{task['id']}:{w['generation']}",extra_refs=['source:'+task['source_id']],wake=key)
+                if self.store.one('SELECT status FROM cx_wake WHERE event_id=? AND task_id=? AND generation=?',key)['status']=='linked':
+                    out.append({'task_id':task['id'],'proposal':proposal})
             except CortexError as e:
                 with self.store.tx():
                     self.store.conn.execute("UPDATE cx_wake SET status='failed',error=? WHERE event_id=? AND task_id=? AND generation=?",(str(e),w['event_id'],task['id'],w['generation']))
@@ -444,10 +472,18 @@ class Brain:
                 out.append({'task_id':task['id'],'error':str(e)})
         return out
 
-    def _finish_task(self,ep: str,outcome: str):
-        state={'success':'done','failed':'failed','rejected':'failed','unknown':'unknown','aborted':'unknown','cancelled':'cancelled','expired':'expired','invalidated':'failed'}.get(outcome)
-        if state:
-            self.store.conn.execute('UPDATE prospective_task SET status=? WHERE proposal_id=? AND status NOT IN (\'cancelled\',\'done\')',(state,ep))
+    def _link(self,ep: str,wake: tuple) -> bool:
+        # Caller holds the transaction. Link only a still-fired commitment of this generation; otherwise withdraw the proposal.
+        event_id,tid,gen=wake
+        cur=self.store.one('SELECT p.status,c.generation FROM prospective_task p JOIN cx_commitment c ON c.id=p.id WHERE p.id=?',(tid,))
+        if not cur or cur['status']!='fired' or cur['generation']!=gen:
+            self.store.conn.execute("UPDATE cx_wake SET status='cancelled' WHERE event_id=? AND task_id=? AND generation=? AND status IN ('pending','preparing')",wake)
+            self.store.settle(ep,'cancelled',('preparing','proposed'),'commitment withdrawn before link')
+            return False
+        self.store.conn.execute('UPDATE prospective_task SET proposal_id=? WHERE id=?',(ep,tid))
+        self.store.conn.execute("UPDATE cx_wake SET status='linked',proposal_id=? WHERE event_id=? AND task_id=? AND generation=?",(ep,*wake))
+        self.store.finish_task(ep,self.store.one('SELECT outcome FROM episode WHERE id=?',(ep,))['outcome'])
+        return True
 
     def metrics(self):
         return {'episodes':self.store.rows('SELECT id,outcome,planner_calls,skill_id FROM episode ORDER BY started_at'),

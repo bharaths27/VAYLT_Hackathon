@@ -396,4 +396,6 @@ def create_app(brain:Brain|None=None,*,tokens:dict[str,str]|None=None,frame_hub:
                         yield b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '+str(len(f.jpeg)).encode()+b'\r\nX-Frame-Sequence: '+str(seq).encode()+b'\r\n\r\n'+f.jpeg+b'\r\n'
             finally:hub.unwatch()
         return StreamingResponse(frames(),media_type='multipart/x-mixed-replace; boundary=frame')
+    @app.post('/clock/reestablish')
+    def reestablish_clock(body:Resolution,principal=Depends(operator)):return b.reestablish_time(principal=principal,note=body.reason)
     return app
