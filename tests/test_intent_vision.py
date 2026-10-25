@@ -131,3 +131,97 @@ def test_find_object_rejects_out_of_range_box_edges():
                                        "where": {"type": "box", "box": {"top": -1, "bottom": 2, "left": 0, "right": 1}}}}
     with pytest.raises(iv.VisionError):
         iv.find_object(png(640, 480), "cup", client(FakeTransport(reply)))
+
+
+def test_error_replies_never_echo_the_body_or_the_key():
+    t = FakeTransport({"error": f"bad token Bearer {KEY}"}, status=401)
+    with pytest.raises(iv.VisionError) as e:
+        iv.classify_hand_signal(png(640, 480), client(t))
+    assert str(e.value) == "HTTP 401" and KEY not in str(e.value)
+
+
+def _choice_reply(**overrides):
+    answer = {"type": "choice", "choice": "fist", "confidence": 0.9,
+              "probabilities": {k: (0.93 if k == "fist" else 0.01) for k in iv.HAND_SIGNALS}}
+    answer.update(overrides)
+    return {"model": "m", "answers": {"signal": answer}}
+
+
+@pytest.mark.parametrize("overrides", [
+    {"confidence": 1.5}, {"confidence": -0.1}, {"confidence": None}, {"confidence": "0.9"}, {"confidence": True},
+    {"confidence": float("nan")},
+    {"probabilities": {k: (None if k == "fist" else 0.01) for k in iv.HAND_SIGNALS}},
+    {"probabilities": {k: ("0.5" if k == "fist" else 0.01) for k in iv.HAND_SIGNALS}},
+    {"probabilities": {k: (2.0 if k == "fist" else 0.01) for k in iv.HAND_SIGNALS}},
+    {"choice": 3},
+])
+def test_out_of_range_or_wrong_type_values_fail_closed(overrides):
+    with pytest.raises(iv.VisionError):
+        iv.classify_hand_signal(png(640, 480), client(FakeTransport(_choice_reply(**overrides))))
+
+
+@pytest.mark.parametrize("box,conf", [({"top": 0.8, "bottom": 0.2, "left": 0.1, "right": 0.9}, 0.9),
+                                      ({"top": 0.1, "bottom": 0.2, "left": 0.1, "right": 0.9}, 1.7),
+                                      ({"top": 0.1, "bottom": 0.2, "left": 0.1}, 0.9)])
+def test_malformed_boxes_fail_closed(box, conf):
+    reply = {"model": "m", "answers": {"present": {"type": "noul", "noul": 0.9},
+                                       "where": {"type": "box", "confidence": conf, "box": box}}}
+    with pytest.raises(iv.VisionError):
+        iv.find_object(png(640, 480), "cup", client(FakeTransport(reply)))
+
+
+def _serve(handler_body):
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            handler_body(self)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}/"
+
+
+def test_the_deadline_covers_the_whole_exchange_even_when_the_server_drips():
+    import time
+
+    def drip(h):
+        h.send_response(200)
+        h.send_header("Content-Length", "100")
+        h.end_headers()
+        for _ in range(100):  # one byte every 0.1 s: each read is quick, the whole reply takes 10 s
+            try:
+                h.wfile.write(b"x")
+                h.wfile.flush()
+            except OSError:
+                return
+            time.sleep(0.1)
+
+    srv, url = _serve(drip)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(iv.VisionError, match="deadline"):
+            iv._default_transport(url, b"{}", {"Content-Type": "application/json"}, 1.0)
+        assert time.monotonic() - t0 < 1.6
+    finally:
+        srv.shutdown()
+
+
+def test_the_default_transport_returns_a_normal_reply():
+    def ok(h):
+        data = b'{"answers": {}}'
+        h.send_response(200)
+        h.send_header("Content-Length", str(len(data)))
+        h.end_headers()
+        h.wfile.write(data)
+
+    srv, url = _serve(ok)
+    try:
+        assert iv._default_transport(url, b"{}", {}, 3.0) == (200, b'{"answers": {}}')
+    finally:
+        srv.shutdown()

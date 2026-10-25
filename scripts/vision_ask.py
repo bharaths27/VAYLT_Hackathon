@@ -50,7 +50,9 @@ def main() -> int:
     src.add_argument("--robot", help="robot server base URL, e.g. http://star-pi.local:8200")
     src.add_argument("--webcam", type=int, help="local camera index")
     ap.add_argument("--what", help="object to find (find mode)")
-    ap.add_argument("--every", type=float, default=0.0, help="seconds between live frames (0 = one frame)")
+    ap.add_argument("--every", type=float, default=0.0,
+                    help="start a live frame every N seconds, or as soon as the last answer is back if that is "
+                         "slower (0 = one frame)")
     ap.add_argument("--timeout", type=float, default=4.0)
     a = ap.parse_args()
     if a.mode == "find" and not a.what:
@@ -90,11 +92,14 @@ def main() -> int:
     label = a.robot or f"webcam {a.webcam}"
     get = (lambda: robot_frame(a.robot)) if a.robot else (lambda: webcam_frame(cap))
     try:
+        next_at = time.monotonic()
         while True:
             run(label, get)
             if a.every <= 0:
                 return 0
-            time.sleep(a.every)
+            next_at += a.every  # a fixed cadence: each frame starts `every` seconds after the last one started,
+            time.sleep(max(0.0, next_at - time.monotonic()))  # or at once when an answer took longer than that
+            next_at = max(next_at, time.monotonic())
     except KeyboardInterrupt:
         return 0
     finally:

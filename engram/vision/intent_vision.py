@@ -19,7 +19,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -62,12 +64,46 @@ class VisionConfigError(VisionError):
     """TYPESAFE_API_KEY or TYPESAFE_INTENT_MODEL is missing."""
 
 
+MAX_REPLY_BYTES = 1 << 20  # a typed answer is a few hundred bytes; anything this big is not one
+
+
 def _default_transport(url: str, body: bytes, headers: dict[str, str], timeout_s: float) -> tuple[int, bytes]:
+    """POST with a wall-clock deadline for the whole exchange.
+
+    httpx timeouts bound each phase, not the total, so a server dripping bytes could hold a plain request
+    open. The request runs on a daemon thread; the caller stops waiting at the deadline, and the abandoned
+    thread stops reading at its next chunk (or its own read timeout)."""
     import httpx  # in requirements.txt
 
-    with httpx.Client(follow_redirects=False, trust_env=False, timeout=httpx.Timeout(timeout_s)) as c:
-        r = c.post(url, content=body, headers=headers)
-        return r.status_code, r.content
+    result: dict[str, Any] = {}
+    finished, abandoned = threading.Event(), threading.Event()
+
+    def work() -> None:
+        try:
+            with httpx.Client(follow_redirects=False, trust_env=False, timeout=httpx.Timeout(timeout_s)) as c:
+                with c.stream("POST", url, content=body, headers=headers) as r:
+                    parts, size = [], 0
+                    for chunk in r.iter_bytes():
+                        if abandoned.is_set():
+                            return
+                        size += len(chunk)
+                        if size > MAX_REPLY_BYTES:
+                            raise VisionError("reply too large")
+                        parts.append(chunk)
+                    result["reply"] = (r.status_code, b"".join(parts))
+        except BaseException as e:  # noqa: BLE001 - handed to the caller below
+            result["error"] = e
+        finally:
+            finished.set()
+
+    threading.Thread(target=work, name="intent-vision-request", daemon=True).start()
+    if not finished.wait(timeout_s):
+        abandoned.set()
+        raise VisionError("deadline exceeded")
+    if "error" in result:
+        err = result["error"]
+        raise err if isinstance(err, VisionError) else VisionError(f"request failed: {type(err).__name__}")
+    return result["reply"]
 
 
 def prepare_jpeg(data: bytes, max_side: int = DEFAULT_SIDE) -> bytes:
@@ -167,7 +203,7 @@ class VisionClient:
             raise VisionError(f"request failed: {type(e).__name__}") from None
         latency_ms = round((time.perf_counter() - t0) * 1000)
         if status != 200:
-            raise VisionError(f"HTTP {status}: {data[:200].decode('utf-8', 'replace')}")
+            raise VisionError(f"HTTP {status}")  # never the body: an error page could echo the request headers
         try:
             reply = json.loads(data)
             answers = reply["answers"]
@@ -178,23 +214,26 @@ class VisionClient:
         return {"answers": answers, "model": str(reply.get("model", "")), "latency_ms": latency_ms}
 
 
+def _unit(x: Any) -> float:
+    """A finite number in [0, 1] (not a bool, not a string), or VisionError."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or not 0.0 <= x <= 1.0:
+        raise VisionError("unexpected answer shape")
+    return float(x)
+
+
 def _noul(answer: Any) -> float:
     if not isinstance(answer, dict) or answer.get("type") != "noul":
         raise VisionError("unexpected answer shape")
-    p = answer.get("noul")
-    if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= p <= 1.0:
-        raise VisionError("unexpected answer shape")
-    return float(p)
+    return _unit(answer.get("noul"))
 
 
 def _choice(answer: Any, options: Mapping[str, str]) -> tuple[str, float, dict[str, float]]:
     if not isinstance(answer, dict) or answer.get("type") != "choice":
         raise VisionError("unexpected answer shape")
-    probs, choice, conf = answer.get("probabilities"), answer.get("choice"), answer.get("confidence")
-    if (not isinstance(probs, dict) or set(probs) != set(options) or choice not in options
-            or isinstance(conf, bool) or not isinstance(conf, (int, float))):
+    probs, choice = answer.get("probabilities"), answer.get("choice")
+    if not isinstance(probs, dict) or set(probs) != set(options) or not isinstance(choice, str) or choice not in options:
         raise VisionError("unexpected answer shape")
-    return str(choice), float(conf), {k: float(v) for k, v in probs.items()}
+    return choice, _unit(answer.get("confidence")), {k: _unit(v) for k, v in probs.items()}
 
 
 def classify_hand_signal(image: bytes, client: VisionClient | None = None) -> dict[str, Any]:
@@ -250,10 +289,12 @@ def find_object(image: bytes, what: str, client: VisionClient | None = None,
     box_answer = out["answers"]["where"]
     box = box_answer.get("box") if isinstance(box_answer, dict) and box_answer.get("type") == "box" else None
     edges = ("top", "bottom", "left", "right")
-    if not (isinstance(box, dict) and all(isinstance(box.get(k), (int, float)) and not isinstance(box.get(k), bool)
-                                          and 0.0 <= box[k] <= 1.0 for k in edges)):
+    if not isinstance(box, dict):
         raise VisionError("unexpected answer shape")
+    box = {k: _unit(box.get(k)) for k in edges}
+    if box["top"] > box["bottom"] or box["left"] > box["right"]:
+        raise VisionError("unexpected answer shape")
+    box_confidence = _unit(box_answer.get("confidence", 0.0))
     found = present >= min_present
-    return {"present": present, "box": {k: float(box[k]) for k in edges} if found else None,
-            "box_confidence": float(box_answer.get("confidence", 0.0)) if found else 0.0,
+    return {"present": present, "box": box if found else None, "box_confidence": box_confidence if found else 0.0,
             "latency_ms": out["latency_ms"], "model": out["model"]}
