@@ -16,9 +16,9 @@ cd "$HUB"
 
 echo "now: $HUB on $(git symbolic-ref -q --short HEAD || echo 'a detached HEAD') at $(git rev-parse --short HEAD)"
 
-# 1. fetch Carter's main first: if the network fails here, nothing on the Pi has changed
-git remote add carter "$REPO_URL" 2>/dev/null || git remote set-url carter "$REPO_URL"
-git fetch carter main
+# 1. fetch Carter's main first: if the network fails here, nothing on the Pi has changed (not even .git/config:
+#    no remote is added, the fetch writes only the ref carter/main)
+git fetch "$REPO_URL" "+refs/heads/main:refs/remotes/carter/main"
 
 # 2. keep what was checked out, and anything changed on the Pi (tracked edits, new untracked files)
 mkdir -p "$BACKUP"
