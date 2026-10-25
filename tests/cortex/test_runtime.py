@@ -189,13 +189,19 @@ def test_a_request_the_advisor_finds_ambiguous_states_unclear(arena,clock):
 @pytest.mark.parametrize('utterance,cls',[
     ("Do not move Sample A to the bench.",'understood'),("Don't move sample A to bench.",'understood'),
     ("Don"+chr(0x2019)+"t move sample A to bench.",'understood'),("Never pick Sample A.",'understood'),
-    ("Dump Sample A in the trash.",'understood'),("Hold on, move Sample A to the bench.",'unclear'),
+    ("Dump Sample A in the trash.",'understood'),("Never mind, move Sample A to the bench.",'unclear'),
     ("Move sample A to bench tomorrow.",'unclear'),("Bring the gizmo to the bench.",'unclear')],
     ids=['do not','dont','a curly apostrophe','never','an action it may not do','a cancellation','tomorrow',
          'a word it does not know'])
 def test_a_clear_dont_or_a_refused_action_is_understood_and_the_rest_unclear(brain,utterance,cls):
     r=brain.command(utterance,principal='carther')
     assert (r['status'],r['classification'],r['needs_clarification'])==('refused',cls,cls!='understood'),r
+
+def test_a_cancellation_with_a_stop_word_in_it_is_a_stop_as_in_the_engine_and_the_console(brain):
+    # "hold on" is a stop word here as in the engine and the console parser (one pattern): it latches a stop.
+    r=brain.command('Hold on, move Sample A to the bench.',principal='carther')
+    assert (r['kind'],r['classification'],r['needs_clarification'])==('stop','understood',False),r
+    assert brain.robot.stopped and brain.store.one('SELECT COUNT(*) n FROM episode')['n']==0   # stopped; nothing proposed
 
 class Negating(Unsure):
     """An intent advisor that finds every request negated, and none ambiguous."""
