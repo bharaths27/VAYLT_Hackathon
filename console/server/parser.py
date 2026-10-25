@@ -33,16 +33,19 @@ UNSAFE = [
 PRONOUNS = r"\b(it|that|this|them|those|the thing|the stuff|something)\b"
 
 # STOP always wins: a stop word ANYWHERE in the utterance stops the robot, whatever the case, punctuation or
-# company ("Stop.", "STOP!", "stop, stop", "Please stop.", "Stop. Open the claw."). whisper.cpp writes
-# "Stop." and the old exact match missed it. This deliberately also stops on "don't stop the timer",
-# "stop sign" or "remember to stop at zone A": on a robot a needless stop costs one Clear Stop, a missed
-# stop can hurt someone, so we err toward stopping. ("e-stop" is covered by "stop". Keep in step with
-# STOP_WORDS in engram/engine.py.)
-STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa)\b")
-# Negated or called-off commands ("don't open the claw", "no, ...", "cancel", "wait, don't"). Planning the
+# company ("Stop.", "STOP!", "stop, stop", "Please stop.", "Wait!", "Hold on.", "Stop. Open the claw.").
+# whisper.cpp writes "Stop." and the old exact match missed it. This deliberately also stops on "don't stop
+# the timer", "stop sign", "remember to stop at zone A" or "remember to wait for the student": on a robot a
+# needless stop costs one Clear Stop, a missed stop can hurt someone, so we err toward stopping. A rule with a
+# stop word in it must be taught through /rules. "hold on", "hold it" and "hang on" are phrases, so "hold the
+# vial" is not a stop. ("e-stop" is covered by "stop".) The same pattern as STOP_WORDS in engram/engine.py
+# (tests/test_spoken_stop.py checks that they are equal).
+STOP_WORDS = re.compile(r"\b(stop|estop|halt|freeze|abort|emergency|whoa|wait|pause|hold\s+on|hold\s+it|hang\s+on)\b")
+# Negated or called-off commands ("don't open the claw", "no, ...", "cancel", "never mind"). Planning the
 # rest of the sentence would do the opposite of what was said, so these refuse. Checked after the rule
 # prefix, so "remember that the vial must never ..." is still taught as a rule (rules never move anything).
-NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never ?mind|wait|hold on)\b")
+# ("wait" and "hold on" are stop words now, checked before this.)
+NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never ?mind)\b")
 # Deferral backstop. A planned command runs NOW, so a command meant for later, on a condition, or chained to
 # another step must not plan. Fail-closed, in two parts (see _deferral):
 #  1. DEFERRAL, anywhere in the command: after(wards), when, once ..., until, before, during, while, if, then,
@@ -52,9 +55,11 @@ NEGATION = re.compile(r"\b(do not|don'?t|\w+n't|cannot|never|not|no|cancel|never
 #     bare "next" count: the console plans one action per command, so "close the claw, then open it" planned
 #     only the close.
 #  2. PLACE_OR_TIME: after in, at, on, by, within, past or around, the words that follow must be a place or
-#     target the grammar knows: a zone or tagged object from memory, "zone A", "tag 5", a scene word ("the bin",
-#     "in front", "in place") or a distance ("by 10 cm"). Anything else ("in a jiffy", "at 5", "on my signal",
-#     "at the end of calibration") asks. The "around" in "turn around" is the turn primitive, not a preposition.
+#     target the grammar knows, and it must end its clause (_CLAUSE_END): a zone or tagged object from memory,
+#     "zone A", "tag 5", or a scene word ("the bin", "in place", "in front of you"). The one measure allowed is
+#     "by N cm" in a drive or "by N degrees" in a turn. Anything else ("in a jiffy", "at 5", "on my signal",
+#     "within 5 cm of the vial", "at 10 cm", "in place soonish") asks. The "around" in "turn around" is the
+#     turn primitive, not a preposition.
 # Only the leading "In N seconds/minutes, ..." (PROSPECTIVE, checked first) can be scheduled here.
 _NUMWORD = r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|fifty|sixty|ninety"
 DEFERRAL = re.compile(
@@ -67,11 +72,34 @@ DEFERRAL = re.compile(
     r"(?:second|minute|min)"
     r"|\d{1,2}(?::\d{2})?\s*[ap]\.?m|[ap]\.m|pm|o'?clock|\d{1,2}:\d{2})\b")
 PLACE_OR_TIME = re.compile(r"\b(in|at|on|by|within|past|(?<!turn )around)\b\s*")
-_DETERMINERS = re.compile(r"(?:(?:the|a|an|this|that|these|those|my|your|our|its|his|her|their)\s+)*")
-_SCENE = (r"(?:bin|tray|table|bench|shelf|shelves|floor|ground|place|front|back|middle|cent(?:er|re)|corner|side"
-          r"|hand|gripper|claw|view|sight|frame|there|here|zone|area|spot|home|tag|marker|aruco)(?:e?s)?")
-_DISTANCE = (rf"(?:\d+(?:\.\d+)?|{_NUMWORD})\s*(?:cm|mm|m|in|inch(?:es)?|(?:centi|milli)?met(?:er|re)s?|ft|feet|foot"
-             r"|deg(?:rees?)?)")
+_DETS = r"(?:(?:the|a|an|this|that|these|those|my|your|our|its|his|her|their)\s+)*"
+_DETERMINERS = re.compile(_DETS)
+_SCENE = (r"zone\s*[a-z]|(?:tag|marker|aruco)\s*\d+|(?:bin|tray|table|bench|shelf|shelves|floor|ground|place|front"
+          r"|back|middle|cent(?:er|re)|corner|side|hand|gripper|claw|view|sight|frame|there|here|zone|area|spot"
+          r"|home)(?:e?s)?")
+# What may follow a recognized phrase: the end, punctuation, or a word that starts the next phrase (checked on
+# its own). Anything else means the phrase did not consume its clause ("5 cm of the vial", "place soonish").
+_CLAUSE_END = (r"(?=\s*(?:$|[^\w\s]|(?:to|for|and|or|plus|then|please|now|thanks|thank|in|at|on|by|within|past"
+               r"|around)\b))")
+_AMOUNT = rf"(?:\d+(?:\.\d+)?|{_NUMWORD})\s*"
+_BY_DISTANCE = re.compile(rf"{_AMOUNT}(?:cm|mm|m|in|inch(?:es)?|(?:centi|milli)?met(?:er|re)s?){_CLAUSE_END}")
+_BY_ANGLE = re.compile(rf"{_AMOUNT}deg(?:rees?)?{_CLAUSE_END}")
+DRIVE_VERB = r"\b(?:drive|go|move|roll|back up|reverse)\b"  # shared with the drive grammar below
+TURN_VERB = r"\bturn\s+(?:left|right)\b"
+
+# More than one action or object. The grammar plans one primitive, or one fetch of one object to one zone, and
+# silently dropped the rest ("close the claw and open the gripper" staged only the open). Fail-closed: a joining
+# word outside a name from memory asks; so does another action verb, or another object ("the ...", "tag 8"),
+# right after , . ; : ! or ? when an action verb came before. The console's fetch takes one object, so a list
+# of objects asks too. A name with "and" in it (a "salt and pepper shaker") is one object. Checked on the text
+# with its punctuation kept (_norm keep=_KEEP).
+JOINER = re.compile(r"\b(and|or|plus|also|as well as|along with|together with)\b|(&)")
+ACTION_VERB = (r"\b(open|close|shut|grab|grip|release|drop|pick|put|place|set|bring|fetch|get|take|deliver|carry"
+               r"|move|drive|go|roll|reverse|back up|turn|rotate|spin|find|locate|search|look|observe|scan|lift"
+               r"|lower|raise|push|pull)\b")
+NEXT_ACTION = re.compile(rf"[,.;:!?]\s*(?:(?:please|then|now|and|also|robot|okay|ok)\s+)*(?:{ACTION_VERB}"
+                         r"|\b(the|a|an|this|that|these|those|another)\b|\b((?:tag|marker|aruco)\s*\d+))")
+_KEEP = ",;!?&"
 
 QUIPS = {
     "plan": ["Plan staged. Your signature, please.", "Drafted. Nothing moves until you say so.",
@@ -113,9 +141,10 @@ def _num(s: str) -> float | None:
     return None
 
 
-def _norm(text: str) -> str:
+def _norm(text: str, keep: str = "") -> str:
+    """Lowercase, single-spaced text. Punctuation other than : . ' - (and the characters in keep) becomes a space."""
     t = text.lower().replace(chr(0x2019), "'").strip()  # a curly apostrophe (U+2019) still reads as one
-    t = re.sub(r"[^\w\s:.'-]", " ", t)
+    t = re.sub(rf"[^\w\s:.'{re.escape(keep)}-]", " ", t)
     return re.sub(r"\s+", " ", t)
 
 
@@ -203,6 +232,13 @@ def is_stop(text: str) -> bool:
     return STOP_WORDS.search(_norm(text)) is not None
 
 
+def _names(bundle: dict) -> list[str]:
+    """Normalized zone and object names and aliases from memory, longest first."""
+    names = {_norm(str(n)).strip(" .") for item in bundle.get("zones", []) + bundle.get("bindings", [])
+             for n in [item.get("name", "")] + list(item.get("aliases", []))}
+    return sorted(names - {""}, key=len, reverse=True)
+
+
 def _deferral(t: str, bundle: dict) -> tuple[str, str] | None:
     """(phrase, reason) for the first part of the normalized command that defers, conditions or chains it,
     or None. See DEFERRAL and PLACE_OR_TIME. Names from memory only ever excuse a place after a preposition:
@@ -210,17 +246,32 @@ def _deferral(t: str, bundle: dict) -> tuple[str, str] | None:
     m = DEFERRAL.search(t)
     if m:
         return m.group(1), f"'{m.group(1)}' sounds like later, a condition or another step"
-    names = {_norm(str(n)).strip(" .") for item in bundle.get("zones", []) + bundle.get("bindings", [])
-             for n in [item.get("name", "")] + list(item.get("aliases", []))}
-    known = "".join("|" + re.escape(n) for n in sorted(names - {""}, key=len, reverse=True))
-    place = re.compile(rf"(?:{_SCENE}|{_DISTANCE}{known})\b")
+    target = "(?:" + "|".join([_SCENE] + [re.escape(n) for n in _names(bundle)]) + ")"
+    place = re.compile(rf"{target}(?:\s+of\s+{_DETS}(?:{target}|you))?{_CLAUSE_END}")
+    drive, turn = re.search(DRIVE_VERB, t), re.search(TURN_VERB, t)
     for p in PLACE_OR_TIME.finditer(t):
         rest = t[p.end():]
         rest = rest[_DETERMINERS.match(rest).end():]
-        if rest[:1].isalnum() and not place.match(rest):  # nothing after it ("4 in.") is fine
-            phrase = " ".join([p.group(1)] + t[p.end():].split()[:2]).rstrip(".,:'-")
-            return phrase, f"I can't tell if '{phrase}' is a place or a time"
+        if not rest[:1].isalnum() or place.match(rest):  # nothing after it ("4 in.") is fine
+            continue
+        if p.group(1) == "by" and ((drive and _BY_DISTANCE.match(rest)) or (turn and _BY_ANGLE.match(rest))):
+            continue
+        phrase = " ".join([p.group(1)] + t[p.end():].split()[:2]).rstrip(".,:'-")
+        return phrase, f"I can't tell if '{phrase}' is a place or a time"
     return None
+
+
+def _multiple(tc: str, bundle: dict) -> str | None:
+    """The joining word or second action verb of a command that asks for more than one thing, or None.
+    tc is the command normalized with its punctuation kept (_KEEP). See JOINER and NEXT_ACTION."""
+    for n in _names(bundle):  # a name from memory may contain "and"
+        tc = re.sub(rf"\b{re.escape(n)}\b", "x", tc)
+    m = JOINER.search(tc)
+    if m:
+        return m.group(0)
+    first = re.search(ACTION_VERB, tc)
+    m = NEXT_ACTION.search(tc, first.end()) if first else None
+    return m.group(m.lastindex) if m else None
 
 
 def parse(text: str, bundle: dict) -> ParseResult:
@@ -263,6 +314,14 @@ def _parse(text: str, bundle: dict) -> ParseResult:
                            "To make it a rule, say 'Remember that ...'", quip=quip("abstain"),
                            trace=trace + [f"negation '{m.group(1)}'"])
 
+    # 2c. more than one action or object asks (see JOINER). On the whole command, before the prospective
+    # prefix is cut off, because that cut loses the commas in "In 5 seconds, open the claw, close it."
+    w = _multiple(_norm(text, keep=_KEEP), bundle)
+    if w:
+        return ParseResult("clarify", text, reason=f"One thing at a time: which first? ('{w}' asks for more than "
+                           "one thing; I plan one action on one object per command.)", quip=quip("clarify"),
+                           trace=trace + [f"multiple: '{w}'"])
+
     # 3. prospective ("in 2 minutes, bring the vial to zone B")
     m = PROSPECTIVE.match(t)
     if m:
@@ -303,7 +362,7 @@ def _parse(text: str, bundle: dict) -> ParseResult:
     if re.search(r"\b(close|shut)\b.*\b(claw|gripper|hand)\b", t):
         return _ok(goal, [Step(op="gripper_close", expect="claw closed (grasp state unknown)")], [], trace + ["gripper close"])
 
-    m = re.search(r"\bturn\s+(around)\b|\bturn\s+(left|right)(?:\s+(.+?))?(?:\s*(?:degrees?|deg))?$", t)
+    m = re.search(r"\bturn\s+(around)\b|\bturn\s+(left|right)(?:\s+(.+?))?(?:\s*(?:degrees?|deg))?\.?$", t)  # "Turn left."
     if m:
         if m.group(1):
             deg = 180.0
@@ -317,7 +376,7 @@ def _parse(text: str, bundle: dict) -> ParseResult:
                                quip=quip("abstain"), trace=trace)
         return _ok(goal, [Step(op="turn_bounded", args={"degrees": deg}, expect=f"heading changed {deg:+.0f} deg")], [], trace + ["turn"])
 
-    m = re.search(r"\b(?:drive|go|move|roll|back up|reverse)\b\s*(forward|forwards|ahead|straight|back|backward|backwards|up)?\s*(.*)$", t)
+    m = re.search(rf"{DRIVE_VERB}\s*(forward|forwards|ahead|straight|back|backward|backwards|up)?\s*(.*)$", t)
     if m and not re.search(r"\bto\b", t) and not resolve_object(t, bundle):
         direction = m.group(1) or ("back" if re.search(r"back up|reverse", t) else "forward")
         rest = m.group(2) or ""

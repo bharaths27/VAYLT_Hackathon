@@ -8,6 +8,7 @@
 Expected kinds were written down before the fix; every table had failing rows on the old parser.
 """
 import asyncio
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,13 +29,21 @@ STOP = [
     # Deliberate false positives (see STOP_WORDS in parser.py): a needless stop costs one Clear Stop,
     # a missed stop can hurt someone.
     "Don't stop the timer.", "Stop sign.", "Remember to stop at zone A.",
+    # "Wait", "Pause", "Hold on", "Hold it" and "Hang on" stop too (they used to refuse, and the robot kept going).
+    "Wait!", "Wait.", "Wait, don't open the claw.", "Wait, open the claw.", "Pause.", "Pause!", "Hold on.",
+    "Hold on, open the claw.", "Hold it!", "Hang on.", "Freeze!", "Open the claw. Wait!",
+    "Remember to wait for the student.",  # deliberate: a rule with a stop word is taught through /rules
 ]
+
+# Phrases, not words: holding something is not a stop.
+NOT_STOP = ["Hold the vial.", "Hold the claw closed.", "Is the gripper holding the vial?",
+            "Put the vial in the waiting area."]
 
 NEGATED = [
     "Don't open the claw", "Don't open the claw.", "Do not open the claw.", "Never open the claw.",
     f"Don{CURLY}t open the claw.", "dont open the claw", "You shouldn't open the claw.",
     "Not now, open the claw.", "No, open the claw.", "No, don't close the gripper.",
-    "Cancel, open the claw.", "Cancel that.", "Wait, don't open the claw.", "Wait, open the claw.",
+    "Cancel, open the claw.", "Cancel that.",
     "Never mind, close the claw.", "Do not bring the red cup to zone B.", "Don't drive forward 10 cm.",
     "Don't turn left.", "In 5 seconds, don't open the claw.",
 ]
@@ -81,6 +90,22 @@ FAIL_CLOSED = [
     "Open the claw in a jiffy.", "Open the claw at once.", "Open the claw at 5.", "Open the claw at five.",
     "Open the claw by then.", "Open the claw on my signal.", "Open the claw on cue.", "Open the claw in due course.",
     "Open the claw in time.", "Open the claw next.", "Put the vial in a box.",
+    # Review round 4: a distance counts only as "by N cm" in a drive (or "by N degrees" in a turn), and a
+    # recognized phrase must end its clause.
+    "Open the claw within 5 cm of the vial.", "Close the gripper at 10 cm.", "Open the claw by 10 cm.",
+    "Turn left by 10 cm.", "Drive forward within 10 cm.", "Drive forward by 10 cm of the vial.",
+    "Open the claw in place soonish.", "Open the claw in front of the deadline.",
+]
+
+# Review round 4: the grammar plans one primitive, or one fetch of one object to one zone. A second action or
+# a second object was silently dropped ("close the claw and open the gripper" staged only the open).
+MULTIPLE = [
+    "Close the claw and open the gripper.", "Open the claw, close it.", "Open the claw & close it.",
+    "Drive forward 10 cm plus turn left.", "Open the claw, also close it.", "Close the claw. Open the gripper.",
+    "Open the claw! Close it!", "Turn left, drive forward 10 cm.", "Drive forward 10 cm and turn left.",
+    "Bring the red cup and the vial to zone B.", "Bring tag 7 and tag 8 to zone A.",
+    "Bring the vial to zone A or zone B.", "Open the claw or close it.",
+    "Bring the vial, the cup to zone B.", "Bring tag 7, tag 8 to zone A.",
 ]
 
 # The leading "In N seconds/minutes, <task>" form schedules only a plan. Anything else the inner task
@@ -95,6 +120,7 @@ PROSPECTIVE_INNER = [
     ("In 5 seconds, juggle.", "abstain"),  # no grammar: the LLM would plan it for NOW
     ("In 5 seconds, stop.", "stop"),
     ("In 2 minutes, open the claw. Stop!", "stop"),
+    ("In 5 seconds, open the claw, close it.", "clarify"),  # scheduled only the open
 ]
 
 STILL_WORKS = [
@@ -125,6 +151,17 @@ STILL_WORKS = [
     ("Turn around.", "plan", "turn_bounded"),
     ("Turn around now.", "plan", "turn_bounded"),  # "turn around" is the turn primitive, not "around <time>"
     ("Put the cup in zone A.", "clarify", None),  # asks which cup ("cup" alone is not in memory), not a deferral
+    ("Put the vial in the bin.", "clarify", None),  # "the bin" ends its clause; it asks for a zone, not a time
+    ("Drive back by 5 cm.", "plan", "drive_bounded"),
+    ("Turn left by 90 degrees.", "plan", "turn_bounded"),
+    # One action with a comma is still one action.
+    ("Robot, open the claw.", "plan", "gripper_open"),
+    ("Okay, close the claw.", "plan", "gripper_close"),
+    ("Close the claw, please.", "plan", "gripper_close"),
+    ("Turn left, 90 degrees.", "plan", "turn_bounded"),
+    ("Drive forward 10.5 cm.", "plan", "drive_bounded"),  # a decimal point is not a sentence end
+    ("Turn left.", "plan", "turn_bounded"),  # whisper's period broke the turn grammar's end anchor
+    ("Turn right.", "plan", "turn_bounded"),
     ("Remember that the vial must never leave zone B.", "rule", None),
     ("From now on, do not drive into zone A.", "rule", None),
 ]
@@ -134,6 +171,11 @@ STILL_WORKS = [
 def test_spoken_stop_always_wins(text):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == ("stop", None), (text, r.kind, r.trace)
+
+
+@pytest.mark.parametrize("text", NOT_STOP)
+def test_holding_something_is_not_a_stop(text):
+    assert parse(text, BUNDLE).kind != "stop", text
 
 
 @pytest.mark.parametrize("text", NEGATED)
@@ -147,6 +189,19 @@ def test_negated_command_is_refused_not_planned(text):
 def test_future_condition_is_not_run_now(text):
     r = parse(text, BUNDLE)
     assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
+
+
+@pytest.mark.parametrize("text", MULTIPLE)
+def test_more_than_one_action_or_object_asks(text):
+    r = parse(text, BUNDLE)
+    assert (r.kind, r.plan) == ("clarify", None), (text, r.kind, r.trace)
+    assert "One thing at a time" in r.reason, r.reason
+
+
+def test_a_name_with_and_in_it_is_one_object():
+    shaker = {"name": "salt and pepper shaker", "aliases": ["shaker"], "tag_id": 11, "source_id": "test"}
+    r = parse("Bring the salt and pepper shaker to zone A.", {**BUNDLE, "bindings": BUNDLE["bindings"] + [shaker]})
+    assert r.kind == "plan" and r.plan.steps[0].args == {"tag_id": 11}, (r.kind, r.reason, r.trace)
 
 
 @pytest.mark.parametrize("text,kind", PROSPECTIVE_INNER)
@@ -173,6 +228,86 @@ def test_spoken_stop_latches_the_console():
         assert main.engine.stopped
         assert c.post(f"/operations/{op['id']}/approve", json={"digest": op["digest"]}).status_code == 409
         c.post("/stop/clear")
+
+
+STOP_PATH_TELEMETRY = {"emit heard", "emit parsed", "emit say", "emit stop", "emit operation",
+                       "ledger command", "ledger parse", "ledger estop"}
+
+
+@pytest.mark.parametrize("route", ["voice command", "stop button"])
+@pytest.mark.parametrize("failure", ["emit raises", "ledger raises", "both raise", "emit hangs"])
+def test_stop_acts_before_telemetry_and_survives_its_failure(monkeypatch, route, failure):
+    # Review round 4: the "heard" emit and the "command" ledger write ran before the stop check, so a stalled
+    # HUD client or a failed ledger write meant the robot never stopped. Telemetry now comes after the stop.
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        op = c.post("/commands", json={"text": "Drive forward 10 cm.", "source": "voice"}).json()["operation"]
+        order: list[str] = []
+        real_stop = main.engine.robot.stop
+
+        async def robot_stop():
+            order.append("robot.stop")
+            return await real_stop()
+
+        async def emit(type_, **data):
+            order.append(f"emit {type_}")
+            if failure == "emit hangs":
+                await asyncio.sleep(4)
+            if failure in ("emit raises", "both raise"):
+                raise RuntimeError("a HUD subscriber broke")
+            return {}
+
+        def append(event, **rec):
+            order.append(f"ledger {event}")
+            if failure in ("ledger raises", "both raise"):
+                raise OSError("disk full")
+            return "ev_test"
+
+        with monkeypatch.context() as m:
+            m.setattr(main.engine.robot, "stop", robot_stop)
+            m.setattr(main.bus, "emit", emit)
+            m.setattr(main.ledger, "append", append)
+            t0 = time.monotonic()
+            if route == "voice command":
+                r = c.post("/commands", json={"text": "Stop.", "source": "voice"})
+            else:
+                r = c.post("/stop")
+            elapsed = time.monotonic() - t0
+        assert r.status_code == 200 and elapsed < 3.0, (r.status_code, elapsed)
+        assert route != "voice command" or r.json()["kind"] == "stop"
+        assert main.engine.stopped and order.count("robot.stop") == 1, order
+        telemetry = [i for i, e in enumerate(order) if e in STOP_PATH_TELEMETRY]
+        assert order.index("robot.stop") < min(telemetry, default=len(order)), order
+        assert main.engine.ops[op["id"]].status == "CANCELLED"
+        c.post("/stop/clear")
+
+
+def test_a_failing_robot_stop_still_stops_the_brain(monkeypatch):
+    # The robot and the brain are stopped at once, each failure on its own: before, a robot call that raised
+    # (for example on a reply that is not JSON) skipped the brain's stop and the cancellations.
+    told = []
+
+    async def robot_stop():
+        raise ValueError("robot reply was not JSON")
+
+    async def brain_stop():
+        told.append("stop")
+        return {"stopped": True}
+
+    async def brain_clear():
+        return {}
+
+    with TestClient(main.app) as c:
+        c.post("/stop/clear")
+        with monkeypatch.context() as m:
+            m.setattr(main.brain, "enabled", lambda: True)
+            m.setattr(main.brain, "stop", brain_stop)
+            m.setattr(main.brain, "clear_stop", brain_clear)
+            m.setattr(main.engine.robot, "stop", robot_stop)
+            r = c.post("/stop")
+            assert r.status_code == 200 and main.engine.stopped and told == ["stop"], (r.status_code, told)
+            assert r.json()["status"] == "stop_request_failed" and "ValueError" in r.json()["error"], r.json()
+            c.post("/stop/clear")
 
 
 def test_spoken_stop_does_not_wait_on_the_brain(monkeypatch):
