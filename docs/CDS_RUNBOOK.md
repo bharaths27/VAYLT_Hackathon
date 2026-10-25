@@ -125,9 +125,12 @@ cd ~/engram_hub && git fetch https://github.com/mrrCarter/VAYLT_Hackathon.git ma
 Expected: it ends with these two lines (the dates differ):
 
 ```
-done. next: bash /home/starrasp/engram_hub/scripts/cds_up.sh --restart   (--restart: services already running still run the old code)
-to undo:  cd /home/starrasp/engram_hub && git checkout pre-cds-20261025-...
+done: on main. next: bash /home/starrasp/engram_hub/scripts/cds_up.sh --restart   (--restart: services already running still run the old code)
+to undo (back from main):  cd /home/starrasp/engram_hub && git checkout pre-cds-20261025-...
 ```
+
+(If it also prints `ignored files that main replaces, copied first: ...`, those local files were saved in
+`~/cds-backup/<date>/` and the undo line puts them back.)
 
 Keep the undo line (it is also saved in `~/cds-backup/<date>/UNDO.txt`). If the Pi has no internet, the `git
 fetch` fails and **nothing on the Pi changes**: switch the laptop and the Pi to your phone's hotspot and paste the
