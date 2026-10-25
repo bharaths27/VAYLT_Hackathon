@@ -17,7 +17,9 @@ from engram.spark.audio_windows import SAMPLE_RATE, AudioOverflow, LiveTranscrib
 from engram.spark.intent_client import MAX_TEXT, IntentClient
 from engram.spark.presets import PRESETS
 from engram.spark.voice_integration import VoiceIntegration, memory_version
-from spark_fakes import FakeIntent, RecordingTransport, clock, decision, fake, spawn  # noqa: F401  (fixtures)
+from spark_fakes import (  # noqa: F401  (fixtures)
+    REJECTIONS, SAMPLES, FakeIntent, RecordingTransport, clock, decision, fake, spawn,
+)
 
 OBSERVED_ONLY = [("observe", {})]   # the fixture's overhead scan; nothing else may reach the robot
 ROOT = Path(__file__).resolve().parents[2]
@@ -365,3 +367,22 @@ def test_voice_integration_reads_the_setting_exactly_as_the_api_does():
     from engram.spark import presets
 
     assert api.voice_presets_enabled is presets.voice_presets_enabled
+
+
+@pytest.mark.parametrize("kind", sorted(REJECTIONS))
+def test_after_any_refused_chunk_nothing_of_the_utterance_is_proposed(taught, spawn, clock, kind):
+    voice = VoiceIntegration(taught, FakeIntent(), spawn=spawn, clock=clock)
+    stt, window = _InstantWhisper(), PcmWindow(max_seconds=5.0)
+    tr = _live_partials(voice, 1, window, stt, spawn)           # chunk 0 arrived; "open the gripper" prepared
+    assert voice.gate.prepared().decision.preset == "open_gripper"
+    with pytest.raises(Exception):
+        REJECTIONS[kind](window)                                # refused
+    for _ in range(3):                                          # the producer catches it and carries on
+        try:
+            window.append(SAMPLES)
+        except AudioOverflow:
+            pass
+    out = voice.finish_live(1, 99, tr)
+    assert out["kind"] == "clarify" and voice.gate.prepared() is None
+    assert stt.calls.count("final") == 0
+    assert nothing_happened(taught)

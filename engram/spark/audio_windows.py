@@ -8,8 +8,9 @@ utterance (the words cut off could be "no, don't"); it must be said again. snaps
 returns a 16 kHz mono 16-bit WAV of everything so far, ready for a partial transcript.
 seal() ends the utterance for its final transcript: the audio is captured atomically and
 any later append() is refused (WindowSealed); audio refused before the final is decided
-(finalize()) makes the utterance invalid too. So does a chunk with the wrong sequence
-number (OutOfOrder): the audio has a hole, so it is never transcribed, whatever comes next.
+(finalize()) makes the utterance invalid too. So does every other refused chunk, whatever
+the reason (wrong type or sample format, odd length, wrong sequence number, after the seal):
+the audio has a hole, so it is never transcribed, whatever the producer appends next.
 
 WhisperServerClient talks to a resident whisper.cpp server (its HTTP server example,
 POST /inference) on this machine only: the URL must be a loopback IP literal, no proxy is
@@ -33,6 +34,7 @@ from ._http import Cancelled, CancelToken
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2          # bytes per sample: signed 16-bit little endian
+_PCM_FORMATS = ("B", "b", "c", "h", "<h", "=h")   # memoryview formats taken as PCM: raw bytes or int16
 CHANNELS = 1
 DEFAULT_MAX_S = 20.0
 MAX_ALLOWED_S = 120.0
@@ -98,13 +100,14 @@ class PcmWindow:
             self._size = 0
             self._next_seq = 0
             self._full = False
-            self._gap = False        # a chunk arrived out of order: audio is missing or misplaced
+            self._refused = False    # a chunk was refused, for any reason: the utterance is not whole
             self._seal: SealedUtterance | None = None
             self._generation += 1
 
     def _whole(self) -> bool:
-        """(lock held) No overflow, no chunk out of order, no audio refused after the seal."""
-        return not (self._full or self._gap or (self._seal is not None and self._seal._clipped))
+        """(lock held) No chunk of this utterance was refused (overflow, out of order, after the seal, or
+        any other reason)."""
+        return not self._refused
 
     @property
     def generation(self) -> int:
@@ -137,33 +140,49 @@ class PcmWindow:
 
         An empty chunk is checked and uses up its sequence number like any other, but stores
         nothing, so a stream of empty keep-alive chunks cannot grow the window past its bound.
+
+        Any refused chunk, whatever the reason, leaves the utterance not whole until reset(), before
+        the error is raised: a producer that catches it and carries on can never get a transcript of
+        audio with a hole in it. Every check lives in _admit(), so a new one cannot skip this.
         """
+        with self._lock:
+            try:
+                chunk = self._admit(pcm, seq)
+            except BaseException:
+                self._refused = True
+                if self._seal is not None and self._seal._decided is None:
+                    self._seal._clipped = True     # a final being made would miss this audio: not final
+                raise
+            if chunk:
+                self._chunks.append(chunk)
+                self._size += len(chunk)
+            self._next_seq += 1
+
+    def _admit(self, pcm, seq: int | None) -> bytes:  # noqa: ANN001
+        """(lock held) Every check a chunk must pass; returns its bytes. Anything raised here voids the
+        utterance (see append())."""
+        if self._seal is not None:
+            raise WindowSealed("this utterance has ended; audio for it is refused (reset() starts the next)")
+        if self._full:
+            raise AudioOverflow("the window is full; end the utterance and reset()")
+        if self._refused:
+            raise AudioOverflow("an earlier chunk of this utterance was refused; end it and reset()")
         if not isinstance(pcm, (bytes, bytearray, memoryview)):
             raise TypeError("pcm must be bytes")
-        pcm = bytes(pcm)
-        if len(pcm) % SAMPLE_WIDTH:
+        if isinstance(pcm, memoryview) and pcm.format not in _PCM_FORMATS:
+            raise TypeError(f"pcm must be raw bytes or 16-bit samples, not {pcm.format!r}")
+        data = bytes(pcm)
+        if len(data) % SAMPLE_WIDTH:
             raise ValueError("a chunk must hold whole 16-bit samples")
-        with self._lock:
-            if self._seal is not None:
-                if self._seal._decided is None:
-                    self._seal._clipped = True     # the final being made would miss this audio: not final
-                raise WindowSealed("this utterance has ended; audio for it is refused (reset() starts the next)")
-            if self._full:
-                raise AudioOverflow("the window is full; end the utterance and reset()")
-            if self._gap:
-                raise AudioOverflow("a chunk of this utterance arrived out of order; end it and reset()")
-            if seq is not None and seq != self._next_seq:
-                # The utterance has a hole (or a repeat) from here on, whatever arrives later: never final.
-                self._gap = True
+        if seq is not None:
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                raise TypeError("seq must be an int")
+            if seq != self._next_seq:
                 raise OutOfOrder(f"expected chunk {self._next_seq}, got {seq}; the utterance is not whole")
-            if self._size + len(pcm) > self.max_bytes:
-                # Refuse from here on: accepting a later, smaller chunk would leave a hole mid-utterance.
-                self._full = True
-                raise AudioOverflow(f"utterance longer than {self.max_bytes // (SAMPLE_RATE * SAMPLE_WIDTH)} s")
-            if pcm:
-                self._chunks.append(pcm)
-                self._size += len(pcm)
-            self._next_seq += 1
+        if self._size + len(data) > self.max_bytes:
+            self._full = True          # refuse from here on: a later, smaller chunk would leave a hole
+            raise AudioOverflow(f"utterance longer than {self.max_bytes // (SAMPLE_RATE * SAMPLE_WIDTH)} s")
+        return data
 
     @property
     def duration_s(self) -> float:

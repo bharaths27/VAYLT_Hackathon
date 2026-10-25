@@ -7,10 +7,40 @@ tests import as the module "conftest".)
 from __future__ import annotations
 
 import threading
+from array import array
 
 import pytest
 
+from engram.spark.audio_windows import SAMPLE_RATE, SAMPLE_WIDTH
 from engram.spark.intent_client import IntentDecision
+
+SAMPLES = (1).to_bytes(2, "little") * 800        # 0.05 s of valid 16-bit mono audio
+
+
+def _released_buffer():
+    view = memoryview(bytes(4))
+    view.release()
+    return view
+
+
+def _sealed_then_appended(window):
+    window.seal()
+    window.append(SAMPLES)
+
+
+# Every way PcmWindow.append() can refuse a chunk, each applied to a window that already holds chunk 0.
+REJECTIONS = {
+    "not bytes": lambda w: w.append("Open the claw"),
+    "float samples": lambda w: w.append(memoryview(array("f", [0.0] * 800))),
+    "odd length": lambda w: w.append(bytes(1)),
+    "released buffer": lambda w: w.append(_released_buffer()),
+    "seq is a bool": lambda w: w.append(SAMPLES, seq=True),
+    "seq is a float": lambda w: w.append(SAMPLES, seq=1.0),
+    "seq skips ahead": lambda w: w.append(SAMPLES, seq=5),
+    "seq repeats": lambda w: w.append(SAMPLES, seq=0),
+    "overflow": lambda w: w.append(bytes(SAMPLE_WIDTH * SAMPLE_RATE * 30)),
+    "after the seal": _sealed_then_appended,
+}
 
 
 def decision(preset=None, confidence=0.9, ready=0.9, directed=0.9, negated=0.0, future=0.0, correction=0.0):

@@ -18,6 +18,7 @@ from engram.spark.audio_windows import (
     PcmWindow, WhisperError, WhisperServerClient, WindowSealed, speech_only,
 )
 from engram.spark.voice import CORRECTION, STOP_WORDS
+from spark_fakes import REJECTIONS, SAMPLES
 
 
 def pcm(*samples):
@@ -66,7 +67,8 @@ def test_chunks_must_arrive_in_order_and_hold_whole_samples():
     w.append(pcm(2), seq=1)
     with pytest.raises(ValueError):
         w.append(b"\x01")
-    assert read_wav(w.snapshot())[3] == pcm(1, 2)
+    with pytest.raises(AudioOverflow):
+        w.snapshot()                                            # a refused chunk voids the utterance too
 
 
 def test_empty_chunks_store_nothing_but_keep_their_sequence_number():
@@ -662,3 +664,38 @@ def test_an_utterance_with_a_missing_chunk_never_yields_a_final_transcript(arriv
     with pytest.raises(AudioOverflow):
         tr.finish()                                             # and no final transcript
     assert "final" not in fake.calls
+
+
+# ---- any refused chunk voids the utterance -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", sorted(REJECTIONS))
+def test_any_refused_chunk_voids_the_utterance_until_reset(kind):
+    w = PcmWindow(max_seconds=5.0)
+    w.append(SAMPLES, seq=0)
+    with pytest.raises(Exception):
+        REJECTIONS[kind](w)                                     # refused
+    for _ in range(3):                                          # the producer carries on with valid audio...
+        with pytest.raises(AudioOverflow):
+            w.append(SAMPLES)                                   # ...and is told the utterance is void
+    assert not w.intact(w.generation)
+    with pytest.raises(AudioOverflow):
+        w.snapshot()
+    with pytest.raises(AudioOverflow):
+        w.seal()
+    stt = _FakeWhisper()
+    stt.release.set()
+    with pytest.raises(AudioOverflow):
+        LiveTranscriber(stt, w).finish()
+    assert "final" not in stt.calls
+    w.reset()                                                   # the next utterance starts clean
+    w.append(SAMPLES, seq=0)
+    assert w.intact(w.generation) and read_wav(w.snapshot())[3] == SAMPLES
+
+
+def test_an_empty_chunk_is_not_a_refusal():
+    w = PcmWindow()
+    w.append(SAMPLES, seq=0)
+    w.append(b"", seq=1)                                        # a keep-alive: accepted, nothing stored
+    w.append(SAMPLES, seq=2)
+    assert w.intact(w.generation) and read_wav(w.snapshot())[3] == SAMPLES + SAMPLES
